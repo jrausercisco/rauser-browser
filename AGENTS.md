@@ -8,6 +8,7 @@ M0 is merged. M1 development code adds a Chrome side panel and settings page, op
 
 - `protocol/schema.json` defines native messages. Run `python3 protocol/generate.py` after changing it and commit the generated Rust and TypeScript files together.
 - `host/` contains the native host. Keep host policy checks on the privileged side of the messaging boundary.
+- `macos-alert/` is the host's only unsafe code: a small macOS-only wrapper around `CFUserNotification`, so the Yes/No confirmation can time out and be canceled when the host goes away. The alert is drawn by `UserNotificationCenter`, so killing the dialog process does not close it. Keep new unsafe code there, with a `SAFETY` comment per block; every other crate stays `#![forbid(unsafe_code)]`.
 - `extension/` contains the MV3 Chrome development build. `npm run build:extension` emits `extension/dist/` for unpacked loading.
 - Product naming (app name, native host ID, storage key, marker, and temp-file prefixes) lives in `extension/brand.ts` (also used by the build and dev scripts) and `host/src/brand.rs`. Page and manifest text use `{{APP_NAME}}`/`{{FULL_NAME}}`, filled in by `extension/build.mjs`. Crate, package, and binary names in `Cargo.toml` and `package.json` still change separately.
 - `scripts/register-dev-host.mjs` registers a per-user development native host for one unpacked extension ID; installers own release registration.
@@ -17,7 +18,7 @@ M0 is merged. M1 development code adds a Chrome side panel and settings page, op
 
 Run the commands in [README.md](README.md#development) before proposing a code change. The Rust version is pinned in `rust-toolchain.toml`.
 
-For end-to-end checks, use `npm run smoke:macos:headless`. It never shows a window or takes focus. Run `--auto` (real dialogs, UI scripting) only in a VM or separate session, never on the user's desktop. The general strategy, including what headless cannot prove, is in the ENDURANCE workspace's `TESTING.md` (`/Users/jrauser/ENDURANCE/TESTING.md`); update it with anything you learn here.
+For end-to-end checks, use `npm run smoke:macos:headless`. It never shows a window or takes focus. Run `--auto` (real dialogs, UI scripting) only in a VM or separate session, never on the user's desktop. The same applies to `npm run check:macos-alert` (the real alert's cancel and timeout paths), which refuses to run outside a VM without `--on-desktop`. The general strategy, including what headless cannot prove, is in the ENDURANCE workspace's `TESTING.md` (`/Users/jrauser/ENDURANCE/TESTING.md`); update it with anything you learn here.
 
 ## Security rules
 

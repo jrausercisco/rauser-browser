@@ -14,7 +14,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::brand::{APP_NAME, NAMESPACE};
-use crate::vault::{Vault, selected_root_identity};
+use crate::vault::{STALE_TEMPORARY_AGE, Vault, is_generated_temporary, selected_root_identity};
 
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_ROOT_PATH_BYTES: usize = 4 * 1024;
@@ -24,6 +24,8 @@ const MAX_SITES: usize = 128;
 const MAX_STRIP_PARAMS: usize = 64;
 const MAX_RULE_BYTES: usize = 64;
 const MISSING_REVISION: &str = "missing";
+/// Never a real revision, so no update can be based on an unreadable file.
+const UNREADABLE_REVISION: &str = "unreadable";
 /// Hash at most this much of an oversized config. Past it, the revision
 /// also covers the length so a growing file still changes revision.
 const MAX_HASHED_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
@@ -60,18 +62,69 @@ impl ConfigStore {
     }
 
     pub fn load() -> Result<Self> {
-        let path = Self::default_path()?;
-        let state = read_disk_state(&path)?;
+        Ok(Self::load_from(Self::default_path()?))
+    }
+
+    fn load_from(path: PathBuf) -> Self {
         // The folder may have moved since setup. Keep the config available for
         // repair through update_config, but never use it for vault I/O until a
         // fresh validation succeeds.
-        Ok(Self {
-            path,
-            config: state.config,
-            revision: state.revision,
-            issue: state.issue,
-            root_identity: state.root_identity,
-        })
+        match read_disk_state(&path) {
+            Ok(state) => Self {
+                path,
+                config: state.config,
+                revision: state.revision,
+                issue: state.issue,
+                root_identity: state.root_identity,
+            },
+            // Exiting here would show the extension only a disconnect. Start
+            // inert instead; each request refreshes, fails the same way, and
+            // answers invalid_config until the file is readable again.
+            Err(error) => {
+                eprintln!("{NAMESPACE}: warning: configuration is unreadable: {error:#}");
+                let mut store = Self {
+                    path,
+                    config: empty_config(),
+                    revision: String::new(),
+                    issue: None,
+                    root_identity: None,
+                };
+                store.become_inert();
+                store
+            }
+        }
+    }
+
+    /// Forget the last readable config. `hello` and `get_config` report this
+    /// state with its issue, so the extension can tell the user to repair the
+    /// file; every other request refuses with invalid_config.
+    fn become_inert(&mut self) {
+        self.config = empty_config();
+        self.revision = UNREADABLE_REVISION.into();
+        self.issue = Some("The configuration file cannot be read or is not a regular file. Fix or remove it, then reload this page.".into());
+        self.root_identity = None;
+    }
+
+    /// Best-effort startup cleanup of temporaries a killed host left behind,
+    /// in the config directory and, once the folder is trusted, the page
+    /// notes directory. Failures are logged; they never block serving.
+    pub fn sweep_stale_temporaries(&self) {
+        if let Some(parent) = self.path.parent()
+            && let Err(error) = sweep_config_temporaries(parent)
+        {
+            eprintln!("{NAMESPACE}: warning: could not sweep config temporaries: {error:#}");
+        }
+        if !self.configured() {
+            return;
+        }
+        let Some(storage) = self.config.storage.as_ref() else {
+            return;
+        };
+        if let Err(error) = Vault::open_checked(storage, self.root_identity())
+            .and_then(|vault| vault.sweep_stale_temporaries())
+        {
+            eprintln!("{NAMESPACE}: warning: could not sweep page-note temporaries: {error:#}");
+        }
     }
 
     pub fn snapshot(&self) -> &ConfigSnapshot {
@@ -108,8 +161,16 @@ impl ConfigStore {
         self.issue.as_deref()
     }
 
+    /// Re-read config.toml. On failure the store becomes inert rather than
+    /// keeping a policy the file no longer supports.
     pub fn refresh(&mut self) -> Result<()> {
-        let state = read_disk_state(&self.path)?;
+        let state = match read_disk_state(&self.path) {
+            Ok(state) => state,
+            Err(error) => {
+                self.become_inert();
+                return Err(error);
+            }
+        };
         self.config = state.config;
         self.revision = state.revision;
         self.issue = state.issue;
@@ -118,7 +179,9 @@ impl ConfigStore {
     }
 
     pub fn configured(&self) -> bool {
-        self.issue.is_none() && self.config.storage.is_some() && validate(&self.config).is_ok()
+        self.issue.is_none()
+            && self.config.storage.is_some()
+            && validate_persisted(&self.config).is_ok()
     }
 
     /// Replace config only when the caller's revision still matches the file.
@@ -314,7 +377,7 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
     }
     let mut file = file.take(MAX_HASHED_CONFIG_BYTES);
     let mut contents = Vec::new();
-    let mut hasher = Sha256::new();
+    let mut hasher = RevisionHasher::new();
     let mut bytes_read = 0u64;
     let mut chunk = [0u8; 8192];
     loop {
@@ -331,10 +394,7 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
             .min(count);
         contents.extend_from_slice(&chunk[..keep]);
     }
-    if bytes_read == MAX_HASHED_CONFIG_BYTES {
-        hasher.update(metadata.len().to_le_bytes());
-    }
-    let revision = format!("sha256:{}", hex::encode(hasher.finalize()));
+    let revision = hasher.finish(metadata.len());
     if bytes_read > MAX_CONFIG_BYTES as u64 {
         return Ok(DiskState {
             config: empty_config(),
@@ -353,26 +413,38 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
             let root_unconfirmed = stored.storage.is_some()
                 && (!stored.root_picker_confirmed || root_identity.is_none());
             let config: ConfigSnapshot = stored.into();
-            let issue = if root_unconfirmed {
-                Some("This notes folder predates native picker confirmation. Choose it again to activate capture; the original config will be backed up.".to_owned())
-            } else if validate(&config).is_err() {
-                Some("Configuration settings or notes folder are invalid or unavailable. Choose a notes folder and save a repair; the original config will be backed up.".to_owned())
-            } else if config.storage.as_ref().is_some_and(|storage| {
+            if root_unconfirmed || validate(&config).is_err() {
+                let issue = if root_unconfirmed {
+                    "This notes folder predates native picker confirmation. Choose it again to activate capture; the original config will be backed up."
+                } else {
+                    "Configuration settings are invalid. Choose a notes folder and save a repair; the original config will be backed up."
+                };
+                return Ok(DiskState {
+                    config: empty_config(),
+                    revision,
+                    issue: Some(issue.to_owned()),
+                    needs_backup: true,
+                    root_identity: None,
+                });
+            }
+            // The settings themselves are valid. A folder that is missing or
+            // no longer matches its stored identity (an unmounted drive, or a
+            // remount with a new device number) blocks vault I/O and needs
+            // reselection, but it must not discard the allowlist: keep every
+            // setting for the repair, which rewrites the file with a fresh
+            // identity, so there is nothing to back up.
+            let folder_changed = config.storage.as_ref().is_some_and(|storage| {
                 match selected_root_identity(Path::new(&storage.root)) {
                     Ok(actual) => Some(actual.as_str()) != root_identity.as_deref(),
                     Err(_) => true,
                 }
-            }) {
-                Some("The selected notes folder changed. Choose it again to repair this configuration; the original config will be backed up.".to_owned())
-            } else {
-                None
-            };
+            });
             Ok(DiskState {
-                config: if issue.is_some() { empty_config() } else { config },
+                config,
                 revision,
-                needs_backup: issue.is_some(),
-                issue,
-                root_identity: if root_unconfirmed { None } else { root_identity },
+                issue: folder_changed.then(|| "The selected notes folder is unavailable or changed. Reconnect it, or choose it again to repair this configuration; your other settings are kept.".to_owned()),
+                needs_backup: false,
+                root_identity,
             })
         }
         Err(_) => Ok(DiskState {
@@ -391,7 +463,10 @@ fn backup_invalid(parent: &Path, source_path: &Path, expected_revision: &str) ->
     let result = (|| -> Result<()> {
         let mut source = File::open(source_path)
             .with_context(|| format!("opening invalid config at {}", source_path.display()))?;
-        let mut hasher = Sha256::new();
+        // Copy every byte, but compute the revision exactly as
+        // read_disk_state does, or a file past the hash cap never matches.
+        let mut hasher = RevisionHasher::new();
+        let mut copied = 0u64;
         let mut chunk = [0u8; 8192];
         loop {
             let count = source.read(&mut chunk)?;
@@ -399,9 +474,10 @@ fn backup_invalid(parent: &Path, source_path: &Path, expected_revision: &str) ->
                 break;
             }
             hasher.update(&chunk[..count]);
+            copied += count as u64;
             file.write_all(&chunk[..count])?;
         }
-        if format!("sha256:{}", hex::encode(hasher.finalize())) != expected_revision {
+        if hasher.finish(copied) != expected_revision {
             bail!("configuration changed while it was being backed up");
         }
         file.sync_all()?;
@@ -414,8 +490,76 @@ fn backup_invalid(parent: &Path, source_path: &Path, expected_revision: &str) ->
     Ok(())
 }
 
+/// Remove `.config-<uuid>.tmp` files old enough that no live update can still
+/// own them. Symlinks and anything not exactly that name are left alone.
+fn sweep_config_temporaries(parent: &Path) -> Result<usize> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("listing {}", parent.display()));
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("listing {}", parent.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_generated_temporary(name, ".config-") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = metadata.is_file()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|elapsed| elapsed >= STALE_TEMPORARY_AGE);
+        if stale && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 fn revision_for(contents: &[u8]) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(contents)))
+    let mut hasher = RevisionHasher::new();
+    hasher.update(contents);
+    hasher.finish(contents.len() as u64)
+}
+
+/// The one definition of a config revision: the SHA-256 of at most
+/// `MAX_HASHED_CONFIG_BYTES`, plus the file length when that cap is reached.
+struct RevisionHasher {
+    hasher: Sha256,
+    hashed: u64,
+}
+
+impl RevisionHasher {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            hashed: 0,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        let room = MAX_HASHED_CONFIG_BYTES - self.hashed;
+        let take = (bytes.len() as u64).min(room) as usize;
+        self.hasher.update(&bytes[..take]);
+        self.hashed += take as u64;
+    }
+
+    fn finish(mut self, total_len: u64) -> String {
+        if self.hashed == MAX_HASHED_CONFIG_BYTES {
+            self.hasher.update(total_len.to_le_bytes());
+        }
+        format!("sha256:{}", hex::encode(self.hasher.finalize()))
+    }
 }
 
 fn create_temporary(path: &Path) -> Result<(File, TempFileCleanup<'_>)> {
@@ -444,6 +588,11 @@ fn empty_config() -> ConfigSnapshot {
     }
 }
 
+/// Check a proposed config's shape and limits. This never touches the
+/// filesystem: an extension-supplied root is untrusted until a picker grant or
+/// the persisted identity authorizes it, so probing it here would answer
+/// whether arbitrary paths exist (and, on Windows, reach out to UNC shares).
+/// Callers open the root only after authorization; see `validate_persisted`.
 pub fn validate(config: &ConfigSnapshot) -> Result<()> {
     if config.sites.len() > MAX_SITES {
         bail!("site allowlist exceeds the 128-entry limit");
@@ -475,6 +624,15 @@ pub fn validate(config: &ConfigSnapshot) -> Result<()> {
     }
     if let Some(storage) = &config.storage {
         validate_storage(storage)?;
+    }
+    Ok(())
+}
+
+/// Validate a config the host itself persisted, including that its notes
+/// folder can be opened. Only call this for a root that is already trusted.
+fn validate_persisted(config: &ConfigSnapshot) -> Result<()> {
+    validate(config)?;
+    if let Some(storage) = &config.storage {
         Vault::open(storage).context("notes folder is unavailable")?;
     }
     Ok(())
@@ -800,16 +958,150 @@ mod tests {
         fs::create_dir(&root).unwrap();
         store.refresh().unwrap();
         assert!(store.config_issue().is_some());
-        assert!(store.snapshot().storage.is_none());
+        assert!(!store.configured());
+        // Only the folder needs reselection; the settings are kept for repair.
+        assert_eq!(store.snapshot(), &config);
+        let revision = store.revision().to_owned();
+        // The stored identity no longer matches, so the same path alone is
+        // not enough to authorize the replacement folder.
+        assert!(store.update(config.clone(), &revision).is_err());
         let new_identity = selected_root_identity(&root).unwrap();
         assert_ne!(identity, new_identity);
-        let revision = store.revision().to_owned();
         store
             .update_with_root_identity(config, &revision, Some(&new_identity))
             .unwrap()
             .unwrap();
         store.refresh().unwrap();
         assert!(store.config_issue().is_none());
+        // The file was valid; only its identity was stale, so nothing to back up.
+        assert_eq!(backup_count(base.path()), 0);
+    }
+
+    #[test]
+    fn remounted_or_missing_folder_keeps_settings_without_a_backup() {
+        // An external or network volume can disappear, or come back with a
+        // new device number. Neither may wipe the site allowlist.
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("selected");
+        let away = base.path().join("away");
+        fs::create_dir(&root).unwrap();
+        let path = base.path().join("config.toml");
+        let mut store = ConfigStore::for_test(path.clone());
+        let config = ConfigSnapshot {
+            storage: Some(StorageConfig {
+                root: root.to_string_lossy().into_owned(),
+                profile: "neutral".into(),
+                log_dir: "log".into(),
+                pages_dir: "pages".into(),
+                later_dir: "later".into(),
+            }),
+            capture_enabled: true,
+            sites: vec![SiteConfig {
+                origin: "https://example.com".into(),
+                path_prefix: "/".into(),
+            }],
+            ..empty_config()
+        };
+        let identity = selected_root_identity(&root).unwrap();
+        store
+            .update_with_root_identity(config.clone(), MISSING_REVISION, Some(&identity))
+            .unwrap()
+            .unwrap();
+        let saved = fs::read(&path).unwrap();
+
+        // Unmounted: the folder is gone. Capture stops, settings stay.
+        fs::rename(&root, &away).unwrap();
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_some());
+        assert!(!store.configured());
+        assert_eq!(store.snapshot(), &config);
+        assert_eq!(store.root_identity(), Some(identity.as_str()));
+
+        // Remounted with the same identity: no repair is needed at all.
+        fs::rename(&away, &root).unwrap();
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
+        assert!(store.configured());
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        assert_eq!(backup_count(base.path()), 0);
+    }
+
+    #[test]
+    fn unreadable_config_degrades_to_an_issue_at_startup() {
+        // A directory (or FIFO, or unreadable file) at the config path must
+        // not stop the host: it serves invalid_config errors instead.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.toml");
+        fs::create_dir(&path).unwrap();
+        let mut store = ConfigStore::load_from(path);
+        assert!(store.config_issue().is_some());
+        assert!(!store.configured());
+        assert_eq!(store.snapshot(), &empty_config());
+        assert!(store.refresh().is_err());
+        assert!(store.config_issue().is_some());
+    }
+
+    #[test]
+    fn a_config_that_becomes_unreadable_turns_inert_on_refresh() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.toml");
+        let mut store = ConfigStore::for_test(path.clone());
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
+        fs::create_dir(&path).unwrap();
+        assert!(store.refresh().is_err());
+        assert!(store.config_issue().is_some());
+        assert!(!store.configured());
+        assert_eq!(store.snapshot(), &empty_config());
+        assert_eq!(store.revision(), UNREADABLE_REVISION);
+        fs::remove_dir(&path).unwrap();
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
+    }
+
+    #[test]
+    fn oversized_config_past_the_hash_cap_can_be_repaired() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.toml");
+        let oversized = vec![b'#'; MAX_HASHED_CONFIG_BYTES as usize + 10];
+        fs::write(&path, &oversized).unwrap();
+        let mut store = ConfigStore::for_test(path.clone());
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_some());
+        let revision = store.revision().to_owned();
+        store
+            .update(empty_config(), &revision)
+            .unwrap()
+            .expect("repair should commit");
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
+        assert_eq!(backup_count(folder.path()), 1);
+        let backup = fs::read_dir(folder.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("config-invalid-")
+            })
+            .unwrap();
+        assert_eq!(fs::read(backup).unwrap(), oversized);
+    }
+
+    fn backup_count(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config-invalid-")
+            })
+            .count()
     }
 
     #[test]
@@ -857,6 +1149,35 @@ mod tests {
             later_dir: "later".into(),
         };
         assert!(validate_storage(&storage).is_err());
+    }
+
+    #[test]
+    fn startup_sweep_removes_only_stale_config_temporaries() {
+        use crate::vault::tests::age_file;
+        use std::time::Duration;
+
+        let folder = tempfile::tempdir().unwrap();
+        let old = STALE_TEMPORARY_AGE + Duration::from_secs(60);
+        let stale = folder
+            .path()
+            .join(format!(".config-{}.tmp", Uuid::new_v4()));
+        let fresh = folder
+            .path()
+            .join(format!(".config-{}.tmp", Uuid::new_v4()));
+        let other = folder.path().join(".config-existing.tmp");
+        let config = folder.path().join("config.toml");
+        for path in [&stale, &fresh, &other, &config] {
+            fs::write(path, "content").unwrap();
+        }
+        for path in [&stale, &other, &config] {
+            age_file(path, old);
+        }
+        let store = ConfigStore::for_test(config.clone());
+        store.sweep_stale_temporaries();
+        assert!(!stale.exists());
+        for path in [&fresh, &other, &config] {
+            assert!(path.exists(), "{} was removed", path.display());
+        }
     }
 
     #[test]

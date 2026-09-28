@@ -579,12 +579,11 @@
           "maxLength": 8192
         },
         "title": {
-          "type": "string",
-          "maxLength": 2048
+          "type": "string"
         },
         "body": {
           "type": "string",
-          "maxLength": 1048576
+          "maxLength": 98304
         },
         "expected_revision": {
           "type": "string",
@@ -754,7 +753,7 @@
         },
         "body": {
           "type": "string",
-          "maxLength": 1048576
+          "maxLength": 98304
         }
       }
     },
@@ -835,7 +834,7 @@
         },
         "body": {
           "type": "string",
-          "maxLength": 1048576
+          "maxLength": 98304
         }
       }
     },

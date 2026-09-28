@@ -10,6 +10,7 @@ use brauser_protocol::{
     VisitOutcome, VisitRecorded,
 };
 
+use crate::brand::NAMESPACE;
 use crate::capture::{CaptureOutcome, CapturePolicy, CaptureStore};
 use crate::config::{self, ConfigStore};
 use crate::consent::ConsentAuthority;
@@ -18,8 +19,9 @@ use crate::vault::Vault;
 
 const MAX_INBOUND_BYTES: usize = 4 * 1024 * 1024;
 // Chrome limits host-to-extension messages to 1 MiB. Leave room for the
-// framing prefix and future envelope fields.
-const MAX_OUTBOUND_BYTES: usize = 900 * 1024;
+// framing prefix and future envelope fields. Note limits (`note.rs`) are
+// derived from this so a saved note can always be loaded again.
+pub(crate) const MAX_OUTBOUND_BYTES: usize = 900 * 1024;
 const MAX_REQUEST_ID_CHARS: usize = 128;
 
 pub fn serve(config: ConfigStore) -> Result<()> {
@@ -150,34 +152,29 @@ fn dispatch(
         );
     }
     match request {
-        Request::Hello(value) => match config.refresh() {
-            Ok(()) => Response::HelloResult(HelloResult {
+        // An unreadable config file leaves the store inert with an issue.
+        // Report that state instead of an error: the extension treats a
+        // failed hello as a missing host, and the issue says how to repair.
+        Request::Hello(value) => {
+            let _ = config.refresh();
+            Response::HelloResult(HelloResult {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: value.request_id,
                 host_version: env!("CARGO_PKG_VERSION").to_owned(),
                 configured: config.configured(),
                 config_issue: config.config_issue().map(str::to_owned),
-            }),
-            Err(_) => error(
-                &value.request_id,
-                ErrorCode::InvalidConfig,
-                "configuration file is invalid or unavailable",
-            ),
-        },
-        Request::GetConfig(value) => match config.refresh() {
-            Ok(()) => Response::ConfigResult(ConfigResult {
+            })
+        }
+        Request::GetConfig(value) => {
+            let _ = config.refresh();
+            Response::ConfigResult(ConfigResult {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: value.request_id,
                 config: config.snapshot().clone(),
                 revision: config.revision().to_owned(),
                 config_issue: config.config_issue().map(str::to_owned),
-            }),
-            Err(_) => error(
-                &value.request_id,
-                ErrorCode::InvalidConfig,
-                "configuration file is invalid or unavailable",
-            ),
-        },
+            })
+        }
         Request::UpdateConfig(value) => {
             if config.refresh().is_err() {
                 return error(
@@ -270,11 +267,17 @@ fn dispatch(
                     ErrorCode::Cancelled,
                     "folder selection was canceled",
                 ),
-                Err(_) => error(
-                    &value.request_id,
-                    ErrorCode::Internal,
-                    "could not open the folder picker",
-                ),
+                Err(choose_error) => {
+                    // The failure may come from the picker itself or from
+                    // checking the folder the user picked (for example one
+                    // macOS privacy settings protect); keep the cause.
+                    eprintln!("{NAMESPACE}: folder selection failed: {choose_error:#}");
+                    error(
+                        &value.request_id,
+                        ErrorCode::Internal,
+                        "could not open the folder picker or use the selected folder",
+                    )
+                }
             }
         }
         Request::ConfirmConfig(value) => {
@@ -426,8 +429,8 @@ fn note_vault(
 
 fn note_error(request_id: &str, error_value: note::NoteRequestError) -> Response {
     match error_value {
-        note::NoteRequestError::Invalid(message) => {
-            error(request_id, ErrorCode::InvalidRequest, &message)
+        note::NoteRequestError::TooLarge(message) => {
+            error(request_id, ErrorCode::MessageTooLarge, &message)
         }
         note::NoteRequestError::Conflict(note::OwnershipConflict(message)) => {
             error(request_id, ErrorCode::Conflict, &message)
@@ -546,9 +549,17 @@ fn read_frame<R: Read>(input: &mut R) -> std::result::Result<Option<Vec<u8>>, Fr
 }
 
 fn write_frame<W: Write>(output: &mut W, response: &Response) -> Result<()> {
-    let body = serde_json::to_vec(response).context("serializing native response")?;
+    let mut body = serde_json::to_vec(response).context("serializing native response")?;
     if body.len() > MAX_OUTBOUND_BYTES {
-        bail!("native response exceeds host-to-extension size limit");
+        // One oversized answer must not end the connection: that would drop
+        // every other in-flight request and show the extension only a
+        // disconnect. Answer the same request with a small error instead.
+        let fallback = error(
+            response.request_id(),
+            ErrorCode::MessageTooLarge,
+            "response exceeds the host-to-extension size limit",
+        );
+        body = serde_json::to_vec(&fallback).context("serializing native response")?;
     }
     let size = u32::try_from(body.len()).context("native response length overflow")?;
     output.write_all(&size.to_ne_bytes())?;
@@ -578,6 +589,67 @@ mod tests {
         let mut input = Cursor::new(wire);
         let json = read_frame(&mut input).unwrap().unwrap();
         serde_json::from_slice(&json).unwrap()
+    }
+
+    #[test]
+    fn an_unreadable_config_answers_hello_and_get_config_with_its_issue() {
+        // The extension treats a failed hello as a missing host, so an
+        // unreadable config must still answer hello and report the repair.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+        let config = ConfigStore::for_test(path);
+        let requests = [
+            Request::Hello(HelloRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "hello".into(),
+            }),
+            Request::GetConfig(GetConfigRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "read".into(),
+            }),
+            Request::UpdateConfig(UpdateConfigRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "write".into(),
+                expected_revision: "unreadable".into(),
+                config: ConfigSnapshot {
+                    storage: None,
+                    capture_enabled: false,
+                    sites: Vec::new(),
+                    strip_params: Vec::new(),
+                    near_repeat_secs: 300,
+                },
+                picker_token: None,
+                consent_token: None,
+            }),
+        ];
+        let input: Vec<u8> = requests.into_iter().flat_map(encoded_request).collect();
+        let mut output = Vec::new();
+        serve_with_io(Cursor::new(input), &mut output, config).unwrap();
+        let mut reader = Cursor::new(output);
+        let mut responses = Vec::new();
+        while let Some(body) = read_frame(&mut reader).unwrap() {
+            responses.push(serde_json::from_slice::<Response>(&body).unwrap());
+        }
+        match &responses[0] {
+            Response::HelloResult(value) => {
+                assert!(!value.configured);
+                assert!(value.config_issue.is_some());
+            }
+            other => panic!("expected hello_result, got {other:?}"),
+        }
+        match &responses[1] {
+            Response::ConfigResult(value) => {
+                assert!(value.config.storage.is_none());
+                assert!(value.config.sites.is_empty());
+                assert!(value.config_issue.is_some());
+            }
+            other => panic!("expected config_result, got {other:?}"),
+        }
+        match &responses[2] {
+            Response::Error(value) => assert_eq!(value.code, ErrorCode::InvalidConfig),
+            other => panic!("expected invalid_config, got {other:?}"),
+        }
     }
 
     #[test]
@@ -705,6 +777,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unauthorized_roots_are_refused_before_any_filesystem_probe() {
+        // An extension-supplied root is untrusted. Whether it exists must not
+        // change the answer, or the host becomes a directory-existence oracle.
+        let folder = tempfile::tempdir().unwrap();
+        let existing = folder.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let mut config = ConfigStore::for_test(folder.path().join("config.toml"));
+        let mut consent = ConsentAuthority::new();
+        for root in [existing.clone(), folder.path().join("absent")] {
+            let snapshot = ConfigSnapshot {
+                storage: Some(brauser_protocol::StorageConfig {
+                    root: root.to_string_lossy().into_owned(),
+                    profile: "neutral".into(),
+                    log_dir: "log".into(),
+                    pages_dir: "pages".into(),
+                    later_dir: "later".into(),
+                }),
+                capture_enabled: false,
+                sites: Vec::new(),
+                strip_params: Vec::new(),
+                near_repeat_secs: 300,
+            };
+            let update = dispatch(
+                Request::UpdateConfig(UpdateConfigRequest {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: "probe-update".into(),
+                    expected_revision: "missing".into(),
+                    config: snapshot.clone(),
+                    picker_token: None,
+                    consent_token: None,
+                }),
+                &mut config,
+                &mut consent,
+            );
+            let confirm = dispatch(
+                Request::ConfirmConfig(brauser_protocol::ConfirmConfigRequest {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: "probe-confirm".into(),
+                    expected_revision: "missing".into(),
+                    config: snapshot,
+                    picker_token: None,
+                }),
+                &mut config,
+                &mut consent,
+            );
+            for response in [update, confirm] {
+                match response {
+                    Response::Error(value) => assert_eq!(
+                        value.code,
+                        ErrorCode::Unauthorized,
+                        "{} for {}",
+                        value.message,
+                        root.display()
+                    ),
+                    other => panic!("expected an authorization error, got {other:?}"),
+                }
+            }
+        }
+    }
+
     fn configured_store(root: &std::path::Path) -> ConfigStore {
         let mut store = ConfigStore::for_test(root.join("config.toml"));
         let snapshot = brauser_protocol::ConfigSnapshot {
@@ -750,6 +883,141 @@ mod tests {
                 assert_eq!(value.revision, "missing");
             }
             other => panic!("expected note_loaded, got {other:?}"),
+        }
+    }
+
+    fn responses_from(output: Vec<u8>) -> Vec<Response> {
+        let mut reader = Cursor::new(output);
+        let mut responses = Vec::new();
+        while let Some(body) = read_frame(&mut reader).unwrap() {
+            responses.push(serde_json::from_slice::<Response>(&body).unwrap());
+        }
+        responses
+    }
+
+    fn save_request(id: &str, body: &str, revision: &str) -> Request {
+        Request::SaveNote(brauser_protocol::SaveNoteRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: id.into(),
+            url: "https://example.com/a".into(),
+            title: "A Title".into(),
+            body: body.into(),
+            expected_revision: revision.into(),
+        })
+    }
+
+    fn load_request(id: &str) -> Request {
+        Request::LoadNote(brauser_protocol::LoadNoteRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: id.into(),
+            url: "https://example.com/a".into(),
+        })
+    }
+
+    fn hello_request(id: &str) -> Request {
+        Request::Hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: id.into(),
+        })
+    }
+
+    #[test]
+    fn the_largest_valid_note_round_trips_without_ending_the_serve_loop() {
+        let folder = tempfile::tempdir().unwrap();
+        let notes = folder.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let config = configured_store(&notes);
+        // 98304 quotes, the panel's and the schema's limit, which double
+        // once escaped.
+        let body = "\"".repeat(98_304);
+        let requests = [
+            save_request("save-1", &body, "missing"),
+            load_request("load-1"),
+            // A stale save echoes the whole note back.
+            save_request("save-stale", "other", "missing"),
+            hello_request("hello-1"),
+        ];
+        let input: Vec<u8> = requests.into_iter().flat_map(encoded_request).collect();
+        let mut output = Vec::new();
+        serve_with_io(Cursor::new(input), &mut output, config).unwrap();
+
+        let responses = responses_from(output);
+        assert_eq!(responses.len(), 4);
+        assert!(matches!(&responses[0], Response::NoteSaved(_)));
+        match &responses[1] {
+            Response::NoteLoaded(value) => assert_eq!(value.body, body),
+            other => panic!("expected note_loaded, got {other:?}"),
+        }
+        match &responses[2] {
+            Response::NoteConflict(value) => assert_eq!(value.body, body),
+            other => panic!("expected note_conflict, got {other:?}"),
+        }
+        assert!(matches!(&responses[3], Response::HelloResult(_)));
+    }
+
+    #[test]
+    fn a_note_too_large_to_return_gets_a_correlated_error_and_serving_continues() {
+        let folder = tempfile::tempdir().unwrap();
+        let notes = folder.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let mut config = configured_store(&notes);
+        let saved = match dispatch(
+            save_request("save-1", "small", "missing"),
+            &mut config,
+            &mut ConsentAuthority::new(),
+        ) {
+            Response::NoteSaved(value) => value,
+            other => panic!("expected note_saved, got {other:?}"),
+        };
+        // The note grows outside the panel (for example in Obsidian) past
+        // what one response can carry, while staying under the read limit.
+        let path = notes.join(&saved.relative_path);
+        let grown = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("small", &"x".repeat(MAX_OUTBOUND_BYTES));
+        std::fs::write(&path, grown).unwrap();
+
+        let requests = [
+            load_request("load-1"),
+            save_request("save-stale", "new", "missing"),
+            hello_request("hello-1"),
+        ];
+        let input: Vec<u8> = requests.into_iter().flat_map(encoded_request).collect();
+        let mut output = Vec::new();
+        serve_with_io(Cursor::new(input), &mut output, config).unwrap();
+
+        let responses = responses_from(output);
+        assert_eq!(responses.len(), 3);
+        for (response, id) in responses[..2].iter().zip(["load-1", "save-stale"]) {
+            match response {
+                Response::Error(value) => {
+                    assert_eq!(value.code, ErrorCode::MessageTooLarge);
+                    assert_eq!(value.request_id, id);
+                }
+                other => panic!("expected message_too_large, got {other:?}"),
+            }
+        }
+        assert!(matches!(&responses[2], Response::HelloResult(_)));
+    }
+
+    #[test]
+    fn an_oversized_response_becomes_a_correlated_error_frame() {
+        let response = Response::NoteLoaded(NoteLoaded {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "load-big".into(),
+            exists: true,
+            revision: "missing".into(),
+            title: String::new(),
+            body: "x".repeat(MAX_OUTBOUND_BYTES + 1),
+        });
+        let mut output = Vec::new();
+        write_frame(&mut output, &response).unwrap();
+        match decoded_response(output) {
+            Response::Error(value) => {
+                assert_eq!(value.code, ErrorCode::MessageTooLarge);
+                assert_eq!(value.request_id, "load-big");
+            }
+            other => panic!("expected message_too_large, got {other:?}"),
         }
     }
 

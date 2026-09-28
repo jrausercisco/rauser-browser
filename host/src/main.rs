@@ -13,7 +13,7 @@ fn main() {
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        None | Some("serve") => native::serve(ConfigStore::load()?),
+        None | Some("serve") => serve(),
         Some("--version") => {
             // Test runners check this marker before relying on scripted dialogs.
             let variant = if cfg!(feature = "scripted-dialogs") {
@@ -34,9 +34,15 @@ fn run() -> Result<()> {
         Some(command @ (dialog::PICK_FOLDER_COMMAND | dialog::CONFIRM_COMMAND)) => {
             dialog::run_child_command(command)
         }
-        Some(origin) if origin.starts_with("chrome-extension://") => {
-            native::serve(ConfigStore::load()?)
-        }
+        Some(origin) if origin.starts_with("chrome-extension://") => serve(),
         Some(other) => bail!("unknown command or browser origin: {other}"),
     }
+}
+
+fn serve() -> Result<()> {
+    let config = ConfigStore::load()?;
+    // A host killed mid-save can leave a temporary behind; nothing else
+    // removes it, so clear old ones before serving.
+    config.sweep_stale_temporaries();
+    native::serve(config)
 }

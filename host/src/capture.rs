@@ -245,8 +245,12 @@ impl CaptureStore {
                 reason: "daily_log_name_conflict".into(),
             });
         }
+        // An oversized log is refused without scanning it. That is terminal,
+        // like a log that the next entry would push over the limit.
         if metadata.len() > MAX_LOG_BYTES {
-            bail!("daily log exceeds 32 MiB; refusing an unbounded scan");
+            return Ok(CaptureOutcome::Rejected {
+                reason: "daily_log_full".into(),
+            });
         }
         // A previous attempt may have synced the entry but failed to sync a
         // newly published directory entry. Do this before terminal replay or
@@ -375,7 +379,6 @@ impl CaptureStore {
         if !existing_log_is_owned(
             &day_dir,
             filename.to_str().context("log filename is not UTF-8")?,
-            metadata.len(),
         )? {
             bail!("original daily log is not owned by {APP_NAME}");
         }
@@ -462,10 +465,14 @@ impl CaptureStore {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error).context("checking adjacent daily log"),
             };
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
+            // Near-repeat is best effort; an oversized neighbour is not scanned.
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > MAX_LOG_BYTES
+            {
                 continue;
             }
-            if !existing_log_is_owned(&dir, &filename, metadata.len())? {
+            if !existing_log_is_owned(&dir, &filename)? {
                 continue;
             }
             sync_directory(&dir).context("syncing adjacent daily log before acknowledgement")?;
@@ -743,7 +750,7 @@ fn ensure_daily_log(dir: &Dir, name: &str) -> Result<bool> {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Ok(false);
             }
-            return existing_log_is_owned(dir, name, metadata.len());
+            return existing_log_is_owned(dir, name);
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("checking daily log"),
@@ -763,7 +770,7 @@ fn ensure_daily_log(dir: &Dir, name: &str) -> Result<bool> {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Ok(false);
             }
-            return existing_log_is_owned(dir, name, metadata.len());
+            return existing_log_is_owned(dir, name);
         }
         Err(error) => return Err(error).context("publishing daily log"),
     }
@@ -775,14 +782,16 @@ fn ensure_daily_log(dir: &Dir, name: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn existing_log_is_owned(dir: &Dir, name: &str, length: u64) -> Result<bool> {
-    if length > MAX_LOG_BYTES {
-        bail!("daily log exceeds 32 MiB; refusing an unbounded scan");
-    }
+/// Only the header line is read, so this is bounded for a log of any size;
+/// the caller decides what an oversized log means.
+fn existing_log_is_owned(dir: &Dir, name: &str) -> Result<bool> {
     let file = dir.open(name).context("opening existing daily log")?;
-    let mut first = String::new();
-    BufReader::new(file).read_line(&mut first)?;
-    Ok(first.trim_end_matches(['\r', '\n']) == LOG_HEADER)
+    let mut first = Vec::new();
+    BufReader::new(file.take(LOG_HEADER.len() as u64 + 2)).read_until(b'\n', &mut first)?;
+    while matches!(first.last(), Some(b'\r' | b'\n')) {
+        first.pop();
+    }
+    Ok(first == LOG_HEADER.as_bytes())
 }
 
 /// Truncate a failed append back to `offset`, but only if everything after
@@ -851,8 +860,17 @@ fn scan_log(
     at: i64,
     near_repeat_secs: u64,
 ) -> Result<ScanResult> {
-    let mut lines = BufReader::new(file).lines();
-    if lines.next().transpose()?.as_deref() != Some(LOG_HEADER) {
+    // Split on bytes: a crash can leave the log cut inside a multibyte
+    // character, and that must not stop the scan or the resume after it.
+    let mut lines = BufReader::new(file).split(b'\n').map(|line| {
+        line.map(|mut line| {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            line
+        })
+    });
+    if lines.next().transpose()?.as_deref() != Some(LOG_HEADER.as_bytes()) {
         bail!("daily log exists without {APP_NAME} ownership marker");
     }
     let mut result = ScanResult {
@@ -860,7 +878,11 @@ fn scan_log(
         near_repeat: false,
     };
     for line in lines {
-        if let Some((id, url, previous_at)) = parse_marker(&line?) {
+        let line = line?;
+        let Ok(line) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        if let Some((id, url, previous_at)) = parse_marker(line) {
             if id == event_hash {
                 result.duplicate = true;
             }
@@ -1121,6 +1143,78 @@ mod tests {
             record(&store, &first),
             CaptureOutcome::Suppressed { .. }
         ));
+    }
+
+    #[test]
+    fn entry_torn_inside_a_multibyte_character_resumes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store =
+            CaptureStore::open_at(&storage(root.path(), "log"), None, state.path()).unwrap();
+        let visit = event();
+        let CaptureOutcome::Persisted { relative_path } = record(&store, &visit) else {
+            panic!("expected persisted visit");
+        };
+        let hash = sha256_hex(visit.event_id.as_bytes());
+        let intent = read_intent(&store.journal_path(&hash)).unwrap().unwrap();
+        let log = root.path().join(relative_path);
+        let original = fs::read(&log).unwrap();
+        let entry = &original[intent.offset as usize..];
+        let dash = entry
+            .windows("—".len())
+            .position(|window| window == "—".as_bytes())
+            .unwrap();
+        // Cut after the em dash's first byte, leaving invalid UTF-8 at the end.
+        let torn = intent.offset + dash as u64 + 1;
+        let truncate = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&log)
+                .unwrap()
+                .set_len(torn)
+                .unwrap();
+            assert!(std::str::from_utf8(&fs::read(&log).unwrap()).is_err());
+        };
+
+        truncate();
+        assert!(matches!(
+            record(&store, &visit),
+            CaptureOutcome::Persisted { .. }
+        ));
+        assert_eq!(fs::read(&log).unwrap(), original);
+
+        // A different visit that day must not be blocked by the torn tail.
+        truncate();
+        assert!(matches!(
+            record(&store, &event()),
+            CaptureOutcome::Persisted { .. }
+        ));
+    }
+
+    #[test]
+    fn oversized_daily_log_is_rejected_not_retried() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store =
+            CaptureStore::open_at(&storage(root.path(), "log"), None, state.path()).unwrap();
+        let CaptureOutcome::Persisted { relative_path } = record(&store, &event()) else {
+            panic!("expected persisted visit");
+        };
+        let log = root.path().join(relative_path);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_len(MAX_LOG_BYTES + 1)
+            .unwrap();
+        let before = fs::metadata(&log).unwrap().len();
+        assert_eq!(
+            record(&store, &event()),
+            CaptureOutcome::Rejected {
+                reason: "daily_log_full".into()
+            }
+        );
+        assert_eq!(fs::metadata(&log).unwrap().len(), before);
     }
 
     #[test]

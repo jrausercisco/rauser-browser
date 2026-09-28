@@ -15,7 +15,35 @@ let permissionChecks = 0;
 let tabReads = 0;
 let onMessage;
 let onCommitted;
+let onHistoryStateUpdated;
 let onTabUpdated;
+// Every native port the code under test opened, newest last.
+const ports = [];
+
+function fakePort() {
+  const messageListeners = [];
+  const disconnectListeners = [];
+  const port = {
+    sent: [],
+    closed: false,
+    postMessage(message) {
+      if (port.closed) throw new Error("Attempting to use a disconnected port object");
+      port.sent.push(message);
+    },
+    disconnect() { port.closed = true; },
+    onMessage: { addListener(listener) { messageListeners.push(listener); } },
+    onDisconnect: { addListener(listener) { disconnectListeners.push(listener); } },
+    // Deliver a host frame, as Chrome would.
+    reply(message) { for (const listener of messageListeners) listener(message); },
+    // The host process exited.
+    drop() {
+      port.closed = true;
+      for (const listener of disconnectListeners) listener();
+    },
+  };
+  ports.push(port);
+  return port;
+}
 
 globalThis.chrome = {
   runtime: {
@@ -23,6 +51,7 @@ globalThis.chrome = {
     getURL: (path) => `chrome-extension://test-extension/${path}`,
     onMessage: { addListener(listener) { onMessage = listener; } },
     onInstalled: { addListener() {} },
+    connectNative: () => fakePort(),
   },
   commands: { onCommand: { addListener() {} } },
   contextMenus: {
@@ -66,12 +95,14 @@ globalThis.chrome = {
   },
   webNavigation: {
     onCommitted: { addListener(listener) { onCommitted = listener; } },
-    onHistoryStateUpdated: { addListener() {} },
+    onHistoryStateUpdated: { addListener(listener) { onHistoryStateUpdated = listener; } },
   },
   sidePanel: { async setPanelBehavior() {} },
 };
 
 await import("../dist/worker.js");
+const { HostClient, HostError, PROTOCOL_VERSION } = await import("../dist/native.js");
+const { ConfigSession } = await import("../dist/settings.js");
 
 function send(message) {
   return new Promise((resolve, reject) => {
@@ -454,4 +485,177 @@ test("worker accepts messages only from the side panel and settings page", async
     assert.equal(accepted, false, JSON.stringify(sender));
     assert.equal(responded, false, JSON.stringify(sender));
   }
+});
+
+test("an SPA route change waits for its new title before the panel can send it", async () => {
+  values.clear();
+  grants.clear();
+  tabs.clear();
+  const origin = "https://spa.example";
+  grants.set("https://spa.example:443/*", true);
+  values.set(storageKey("policy_v1"), lease(origin));
+  // pushState has run, but the app has not set the new route's title yet.
+  tabs.set(9, { id: 9, url: `${origin}/b`, title: "Route A", incognito: false });
+
+  onHistoryStateUpdated({
+    tabId: 9, frameId: 0, documentId: "doc-spa", documentLifecycle: "active",
+    url: `${origin}/b`, timeStamp: Date.now(),
+  });
+  await flush();
+  const [queued] = values.get(storageKey("queue_v1")).items;
+  assert.equal(queued.event.title, "Route A");
+  assert.ok(queued.retry_after > Date.now(), "a history update waits for its title");
+  assert.deepEqual(await send({ kind: "get_pending" }), []);
+
+  onTabUpdated(9, { title: "Route B" }, { id: 9, url: `${origin}/b`, incognito: false });
+  await flush();
+  assert.equal(values.get(storageKey("queue_v1")).items[0].event.title, "Route B");
+});
+
+test("a retry notice clears once nothing is left to retry, and on dismissal", async () => {
+  values.clear();
+  grants.clear();
+  const origin = "https://retry.example";
+  grants.set("https://retry.example:443/*", true);
+  const setUp = (ids) => {
+    values.set(storageKey("policy_v1"), lease(origin));
+    values.set(storageKey("queue_v1"), {
+      version: 1,
+      items: ids.map((id) => visit(id, `${origin}/${id}`)),
+      overflow_count: 0,
+      rejected_count: 0,
+      last_error: null,
+    });
+  };
+  const retry = (id) => send({ kind: "ack_visit", event_id: id, outcome: "retryable", reason: "Host busy" });
+
+  setUp(["one"]);
+  assert.equal((await retry("one")).retry_error, "Host busy");
+  const rejected = await send({ kind: "ack_visit", event_id: "one", outcome: "rejected", reason: "No" });
+  assert.equal(rejected.queued, 0);
+  assert.equal(rejected.retry_error, null);
+
+  setUp(["two"]);
+  await retry("two");
+  assert.equal((await send({ kind: "discard_pending", event_ids: ["two"] })).retry_error, null);
+
+  setUp(["three"]);
+  await retry("three");
+  assert.equal((await send({ kind: "remove_site", site: { origin, path_prefix: "/" } })).retry_error, null);
+
+  values.delete(storageKey("locally_removed_sites_v1"));
+  setUp(["four"]);
+  await retry("four");
+  assert.equal((await send({ kind: "pause_capture" })).retry_error, null);
+  values.delete(storageKey("pause_pending_v1"));
+
+  setUp(["five"]);
+  await retry("five");
+  const dismissed = await send({ kind: "clear_notices" });
+  assert.equal(dismissed.queued, 1);
+  assert.equal(dismissed.retry_error, null);
+});
+
+function helloResult(requestId) {
+  return {
+    type: "hello_result", protocol_version: PROTOCOL_VERSION, request_id: requestId,
+    host_version: "0.0.0", configured: true, config_issue: null,
+  };
+}
+
+function hello() {
+  return {
+    type: "hello", protocol_version: PROTOCOL_VERSION, request_id: crypto.randomUUID(),
+  };
+}
+
+test("a host client reconnects lazily after the host exits", async () => {
+  ports.length = 0;
+  const client = new HostClient();
+  let changes = 0;
+  client.onStateChange(() => { changes += 1; });
+  const first = ports[0];
+  const answered = client.call(hello(), "hello_result");
+  first.reply(helloResult(first.sent[0].request_id));
+  await answered;
+  assert.equal(client.connected, true);
+
+  const inFlight = client.call(hello(), "hello_result");
+  first.drop();
+  await assert.rejects(inFlight, (error) => error instanceof HostError && error.code === "disconnected");
+  // The next call starts a fresh host, so the page is still usable.
+  assert.equal(client.connected, true);
+
+  const retried = client.call(hello(), "hello_result");
+  assert.equal(ports.length, 2);
+  const second = ports[1];
+  // A late frame on the dead port must not settle the new request.
+  first.reply({ ...helloResult(second.sent[0].request_id), host_version: "stale" });
+  second.reply(helloResult(second.sent[0].request_id));
+  assert.equal((await retried).host_version, "0.0.0");
+  assert.equal(client.connected, true);
+  assert.ok(changes >= 1);
+
+  client.disconnect();
+  assert.equal(client.connected, false);
+  await assert.rejects(client.call(hello(), "hello_result"),
+    (error) => error instanceof HostError && error.code === "disconnected");
+  assert.equal(ports.length, 2, "an explicitly closed client stays closed");
+});
+
+test("a host that cannot be started reports the session disconnected", async () => {
+  ports.length = 0;
+  let changes = 0;
+  const session = new ConfigSession(() => { changes += 1; });
+  session.config = {
+    storage: null, capture_enabled: false, sites: [], strip_params: [], near_repeat_secs: 0,
+  };
+  session.revision = "r1";
+  assert.equal(session.connected, true);
+
+  // The host was removed, so Chrome drops the port before any reply.
+  const pending = session.hello();
+  ports[0].drop();
+  await assert.rejects(pending, (error) => error instanceof HostError && error.code === "disconnected");
+  assert.equal(session.connected, false);
+  assert.ok(changes >= 1, "the page is told to redraw its controls");
+
+  // Once the host is back, the next call reconnects and the session recovers.
+  const recovered = session.hello();
+  const port = ports.at(-1);
+  port.reply(helloResult(port.sent[0].request_id));
+  await recovered;
+  assert.equal(session.connected, true);
+  session.host.disconnect();
+});
+
+test("unaddressed host errors and version mismatches reach the caller", async () => {
+  ports.length = 0;
+  const client = new HostClient();
+  const port = ports[0];
+
+  const skewed = client.call(hello(), "hello_result");
+  port.reply({
+    type: "error", protocol_version: PROTOCOL_VERSION + 1, request_id: port.sent[0].request_id,
+    code: "unsupported_protocol_version", message: "extension and host protocol versions differ",
+  });
+  await assert.rejects(skewed,
+    (error) => error instanceof HostError && error.code === "unsupported_protocol_version");
+
+  const skewedResult = client.call(hello(), "hello_result");
+  port.reply({ ...helloResult(port.sent[1].request_id), protocol_version: PROTOCOL_VERSION + 1 });
+  await assert.rejects(skewedResult,
+    (error) => error instanceof HostError && error.code === "invalid_response");
+
+  // The host cannot read an oversized frame's request_id, so it answers with
+  // an empty one and closes the connection.
+  const oversized = client.call(hello(), "hello_result");
+  port.reply({
+    type: "error", protocol_version: PROTOCOL_VERSION, request_id: "",
+    code: "message_too_large", message: "native message exceeds the 4 MiB inbound limit",
+  });
+  port.drop();
+  await assert.rejects(oversized,
+    (error) => error instanceof HostError && error.code === "message_too_large");
+  client.disconnect();
 });
