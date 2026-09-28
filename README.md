@@ -4,7 +4,7 @@ The Rauser Browser Browsing Assistant (Brauser) is a local-first browser assista
 
 ## Status
 
-M0 is merged. M1 development code now includes a Chrome side panel, opt-in visit capture, native folder selection and confirmation, and local Markdown page notes. The extension is an unpacked development build; there is no Chrome Web Store listing or installable release yet. The M1 flow has not had an interactive Chrome check on both operating systems, so it is not ready for general download.
+M0 is merged. M1 development code now includes a Chrome side panel, opt-in visit capture, native folder selection and confirmation, and local Markdown page notes. The extension is an unpacked development build; there is no Chrome Web Store listing or installable release yet. M1 is accepted for development on macOS; the Windows interactive check is parked, so it is not ready for general download.
 
 Read the [design specification](DESIGN.md) for the architecture, security model, planned features, and release plan.
 
