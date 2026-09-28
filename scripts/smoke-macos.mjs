@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 // Guided real-Chrome M1 smoke run. Native dialogs and Chrome permission prompts
-// deliberately remain manual; all host and vault state is kept in a temp home.
+// are answered by a person, or with --auto through UI scripting; all host and
+// vault state is kept in a temp home.
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -26,16 +27,28 @@ const EXTENSION_ID = /^[a-p]{32}$/;
 const EXTENSION_ID_ALPHABET = "abcdefghijklmnop";
 
 function usage() {
-  console.log(`Usage: node scripts/smoke-macos.mjs [--host /absolute/path/to/${BINARY_NAME}] [--chrome /absolute/path/to/Google Chrome]`);
+  console.log(`Usage: node scripts/smoke-macos.mjs [--host /absolute/path/to/${BINARY_NAME}] [--chrome /absolute/path/to/Google Chrome] [--default-port] [--auto]`);
+  console.log("  --default-port  Serve the fixture on port 80 and enter the site as http://127.0.0.1:80.");
+  console.log("  --auto          Answer the prompts through macOS UI scripting; the terminal needs Accessibility access.");
 }
 
 function argumentsForRun(args) {
   let host = DEFAULT_HOST;
   let chrome = DEFAULT_CHROME;
+  let defaultPort = false;
+  let auto = false;
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === "--help") {
       usage();
       return null;
+    }
+    if (args[index] === "--default-port") {
+      defaultPort = true;
+      continue;
+    }
+    if (args[index] === "--auto") {
+      auto = true;
+      continue;
     }
     if ((args[index] === "--host" || args[index] === "--chrome") && args[index + 1]) {
       if (!path.isAbsolute(args[index + 1])) throw new Error(`${args[index]} needs an absolute path`);
@@ -46,7 +59,7 @@ function argumentsForRun(args) {
     }
     throw new Error(`Unknown argument: ${args[index]}`);
   }
-  return { host, chrome };
+  return { host, chrome, defaultPort, auto };
 }
 
 function shellQuote(value) {
@@ -102,6 +115,88 @@ async function commandOutput(executable, args) {
       else reject(new Error(`${executable} exited ${code}: ${stderr.trim()}`));
     });
   });
+}
+
+// --auto answers the prompts through macOS UI scripting, which needs the
+// terminal to hold Accessibility access. The host's folder picker does not
+// answer Accessibility queries, so it is driven by keyboard; its Yes/No
+// alert is drawn by UserNotificationCenter, which does.
+async function osascript(script, language = "AppleScript") {
+  return commandOutput("/usr/bin/osascript", ["-l", language, "-e", script]);
+}
+
+async function requireAccessibility() {
+  const enabled = await osascript('tell application "System Events" to get UI elements enabled');
+  requireCondition(enabled === "true" && await osascript(
+    'tell application "System Events" to get name of first process whose frontmost is true',
+  ).then(() => true, () => false),
+  "--auto needs Accessibility access for this terminal: System Settings > Privacy & Security > Accessibility");
+}
+
+async function onScreenWindows(pid) {
+  const listed = await osascript(`ObjC.import("CoreGraphics");
+    JSON.stringify(ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly, 0)))
+      .filter((window) => window.kCGWindowOwnerPID === ${Number(pid)}).length)`, "JavaScript");
+  return Number(listed);
+}
+
+async function pickerPid() {
+  const pids = await commandOutput("/usr/bin/pgrep", ["-f", `${BINARY_NAME} __dialog-pick-folder`]).catch(() => "");
+  const list = pids.split("\n").filter(Boolean);
+  requireCondition(list.length === 1, list.length ? "More than one folder picker is open" : "The folder picker is not open yet");
+  requireCondition(await onScreenWindows(list[0]) > 0, "The folder picker window is not on screen yet");
+  return Number(list[0]);
+}
+
+// Keystrokes go to the frontmost process. System Events cannot report the
+// unbundled picker process as frontmost, so activate it and wait.
+async function keysToPicker(pid, keys) {
+  await osascript(`tell application "System Events"
+    set frontmost of (first process whose unix id is ${pid}) to true
+    delay 1
+    ${keys}
+  end tell`);
+}
+
+async function cancelPicker() {
+  const pid = await waitFor(pickerPid, { timeout: 20_000 });
+  await keysToPicker(pid, "key code 53");
+}
+
+async function choosePickerFolder(folder) {
+  const pid = await waitFor(pickerPid, { timeout: 20_000 });
+  const closed = async () => requireCondition(
+    !(await commandOutput("/bin/ps", ["-p", String(pid)]).then(() => true, () => false)), "The folder picker is still open");
+  // Early keystrokes can be lost while the picker takes focus; if it is still
+  // open, repeat the whole sequence, which is safe from either picker state.
+  for (let attempt = 1; ; attempt += 1) {
+    await keysToPicker(pid, `keystroke "g" using {command down, shift down}
+      delay 1.5
+      keystroke "a" using {command down}
+      keystroke ${JSON.stringify(folder)}
+      delay 1
+      key code 36
+      delay 1.5
+      key code 36`);
+    try {
+      return await waitFor(closed, { timeout: 5_000 });
+    } catch (error) {
+      if (attempt === 3) throw error;
+    }
+  }
+}
+
+async function answerAlert(button) {
+  await waitFor(() => osascript(`tell application "System Events"
+    click button ${JSON.stringify(button)} of (first window of process "UserNotificationCenter" whose subrole is "AXSystemDialog")
+  end tell`), { timeout: 20_000 });
+}
+
+// Chrome's permission prompt is a sheet on the settings window.
+async function allowInChrome(press, pid) {
+  await waitFor(() => commandOutput(press, [String(pid), "Allow"]).catch((error) => {
+    throw new Error(error.message.includes("exited 2") ? "Chrome's Allow button is not showing" : error.message);
+  }), { timeout: 20_000 });
 }
 
 async function hostConfig(wrapper) {
@@ -344,14 +439,23 @@ function fixtureServer(caseId) {
   return server;
 }
 
-async function startServer(server) {
+async function startServer(server, defaultPort) {
+  if (defaultPort) {
+    // macOS lets an unprivileged process bind port 80 only on the wildcard
+    // address, so refuse every connection that is not from this machine.
+    server.on("connection", (socket) => {
+      if (!["127.0.0.1", "::ffff:127.0.0.1"].includes(socket.remoteAddress ?? "")) socket.destroy();
+    });
+  }
   await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
+    server.once("error", (error) => reject(defaultPort && error.code === "EADDRINUSE"
+      ? new Error("Port 80 is already in use; stop that server or run without --default-port")
+      : error));
+    server.listen(defaultPort ? 80 : 0, defaultPort ? "0.0.0.0" : "127.0.0.1", resolve);
   });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Cannot determine fixture port");
-  return `http://127.0.0.1:${address.port}`;
+  return defaultPort ? "http://127.0.0.1" : `http://127.0.0.1:${address.port}`;
 }
 
 async function stopServer(server) {
@@ -444,6 +548,7 @@ async function run() {
     throw new Error(`Build the native host first: cargo build --locked -p ${BINARY_NAME} (${options.host} is unavailable)`);
   });
   await access(options.chrome, constants.X_OK);
+  if (options.auto) await requireAccessibility();
   await access(path.join(DIST, "manifest.json"), constants.R_OK).catch(() => {
     throw new Error(`Build the extension first: npm run build:extension (${DIST} is unavailable)`);
   });
@@ -453,6 +558,7 @@ async function run() {
   const profile = path.join(runDir, "chrome-profile");
   const notes = path.join(runDir, "notes");
   const wrapper = path.join(runDir, `${BINARY_NAME}-host-wrapper`);
+  const press = path.join(runDir, "smoke-macos-press");
   const manifest = path.join(profile, "NativeMessagingHosts", `${NATIVE_HOST_NAME}.json`);
   const caseId = randomUUID().slice(0, 8);
   const server = fixtureServer(caseId);
@@ -482,8 +588,14 @@ async function run() {
     console.log(`PASS: ${title}`);
   }
 
-  // Only Chrome's permission prompt and the host's native dialogs need a person.
-  async function userAction(instruction, check) {
+  // Only Chrome's permission prompt and the host's native dialogs need a
+  // person, or with --auto, the given automation.
+  async function userAction(instruction, check, automate) {
+    if (options.auto && automate) {
+      console.log(`  AUTO: ${instruction}`);
+      await automate();
+      return waitFor(check, { timeout: 30_000, interval: 500, signal: abort.signal });
+    }
     console.log(`  ACTION: ${instruction}`);
     // Say what is still missing, so a stuck wait is diagnosable.
     let reported = null;
@@ -612,6 +724,18 @@ async function run() {
     ]).then(([origin, api]) => ({ origin, api }))`));
   }
 
+  // Chrome skips its prompt when it already holds the requested access, so a
+  // missing prompt is reported, and the step's own checks decide the result.
+  async function chromePrompt() {
+    try {
+      await allowInChrome(press, chrome.pid);
+      console.log("  Clicked Allow in Chrome's prompt.");
+    } catch (error) {
+      const status = await settingsStatus().catch(() => "(settings page unavailable)");
+      console.log(`  No Chrome prompt was clicked: ${error.message}. Settings page says: ${status}`);
+    }
+  }
+
   async function createNote(expected, body) {
     await waitFor(() => onPanel(async (page) =>
       requireCondition(await page.enabled("#create-note"), "Create page note is disabled")));
@@ -629,6 +753,9 @@ async function run() {
 
   try {
     await Promise.all([mkdir(testHome), mkdir(notes), mkdir(profile)]);
+    if (options.auto) {
+      await commandOutput("/usr/bin/swiftc", ["-O", path.join(REPO, "scripts", "smoke-macos-press.swift"), "-o", press]);
+    }
     await writeFile(wrapper, `#!/bin/sh\nexport HOME=${shellQuote(testHome)}\nexec ${shellQuote(options.host)} "$@"\n`, { mode: 0o700 });
     await chmod(wrapper, 0o700);
     const configPath = await commandOutput(wrapper, ["--config-path"]);
@@ -650,7 +777,9 @@ async function run() {
     console.log(`Predicted unpacked extension ID: ${extensionId}`);
     console.log(`Isolated-profile native host registered for ${extensionId} before Chrome launch.`);
 
-    const origin = await startServer(server);
+    const origin = await startServer(server, options.defaultPort);
+    // The URL typed into settings; the default-port run spells out :80.
+    const siteInput = options.defaultPort ? `${origin}:80` : origin;
     const allowed = `${origin}/allowed/page?case=${caseId}`;
     const blocked = `${origin}/blocked/page?case=${caseId}`;
     const afterRemoval = `${origin}/allowed/after-removal?case=${caseId}`;
@@ -660,11 +789,11 @@ async function run() {
     const changedBody = `Review note ${caseId}`;
     await writeFile(path.join(runDir, "run-info.json"), `${JSON.stringify({
       origin, allowed, blocked, afterRemoval, notes, profile, testHome, configPath,
-      manifest, host: options.host, chrome: options.chrome,
+      manifest, host: options.host, chrome: options.chrome, siteInput,
     }, null, 2)}\n`);
 
     console.log(`\nSmoke artifacts: ${runDir}`);
-    console.log(`Fixture: ${origin}`);
+    console.log(`Fixture: ${origin}${options.defaultPort ? " (port 80, entered as " + siteInput + ")" : ""}`);
     console.log(`Notes folder: ${notes}`);
     console.log(`Extension folder: ${DIST}`);
     console.log("Loading the unpacked extension into the isolated Chrome profile.");
@@ -693,7 +822,10 @@ async function run() {
     console.log("Chrome-to-native-host hello passed.");
     console.log(`The runner drives ${APP_NAME}'s pages itself. Answer only the prompts it names; press Ctrl+C to stop.`);
 
-    const pattern = `${origin}/*`;
+    // The grant the settings page requests: always an explicit port, never
+    // Chrome's any-port form, which the run checks is not granted.
+    const pattern = `${origin}${options.defaultPort ? ":80" : ""}/*`;
+    const anyPortPattern = `${new URL(origin).protocol}//${new URL(origin).hostname}/*`;
     // Any empty folder will do; the suggested one is only a convenience.
     // Later checks count files, so the chosen folder must start empty.
     let notesRoot = null;
@@ -719,12 +851,15 @@ async function run() {
       await inSettings((page) => page.click("#choose-folder"));
       await userAction("In the macOS folder picker, click Cancel.", async () => {
         const status = await settingsStatus();
+        if (status?.startsWith("Folder selected")) {
+          throw Object.assign(new Error("A folder was chosen, but this step needs Cancel. Rerun the smoke test."), { fatal: true });
+        }
         requireCondition(status?.startsWith("Canceled"), `Settings page says: ${status}`);
         await onSettings(async (page) => {
           requireCondition(await page.text("#folder-path") === "None selected", "A folder is shown as selected");
           requireCondition(await page.enabled("#choose-folder"), "Picker is still open");
         });
-      });
+      }, cancelPicker);
       const reply = await hostConfig(wrapper);
       requireCondition(reply.config.storage === null && !reply.config.capture_enabled && reply.config.sites.length === 0,
         "The isolated host configuration changed after picker cancellation");
@@ -744,10 +879,10 @@ async function run() {
             throw Object.assign(new Error(`${chosen} is not empty; rerun and choose an empty folder`), { fatal: true });
           }
           notesRoot = chosen;
-        }));
+        }), () => choosePickerFolder(notes));
       console.log(`  Using notes folder ${notesRoot}`);
       await onSettings(async (page) => {
-        await page.fill("#site-url", origin);
+        await page.fill("#site-url", siteInput);
         await page.fill("#site-path", "/allowed");
       });
       await waitFor(() => onSettings(async (page) =>
@@ -760,6 +895,9 @@ async function run() {
         }
         requireCondition(status?.includes("Canceled"), `Settings page says: ${status}`);
         await onSettings(async (page) => requireCondition(await page.enabled("#enable-site"), "Setup is still running"));
+      }, async () => {
+        await chromePrompt();
+        await answerAlert("No");
       });
       const reply = await hostConfig(wrapper);
       requireCondition(reply.config.storage === null && !reply.config.capture_enabled && reply.config.sites.length === 0,
@@ -774,7 +912,7 @@ async function run() {
         await page.evaluate('document.getElementById("status").textContent = ""');
         await page.click("#enable-site");
       });
-      await userAction(`In Chrome's prompt, click Allow. Then click Yes in ${APP_NAME}'s confirmation dialog.`, async () => {
+      await userAction(`If Chrome prompts, click Allow; it may re-grant the access it just removed without asking. Then click Yes in ${APP_NAME}'s confirmation dialog.`, async () => {
         const status = await settingsStatus().catch(() => null);
         if (status?.startsWith("Setup failed")) {
           throw Object.assign(new Error(`${status} Rerun the smoke test; a folder selection expires after five minutes.`), { fatal: true });
@@ -787,6 +925,9 @@ async function run() {
         requireCondition(reply.config.sites.length === 1 &&
           reply.config.sites[0].origin === origin && reply.config.sites[0].path_prefix === "/allowed",
         "Host site rule does not match the fixture origin and /allowed prefix");
+      }, async () => {
+        await chromePrompt();
+        await answerAlert("Yes");
       });
       // A first navigation grant makes the settings page restart the extension,
       // which closes every extension page.
@@ -804,6 +945,10 @@ async function run() {
         await openSettingsTab();
         await settingsConnected();
       }
+      const granted = await chromeGrants(pattern);
+      requireCondition(granted.origin && granted.api, `Chrome did not grant ${pattern} and webNavigation`);
+      requireCondition(!(await chromeGrants(anyPortPattern)).origin,
+        `Chrome granted every port (${anyPortPattern}), not just ${pattern}`);
       await openPanel();
       await waitFor(() => onPanel(async (page) =>
         requireCondition(await page.hidden("#setup-warning") === true, "Panel still shows the setup warning")),
@@ -913,8 +1058,22 @@ async function run() {
         "A visit was logged after site removal");
     });
 
-    const cursor = await ask(`\nDid a spinning busy cursor stay on screen after any ${APP_NAME} dialog closed? Type no or yes: `);
-    requireCondition(cursor.toLowerCase() === "no", "A busy cursor persisted after a native dialog");
+    if (options.auto) {
+      // The busy cursor came from a host process left holding a dialog
+      // window, so check that no dialog process or host window remains.
+      await step("No host dialog left behind", async () => {
+        const pids = (await commandOutput("/usr/bin/pgrep", ["-f", options.host]).catch(() => ""))
+          .split("\n").filter(Boolean);
+        const commands = await Promise.all(pids.map((pid) =>
+          commandOutput("/bin/ps", ["-o", "command=", "-p", pid]).catch(() => "")));
+        requireCondition(!commands.some((command) => command.includes("__dialog-")), "A native dialog process is still running");
+        const windows = await Promise.all(pids.map(onScreenWindows));
+        requireCondition(windows.every((count) => count === 0), "A host process still has a window on screen");
+      });
+    } else {
+      const cursor = await ask(`\nDid a spinning busy cursor stay on screen after any ${APP_NAME} dialog closed? Type no or yes: `);
+      requireCondition(cursor.toLowerCase() === "no", "A busy cursor persisted after a native dialog");
+    }
 
     console.log("\nPASS: guided macOS Chrome M1 smoke run completed.");
   } catch (error) {
