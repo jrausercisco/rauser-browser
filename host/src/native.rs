@@ -10,6 +10,7 @@ use brauser_protocol::{
     VisitOutcome, VisitRecorded,
 };
 
+use crate::brand::NAMESPACE;
 use crate::capture::{CaptureOutcome, CapturePolicy, CaptureStore};
 use crate::config::{self, ConfigStore};
 use crate::consent::ConsentAuthority;
@@ -270,11 +271,17 @@ fn dispatch(
                     ErrorCode::Cancelled,
                     "folder selection was canceled",
                 ),
-                Err(_) => error(
-                    &value.request_id,
-                    ErrorCode::Internal,
-                    "could not open the folder picker",
-                ),
+                Err(choose_error) => {
+                    // The failure may come from the picker itself or from
+                    // checking the folder the user picked (for example one
+                    // macOS privacy settings protect); keep the cause.
+                    eprintln!("{NAMESPACE}: folder selection failed: {choose_error:#}");
+                    error(
+                        &value.request_id,
+                        ErrorCode::Internal,
+                        "could not open the folder picker or use the selected folder",
+                    )
+                }
             }
         }
         Request::ConfirmConfig(value) => {
