@@ -17,6 +17,7 @@ export interface UpdateConfigRequest {
   type: "update_config";
   protocol_version: 1;
   request_id: string;
+  expected_revision: string;
   config: ConfigSnapshot;
 }
 
@@ -32,6 +33,7 @@ export interface ConfigResult {
   type: "config_result";
   protocol_version: 1;
   request_id: string;
+  revision: string;
   config: ConfigSnapshot;
 }
 
@@ -39,6 +41,7 @@ export interface ConfigUpdated {
   type: "config_updated";
   protocol_version: 1;
   request_id: string;
+  revision: string;
   config: ConfigSnapshot;
 }
 

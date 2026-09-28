@@ -3,7 +3,7 @@
 //! block ownership and conflict detection before replacing an existing file.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +19,23 @@ const MAX_NOTE_BYTES: usize = 4 * 1024 * 1024;
 pub struct Vault {
     root: Dir,
     pages_dir: PathBuf,
+}
+
+/// A page that was published under its final name. Warnings describe work that
+/// failed after publication; callers must not retry the create as if it failed.
+#[derive(Debug)]
+pub struct CreatedPage {
+    pub relative_path: PathBuf,
+    pub warnings: Vec<PostPublishWarning>,
+}
+
+#[derive(Debug)]
+pub enum PostPublishWarning {
+    TemporaryFileRemoval {
+        temporary_name: String,
+        error: io::Error,
+    },
+    DirectorySync(io::Error),
 }
 
 impl Vault {
@@ -46,7 +63,26 @@ impl Vault {
 
     /// Atomically publish a new note, refusing to replace any existing file.
     /// The filename is derived from the URL, never from an extension path.
-    pub fn create_page(&self, page_url: &str, markdown: &str) -> Result<PathBuf> {
+    pub fn create_page(&self, page_url: &str, markdown: &str) -> Result<CreatedPage> {
+        self.create_page_with_post_publish_ops(
+            page_url,
+            markdown,
+            |pages, name| pages.remove_file(name),
+            sync_directory,
+        )
+    }
+
+    fn create_page_with_post_publish_ops<F, G>(
+        &self,
+        page_url: &str,
+        markdown: &str,
+        remove_temporary: F,
+        sync_parent: G,
+    ) -> Result<CreatedPage>
+    where
+        F: FnOnce(&Dir, &str) -> io::Result<()>,
+        G: FnOnce(&Dir) -> io::Result<()>,
+    {
         if markdown.len() > MAX_NOTE_BYTES {
             bail!("page note exceeds the 4 MiB write limit");
         }
@@ -60,16 +96,19 @@ impl Vault {
             .context("opening page notes directory")?;
 
         let temporary = format!(".rauser-{}.tmp", Uuid::new_v4());
-        let _cleanup = TempFileCleanup {
-            dir: &pages,
-            name: &temporary,
-        };
         let mut file = pages
             .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
             .context("creating page note temporary file")?;
-        file.write_all(markdown.as_bytes())?;
-        file.sync_all()?;
+        let mut cleanup = TempFileCleanup {
+            dir: &pages,
+            name: &temporary,
+            armed: true,
+        };
+        let write_result = file
+            .write_all(markdown.as_bytes())
+            .and_then(|_| file.sync_all());
         drop(file);
+        write_result?;
 
         // A hard link is an atomic no-clobber publication on the same volume.
         // rename() would silently replace a user file with this name.
@@ -78,9 +117,25 @@ impl Vault {
             .with_context(|| {
                 format!("page note already exists or cannot be created: {filename}")
             })?;
-        pages.remove_file(&temporary)?;
-        sync_directory(&pages)?;
-        Ok(self.pages_dir.join(filename))
+
+        let removal = remove_temporary(&pages, &temporary);
+        cleanup.disarm();
+        drop(cleanup);
+        let directory_sync = sync_parent(&pages);
+        let mut warnings = Vec::new();
+        if let Err(error) = removal {
+            warnings.push(PostPublishWarning::TemporaryFileRemoval {
+                temporary_name: temporary,
+                error,
+            });
+        }
+        if let Err(error) = directory_sync {
+            warnings.push(PostPublishWarning::DirectorySync(error));
+        }
+        Ok(CreatedPage {
+            relative_path: self.pages_dir.join(filename),
+            warnings,
+        })
     }
 }
 
@@ -140,22 +195,31 @@ fn slug(value: &str) -> String {
 struct TempFileCleanup<'a> {
     dir: &'a Dir,
     name: &'a str,
+    armed: bool,
+}
+
+impl TempFileCleanup<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for TempFileCleanup<'_> {
     fn drop(&mut self) {
-        let _ = self.dir.remove_file(self.name);
+        if self.armed {
+            let _ = self.dir.remove_file(self.name);
+        }
     }
 }
 
 #[cfg(not(windows))]
-fn sync_directory(dir: &Dir) -> Result<()> {
+fn sync_directory(dir: &Dir) -> io::Result<()> {
     dir.try_clone()?.into_std_file().sync_all()?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn sync_directory(_dir: &Dir) -> Result<()> {
+fn sync_directory(_dir: &Dir) -> io::Result<()> {
     // std does not expose a portable way to fsync a Windows directory handle.
     Ok(())
 }
@@ -188,15 +252,42 @@ mod tests {
         let relative = vault
             .create_page("https://example.com/article#part-1", "first")
             .unwrap();
+        assert!(relative.warnings.is_empty());
         assert!(
             vault
                 .create_page("https://example.com/article#part-2", "second")
                 .is_err()
         );
         assert_eq!(
-            fs::read_to_string(root.path().join(relative)).unwrap(),
+            fs::read_to_string(root.path().join(relative.relative_path)).unwrap(),
             "first"
         );
+    }
+
+    #[test]
+    fn post_publish_failures_report_created_page_with_warnings() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = Vault::open(&storage(root.path(), "pages")).unwrap();
+        let created = vault
+            .create_page_with_post_publish_ops(
+                "https://example.com/article",
+                "saved content",
+                |_, _| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                |_| Err(io::Error::other("simulated directory sync failure")),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.path().join(&created.relative_path)).unwrap(),
+            "saved content"
+        );
+        assert!(matches!(
+            created.warnings.as_slice(),
+            [
+                PostPublishWarning::TemporaryFileRemoval { .. },
+                PostPublishWarning::DirectorySync(_)
+            ]
+        ));
     }
 
     #[test]

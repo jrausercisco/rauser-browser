@@ -46,11 +46,12 @@
     "UpdateConfigRequest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "protocol_version", "request_id", "config"],
+      "required": ["type", "protocol_version", "request_id", "expected_revision", "config"],
       "properties": {
         "type": { "const": "update_config" },
         "protocol_version": { "type": "integer", "const": 1 },
         "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "expected_revision": { "type": "string", "minLength": 1, "maxLength": 128 },
         "config": { "$ref": "#/$defs/ConfigSnapshot" }
       }
     },
@@ -69,22 +70,24 @@
     "ConfigResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "protocol_version", "request_id", "config"],
+      "required": ["type", "protocol_version", "request_id", "revision", "config"],
       "properties": {
         "type": { "const": "config_result" },
         "protocol_version": { "type": "integer", "const": 1 },
         "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "revision": { "type": "string", "minLength": 1, "maxLength": 128 },
         "config": { "$ref": "#/$defs/ConfigSnapshot" }
       }
     },
     "ConfigUpdated": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "protocol_version", "request_id", "config"],
+      "required": ["type", "protocol_version", "request_id", "revision", "config"],
       "properties": {
         "type": { "const": "config_updated" },
         "protocol_version": { "type": "integer", "const": 1 },
         "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "revision": { "type": "string", "minLength": 1, "maxLength": 128 },
         "config": { "$ref": "#/$defs/ConfigSnapshot" }
       }
     },

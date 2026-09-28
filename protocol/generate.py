@@ -124,6 +124,16 @@ def render_rust(definitions: dict, version: int) -> str:
         "",
         f"pub const PROTOCOL_VERSION: u32 = {version};",
         "",
+        "// A nullable JSON Schema property is still required on the wire.",
+        "// Serde otherwise treats a missing Option field as None.",
+        "fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>",
+        "where",
+        "    D: serde::Deserializer<'de>,",
+        "    T: Deserialize<'de>,",
+        "{",
+        "    Option::<T>::deserialize(deserializer)",
+        "}",
+        "",
     ]
     for name, definition in definitions.items():
         if name in ("Request", "Response"):
@@ -152,6 +162,8 @@ def render_rust(definitions: dict, version: int) -> str:
         for field, shape in definition["properties"].items():
             if field == "type":
                 continue
+            if "oneOf" in shape:
+                output.append('    #[serde(deserialize_with = "deserialize_required_nullable")]')
             output.append(f"    pub {field}: {shape_type(shape, 'rust')},")
         output.extend(["}", ""])
     for name in ("Request", "Response"):

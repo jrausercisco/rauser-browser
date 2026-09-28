@@ -31,7 +31,7 @@ npm run typecheck
 npm run lint
 ```
 
-The current host protocol supports discovery and configuration messages. Capture stays disabled until the site permission and allowlist rules are implemented. The vault module currently creates new page files only and refuses to replace an existing file. See [protocol/README.md](protocol/README.md) for the message contract.
+The current host protocol supports discovery and revision-checked configuration messages. Capture stays disabled until the site permission and allowlist rules are implemented. The vault module currently creates new page files only, refuses to replace an existing file, and reports warnings if cleanup fails after publication. See [protocol/README.md](protocol/README.md) for the message contract.
 
 ## License
 

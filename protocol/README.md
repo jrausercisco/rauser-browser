@@ -19,7 +19,18 @@ the typed request. A mismatch returns an `error` response with code
 `unsupported_protocol_version` and the host's protocol version. If malformed
 input has no recoverable request ID, an `error` response may use an empty ID.
 
-The M0 contract covers host discovery and configuration. Additional capture,
-notes, and agent messages require a protocol version change. The host remains
-responsible for runtime validation of string lengths, absolute paths, storage
-confinement, and whether a requested config change is authorized.
+The M0 contract covers host discovery and configuration. `get_config` returns a
+`revision` that the extension must send as `expected_revision` with its full
+`update_config` snapshot. A successful update returns a new `revision`; a stale
+revision returns a `conflict` error. The revision is `missing` when no config
+file exists, or `sha256:` followed by 64 lowercase hex digits for an existing
+file. The host compares it with the current file before replacement.
+
+`ConfigSnapshot.storage` must be present: use `null` only to explicitly clear
+the selected notes folder. The generated Rust deserializer rejects an omitted
+field, matching the JSON Schema requirement.
+
+Additional capture, notes, and agent messages require a protocol version
+change. The host remains responsible for runtime validation of string lengths,
+absolute paths, storage confinement, and whether a requested config change is
+authorized.

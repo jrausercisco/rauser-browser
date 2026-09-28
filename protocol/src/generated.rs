@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+// A nullable JSON Schema property is still required on the wire.
+// Serde otherwise treats a missing Option field as None.
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelloRequest {
@@ -22,6 +32,7 @@ pub struct GetConfigRequest {
 pub struct UpdateConfigRequest {
     pub protocol_version: u32,
     pub request_id: String,
+    pub expected_revision: String,
     pub config: ConfigSnapshot,
 }
 
@@ -39,6 +50,7 @@ pub struct HelloResult {
 pub struct ConfigResult {
     pub protocol_version: u32,
     pub request_id: String,
+    pub revision: String,
     pub config: ConfigSnapshot,
 }
 
@@ -47,6 +59,7 @@ pub struct ConfigResult {
 pub struct ConfigUpdated {
     pub protocol_version: u32,
     pub request_id: String,
+    pub revision: String,
     pub config: ConfigSnapshot,
 }
 
@@ -75,6 +88,7 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigSnapshot {
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub storage: Option<StorageConfig>,
     pub capture_enabled: bool,
 }
