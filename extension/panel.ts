@@ -108,7 +108,14 @@ function scheduleReplay(state: WorkerStatus): void {
 
 function openSettings(): void {
   void chrome.runtime.openOptionsPage().catch((error: unknown) => {
-    show(`Could not open settings: ${describe(error)}`, true);
+    // Chrome reads an unpacked extension's manifest only when it loads the
+    // extension, but serves rebuilt pages from disk. A panel from a newer build
+    // can therefore run against a manifest with no settings page.
+    if (!chrome.runtime.getManifest().options_ui) {
+      show("Chrome is still running an older Rauser build. Click Reload on Rauser in chrome://extensions, then reopen this panel.", true);
+    } else {
+      show(`Could not open settings: ${describe(error)}`, true);
+    }
   });
 }
 
