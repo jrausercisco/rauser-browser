@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
-use crate::vault::Vault;
+use crate::vault::{Vault, selected_root_identity};
 
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_ROOT_PATH_BYTES: usize = 4 * 1024;
@@ -37,6 +37,7 @@ pub struct ConfigStore {
     config: ConfigSnapshot,
     revision: String,
     issue: Option<String>,
+    root_identity: Option<String>,
 }
 
 struct DiskState {
@@ -44,6 +45,7 @@ struct DiskState {
     revision: String,
     issue: Option<String>,
     needs_backup: bool,
+    root_identity: Option<String>,
 }
 
 impl ConfigStore {
@@ -64,6 +66,7 @@ impl ConfigStore {
             config: state.config,
             revision: state.revision,
             issue: state.issue,
+            root_identity: state.root_identity,
         })
     }
 
@@ -73,6 +76,27 @@ impl ConfigStore {
 
     pub fn revision(&self) -> &str {
         &self.revision
+    }
+
+    pub fn root_identity(&self) -> Option<&str> {
+        self.root_identity.as_deref()
+    }
+
+    /// Hold this lock from the policy refresh through a privileged write.
+    /// ConfigStore::update takes the same lock before replacing config.toml.
+    pub(crate) fn lock_current(&self) -> Result<File> {
+        let parent = self.path.parent().context("config path has no parent")?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        let path = parent.join(".config.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        file.lock().context("locking configuration")?;
+        Ok(file)
     }
 
     /// A malformed or newer config is shown to setup, never used for capture.
@@ -85,6 +109,7 @@ impl ConfigStore {
         self.config = state.config;
         self.revision = state.revision;
         self.issue = state.issue;
+        self.root_identity = state.root_identity;
         Ok(())
     }
 
@@ -94,41 +119,64 @@ impl ConfigStore {
 
     /// Replace config only when the caller's revision still matches the file.
     /// `None` is a conflict; `Some(revision)` is a committed update.
+    #[cfg(test)]
     pub(crate) fn update(
         &mut self,
         next: ConfigSnapshot,
         expected_revision: &str,
+    ) -> Result<Option<String>> {
+        self.update_with_root_identity(next, expected_revision, None)
+    }
+
+    pub(crate) fn update_with_root_identity(
+        &mut self,
+        next: ConfigSnapshot,
+        expected_revision: &str,
+        selected_identity: Option<&str>,
     ) -> Result<Option<String>> {
         let json = serde_json::to_vec(&next).context("serializing config JSON")?;
         if json.len() > MAX_CONFIG_BYTES {
             bail!("configuration exceeds the 64 KiB size limit");
         }
         validate(&next)?;
-        let serialized = toml::to_string_pretty(&StoredConfig::from(&next))
-            .context("serializing config TOML")?;
-        if serialized.len() > MAX_CONFIG_BYTES {
-            bail!("configuration exceeds the 64 KiB size limit");
-        }
         let parent = self.path.parent().context("config path has no parent")?;
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-
-        // The lock file has a stable name. Locking config.toml itself would
-        // leave a different inode locked after atomic replacement.
-        let lock_path = parent.join(".config.lock");
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("opening {}", lock_path.display()))?;
-        lock_file.lock().context("locking configuration")?;
+        let _lock_file = self.lock_current()?;
         let current = read_disk_state(&self.path)?;
         if expected_revision != current.revision {
             self.config = current.config;
             self.revision = current.revision;
             self.issue = current.issue;
+            self.root_identity = current.root_identity;
             return Ok(None);
+        }
+
+        let next_identity = match next.storage.as_ref() {
+            None => None,
+            Some(storage) => {
+                let unchanged = current
+                    .config
+                    .storage
+                    .as_ref()
+                    .is_some_and(|old| old.root == storage.root);
+                let expected = selected_identity
+                    .or_else(|| {
+                        unchanged
+                            .then_some(current.root_identity.as_deref())
+                            .flatten()
+                    })
+                    .context("a fresh native folder selection is required")?;
+                let actual = selected_root_identity(Path::new(&storage.root))?;
+                if actual != expected {
+                    bail!("selected notes folder changed; choose it again");
+                }
+                Some(actual)
+            }
+        };
+        let serialized =
+            toml::to_string_pretty(&StoredConfig::from_snapshot(&next, next_identity.clone()))
+                .context("serializing config TOML")?;
+        if serialized.len() > MAX_CONFIG_BYTES {
+            bail!("configuration exceeds the 64 KiB size limit");
         }
 
         // Repair must preserve the exact unreadable file. A no-clobber,
@@ -142,6 +190,7 @@ impl ConfigStore {
                 self.config = after_backup.config;
                 self.revision = after_backup.revision;
                 self.issue = after_backup.issue;
+                self.root_identity = after_backup.root_identity;
                 return Ok(None);
             }
         }
@@ -163,6 +212,7 @@ impl ConfigStore {
         self.config = next;
         self.revision = revision.clone();
         self.issue = None;
+        self.root_identity = next_identity;
         if let Err(error) = sync_parent(parent) {
             eprintln!("rauser: warning: config was saved but directory sync failed: {error:#}");
         }
@@ -176,6 +226,7 @@ impl ConfigStore {
             config: empty_config(),
             revision: MISSING_REVISION.into(),
             issue: None,
+            root_identity: None,
         }
     }
 }
@@ -188,6 +239,8 @@ struct StoredConfig {
     #[serde(default)]
     root_picker_confirmed: bool,
     #[serde(default)]
+    root_identity: Option<String>,
+    #[serde(default)]
     capture_enabled: bool,
     #[serde(default)]
     sites: Vec<SiteConfig>,
@@ -197,13 +250,14 @@ struct StoredConfig {
     near_repeat_secs: u32,
 }
 
-impl From<&ConfigSnapshot> for StoredConfig {
-    fn from(value: &ConfigSnapshot) -> Self {
+impl StoredConfig {
+    fn from_snapshot(value: &ConfigSnapshot, root_identity: Option<String>) -> Self {
         Self {
             storage: value.storage.clone(),
             // Only native dispatch calls ConfigStore::update, after verifying
             // the picker grant for a new root. This marks the root's M1 origin.
             root_picker_confirmed: value.storage.is_some(),
+            root_identity,
             capture_enabled: value.capture_enabled,
             sites: value.sites.clone(),
             strip_params: value.strip_params.clone(),
@@ -233,6 +287,7 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
                 revision: MISSING_REVISION.into(),
                 issue: None,
                 needs_backup: false,
+                root_identity: None,
             });
         }
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
@@ -263,6 +318,7 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
             revision,
             issue: Some("Configuration exceeds 64 KiB. Choose a notes folder and save a replacement; the original will be backed up.".into()),
             needs_backup: true,
+            root_identity: None,
         });
     }
     let parsed = std::str::from_utf8(&contents)
@@ -270,12 +326,21 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
         .and_then(|text| toml::from_str::<StoredConfig>(text).map_err(anyhow::Error::from));
     match parsed {
         Ok(stored) => {
-            let root_unconfirmed = stored.storage.is_some() && !stored.root_picker_confirmed;
+            let root_identity = stored.root_identity.clone();
+            let root_unconfirmed = stored.storage.is_some()
+                && (!stored.root_picker_confirmed || root_identity.is_none());
             let config: ConfigSnapshot = stored.into();
             let issue = if root_unconfirmed {
                 Some("This notes folder predates native picker confirmation. Choose it again to activate capture; the original config will be backed up.".to_owned())
             } else if validate(&config).is_err() {
                 Some("Configuration settings or notes folder are invalid or unavailable. Choose a notes folder and save a repair; the original config will be backed up.".to_owned())
+            } else if config.storage.as_ref().is_some_and(|storage| {
+                match selected_root_identity(Path::new(&storage.root)) {
+                    Ok(actual) => Some(actual.as_str()) != root_identity.as_deref(),
+                    Err(_) => true,
+                }
+            }) {
+                Some("The selected notes folder changed. Choose it again to repair this configuration; the original config will be backed up.".to_owned())
             } else {
                 None
             };
@@ -284,6 +349,7 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
                 revision,
                 needs_backup: issue.is_some(),
                 issue,
+                root_identity: if root_unconfirmed { None } else { root_identity },
             })
         }
         Err(_) => Ok(DiskState {
@@ -291,6 +357,7 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
             revision,
             issue: Some("Configuration is invalid or from a newer version. Choose a notes folder and save a replacement; the original will be backed up.".into()),
             needs_backup: true,
+            root_identity: None,
         }),
     }
 }
@@ -636,14 +703,90 @@ mod tests {
             capture_enabled: false,
             ..empty_config()
         };
+        let root_identity = selected_root_identity(folder.path()).unwrap();
         let second_revision = second
-            .update(next.clone(), &first_revision)
+            .update_with_root_identity(next.clone(), &first_revision, Some(&root_identity))
             .unwrap()
             .unwrap();
         assert_ne!(first_revision, second_revision);
         first.refresh().unwrap();
         assert_eq!(first.snapshot(), &next);
         assert_eq!(first.revision(), second_revision);
+    }
+
+    #[test]
+    fn legacy_same_path_requires_and_accepts_fresh_selection() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.toml");
+        let next = ConfigSnapshot {
+            storage: Some(StorageConfig {
+                root: folder.path().to_string_lossy().into_owned(),
+                profile: "neutral".into(),
+                log_dir: "log".into(),
+                pages_dir: "pages".into(),
+                later_dir: "later".into(),
+            }),
+            ..empty_config()
+        };
+        // Old M1 files recorded picker confirmation but not folder identity.
+        fs::write(
+            &path,
+            toml::to_string(&StoredConfig::from_snapshot(&next, None)).unwrap(),
+        )
+        .unwrap();
+        let mut store = ConfigStore::for_test(path);
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_some());
+        assert!(store.snapshot().storage.is_none());
+        let revision = store.revision().to_owned();
+        assert!(store.update(next.clone(), &revision).is_err());
+        let identity = selected_root_identity(folder.path()).unwrap();
+        store
+            .update_with_root_identity(next.clone(), &revision, Some(&identity))
+            .unwrap()
+            .unwrap();
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
+        assert_eq!(store.snapshot(), &next);
+    }
+
+    #[test]
+    fn replacing_selected_directory_requires_reselection() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("selected");
+        let moved = base.path().join("moved");
+        fs::create_dir(&root).unwrap();
+        let path = base.path().join("config.toml");
+        let mut store = ConfigStore::for_test(path);
+        let config = ConfigSnapshot {
+            storage: Some(StorageConfig {
+                root: root.to_string_lossy().into_owned(),
+                profile: "neutral".into(),
+                log_dir: "log".into(),
+                pages_dir: "pages".into(),
+                later_dir: "later".into(),
+            }),
+            ..empty_config()
+        };
+        let identity = selected_root_identity(&root).unwrap();
+        store
+            .update_with_root_identity(config.clone(), MISSING_REVISION, Some(&identity))
+            .unwrap()
+            .unwrap();
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_some());
+        assert!(store.snapshot().storage.is_none());
+        let new_identity = selected_root_identity(&root).unwrap();
+        assert_ne!(identity, new_identity);
+        let revision = store.revision().to_owned();
+        store
+            .update_with_root_identity(config, &revision, Some(&new_identity))
+            .unwrap()
+            .unwrap();
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
     }
 
     #[test]

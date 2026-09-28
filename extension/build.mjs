@@ -21,7 +21,7 @@ await mkdir(outputDir, { recursive: true });
 for (const name of ["manifest.json", "panel.html", "panel.css"]) {
   await copyFile(join(extensionDir, name), join(outputDir, name));
 }
-for (const name of ["model.js", "native.js", "panel.js", "worker.js"]) {
+for (const name of ["coordination.js", "model.js", "native.js", "panel.js", "worker.js"]) {
   await copyFile(join(intermediateDir, "extension", name), join(outputDir, name));
 }
 await rm(intermediateDir, { recursive: true, force: true });

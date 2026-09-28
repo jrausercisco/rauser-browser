@@ -40,24 +40,18 @@ pub enum PostPublishWarning {
 
 impl Vault {
     pub fn open(storage: &StorageConfig) -> Result<Self> {
+        Self::open_checked(storage, None)
+    }
+
+    /// The identity comes from the native picker and is persisted with config.
+    /// Check the opened directory handle, not just a canonicalized pathname:
+    /// a folder can be replaced between those two operations.
+    pub fn open_checked(storage: &StorageConfig, expected_identity: Option<&str>) -> Result<Self> {
         let chosen = Path::new(&storage.root);
-        if !chosen.is_absolute() {
-            bail!("notes folder must be an absolute path");
-        }
-        let canonical = fs::canonicalize(chosen)
-            .with_context(|| format!("resolving notes folder {}", chosen.display()))?;
-        if !canonical.is_dir() {
-            bail!("notes folder is not a directory: {}", canonical.display());
-        }
         let pages_dir = checked_relative_dir(&storage.pages_dir)?;
         checked_relative_dir(&storage.log_dir)?;
         checked_relative_dir(&storage.later_dir)?;
-
-        // This is the sole ambient filesystem entry point for vault contents.
-        // cap-std resolves subsequent paths relative to this open directory and
-        // prevents symlinks from escaping it.
-        let root = Dir::open_ambient_dir(&canonical, ambient_authority())
-            .with_context(|| format!("opening notes folder {}", canonical.display()))?;
+        let (root, _) = open_selected_root(chosen, expected_identity)?;
         Ok(Self { root, pages_dir })
     }
 
@@ -233,6 +227,68 @@ impl Vault {
             relative_path: self.pages_dir.join(filename),
             warnings,
         })
+    }
+}
+
+/// Open the selected directory as a capability, then identify that handle.
+/// Reopening a pathname must never silently authorize a replacement folder.
+pub(crate) fn open_selected_root(
+    chosen: &Path,
+    expected_identity: Option<&str>,
+) -> Result<(Dir, String)> {
+    if !chosen.is_absolute() {
+        bail!("notes folder must be an absolute path");
+    }
+    let canonical = fs::canonicalize(chosen)
+        .with_context(|| format!("resolving notes folder {}", chosen.display()))?;
+    if !canonical.is_dir() {
+        bail!("notes folder is not a directory: {}", canonical.display());
+    }
+    // This is the sole ambient filesystem entry point for vault contents.
+    // cap-std confines subsequent paths to the opened directory.
+    let root = Dir::open_ambient_dir(&canonical, ambient_authority())
+        .with_context(|| format!("opening notes folder {}", canonical.display()))?;
+    let identity = directory_identity(&root)?;
+    if expected_identity.is_some_and(|expected| expected != identity) {
+        bail!("selected notes folder changed; choose it again");
+    }
+    Ok((root, identity))
+}
+
+pub(crate) fn selected_root_identity(chosen: &Path) -> Result<String> {
+    let (_, identity) = open_selected_root(chosen, None)?;
+    Ok(identity)
+}
+
+fn directory_identity(dir: &Dir) -> Result<String> {
+    let metadata = dir
+        .try_clone()
+        .context("cloning notes folder handle")?
+        .into_std_file()
+        .metadata()
+        .context("identifying notes folder")?;
+    if !metadata.is_dir() {
+        bail!("selected notes folder is not a directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "unix:{:016x}:{:016x}",
+            metadata.dev(),
+            metadata.ino()
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let volume = metadata
+            .volume_serial_number()
+            .context("Windows did not return a notes-folder volume ID")?;
+        let file = metadata
+            .file_index()
+            .context("Windows did not return a notes-folder file ID")?;
+        Ok(format!("windows:{volume:08x}:{file:016x}"))
     }
 }
 

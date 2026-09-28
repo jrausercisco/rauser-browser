@@ -35,18 +35,22 @@ export interface WorkerStatus {
   policy_expires_at: number | null;
   revoked_origins: string[];
   pause_pending: boolean;
+  pause_token: string | null;
   navigation_ready: boolean;
   locally_removed_sites: SiteConfig[];
 }
 
 export type WorkerRequest =
-  | { kind: "install_policy"; lease: PolicyLease; resume_after_confirmation: boolean }
-  | { kind: "clear_policy" }
+  | { kind: "install_policy"; lease: PolicyLease; resume_after_confirmation: boolean; resume_after_pause_token: string | null }
+  | { kind: "suspend_policy" }
   | { kind: "pause_capture" }
+  | { kind: "get_pending_ids" }
+  | { kind: "discard_pending"; event_ids: string[] }
   | { kind: "remove_site"; site: SiteConfig }
   | { kind: "get_pending" }
   | { kind: "ack_visit"; event_id: string; outcome: VisitOutcome; reason: string | null }
   | { kind: "get_status" }
+  | { kind: "ack_reenabled_origin"; origin: string; revision: string }
   | { kind: "ack_revocations"; origins: string[] };
 
 export interface WorkerReply<T> {

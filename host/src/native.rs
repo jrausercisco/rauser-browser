@@ -201,20 +201,27 @@ fn dispatch(
             }
             let previous = config.snapshot().clone();
             let previous_revision = config.revision().to_owned();
-            if let Err(authority_error) = consent.authorize_update(
+            let selected_identity = match consent.authorize_update(
                 &previous,
                 &previous_revision,
                 &value.config,
                 value.picker_token.as_deref(),
                 value.consent_token.as_deref(),
             ) {
-                return error(
-                    &value.request_id,
-                    ErrorCode::Unauthorized,
-                    &authority_error.to_string(),
-                );
-            }
-            match config.update(value.config.clone(), &value.expected_revision) {
+                Ok(identity) => identity,
+                Err(authority_error) => {
+                    return error(
+                        &value.request_id,
+                        ErrorCode::Unauthorized,
+                        &authority_error.to_string(),
+                    );
+                }
+            };
+            match config.update_with_root_identity(
+                value.config.clone(),
+                &value.expected_revision,
+                selected_identity.as_deref(),
+            ) {
                 Ok(Some(revision)) => {
                     consent.consume_update(
                         &previous,
@@ -339,6 +346,12 @@ fn record_visit(value: rauser_protocol::RecordVisitRequest, config: &mut ConfigS
             relative_path: None,
         })
     };
+    // Serialize with all host config updates, then re-read policy while the
+    // lock is held. A revoked site cannot be appended after revocation commits.
+    let _config_lock = match config.lock_current() {
+        Ok(lock) => lock,
+        Err(_) => return retryable("configuration is unavailable"),
+    };
     if config.refresh().is_err() || config.config_issue().is_some() {
         return retryable("configuration is unavailable or needs repair");
     }
@@ -355,7 +368,7 @@ fn record_visit(value: rauser_protocol::RecordVisitRequest, config: &mut ConfigS
     let Some(storage) = config.snapshot().storage.as_ref() else {
         return retryable("choose a notes folder before capture");
     };
-    let store = match CaptureStore::open(storage) {
+    let store = match CaptureStore::open_checked(storage, config.root_identity()) {
         Ok(store) => store,
         Err(_) => return retryable("notes folder is unavailable"),
     };
@@ -389,6 +402,16 @@ fn create_page_note(
     value: rauser_protocol::CreatePageNoteRequest,
     config: &mut ConfigStore,
 ) -> Response {
+    let _config_lock = match config.lock_current() {
+        Ok(lock) => lock,
+        Err(_) => {
+            return error(
+                &value.request_id,
+                ErrorCode::Internal,
+                "configuration is unavailable",
+            );
+        }
+    };
     if config.refresh().is_err() || config.config_issue().is_some() {
         return error(
             &value.request_id,
@@ -431,7 +454,7 @@ fn create_page_note(
             );
         }
     };
-    let vault = match Vault::open(storage) {
+    let vault = match Vault::open_checked(storage, config.root_identity()) {
         Ok(vault) => vault,
         Err(_) => {
             return error(
@@ -619,9 +642,17 @@ mod tests {
     fn future_message_type_reports_version_before_shape_error() {
         let folder = tempfile::tempdir().unwrap();
         let config = ConfigStore::for_test(folder.path().join("config.toml"));
-        let request = br#"{"type":"future_operation","protocol_version":2,"request_id":"future-1","new_field":true}"#;
+        let request = format!(
+            r#"{{"type":"future_operation","protocol_version":{},"request_id":"future-1","new_field":true}}"#,
+            PROTOCOL_VERSION + 1
+        );
         let mut output = Vec::new();
-        serve_with_io(Cursor::new(encoded_json(request)), &mut output, config).unwrap();
+        serve_with_io(
+            Cursor::new(encoded_json(request.as_bytes())),
+            &mut output,
+            config,
+        )
+        .unwrap();
         match decoded_response(output) {
             Response::Error(value) => {
                 assert_eq!(value.code, ErrorCode::UnsupportedProtocolVersion);

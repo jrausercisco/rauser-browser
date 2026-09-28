@@ -5,6 +5,8 @@
   "description": "Development tooling for the Rauser browser extension and shared protocol",
   "scripts": {
     "build:extension": "node extension/build.mjs",
+    "test:extension": "node --test extension/tests/worker.test.mjs",
+    "smoke:macos": "node scripts/smoke-macos.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0"
   },

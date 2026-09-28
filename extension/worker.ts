@@ -20,6 +20,7 @@ const QUEUE_KEY = "rauser_queue_v1";
 const POLICY_KEY = "rauser_policy_v1";
 const REVOCATIONS_KEY = "rauser_revocations_v1";
 const PAUSE_KEY = "rauser_pause_pending_v1";
+const PAUSE_TOKEN_KEY = "rauser_pause_token_v1";
 const REMOVED_SITES_KEY = "rauser_locally_removed_sites_v1";
 const MAX_VISIT_URL_BYTES = 16 * 1_024;
 const MAX_TITLE_CHARS = 300;
@@ -92,6 +93,14 @@ async function pausePending(): Promise<boolean> {
   return stored[PAUSE_KEY] === true;
 }
 
+async function readPauseToken(): Promise<string | null> {
+  const stored = await chrome.storage.local.get(PAUSE_TOKEN_KEY);
+  const value = stored[PAUSE_TOKEN_KEY];
+  if (value === undefined) return null;
+  if (typeof value !== "string") throw new Error("Local pause state is unreadable; capture is paused");
+  return value;
+}
+
 function sameSite(left: { origin: string; path_prefix: string }, right: {
   origin: string; path_prefix: string;
 }): boolean {
@@ -131,15 +140,47 @@ function matchesAnySite(sites: Array<{ origin: string; path_prefix: string }>, r
   }
 }
 
-async function hasGrant(origin: string): Promise<boolean> {
+async function checkedGrant(origin: string): Promise<boolean | null> {
   try {
     return await chrome.permissions.contains({
       permissions: ["webNavigation"],
       origins: [exactOriginPattern(origin)],
     });
   } catch {
-    return false;
+    return null;
   }
+}
+
+async function purgeRevokedQueueWithoutPolicy(): Promise<void> {
+  const queue = await readQueue();
+  if (!queue.items.length) return;
+  const grants = new Map<string, boolean | null>();
+  const retained: QueuedVisit[] = [];
+  const revoked = new Set<string>();
+  for (const item of queue.items) {
+    let origin: string;
+    try {
+      const url = new URL(item.event.url);
+      if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+      origin = url.origin;
+    } catch {
+      continue;
+    }
+    if (!grants.has(origin)) grants.set(origin, await checkedGrant(origin));
+    if (grants.get(origin) !== false) retained.push(item);
+    else revoked.add(origin);
+  }
+  if (retained.length === queue.items.length) return;
+  queue.items = retained;
+  const removed = [...revoked];
+  queue.last_error = removed.length
+    ? `Chrome access was removed for ${removed.join(", ")}; pending visits were purged`
+    : "Invalid pending visits were purged";
+  const revocations = await readRevocations();
+  await chrome.storage.local.set({
+    [QUEUE_KEY]: queue,
+    [REVOCATIONS_KEY]: [...new Set([...revocations, ...removed])].slice(0, 256),
+  });
 }
 
 async function reconcileGrants(): Promise<PolicyLease | null> {
@@ -147,7 +188,11 @@ async function reconcileGrants(): Promise<PolicyLease | null> {
   // fail closed even when an older cached policy is otherwise readable.
   const locallyRemoved = await readLocallyRemovedSites();
   let lease = await readPolicy();
-  if (!lease || await pausePending()) return null;
+  if (!lease) {
+    await purgeRevokedQueueWithoutPolicy();
+    return null;
+  }
+  if (await pausePending()) return null;
   const activeSites = lease.sites.filter((site) =>
     !locallyRemoved.some((removed) => sameSite(removed, site)));
   if (activeSites.length !== lease.sites.length) {
@@ -168,7 +213,9 @@ async function reconcileGrants(): Promise<PolicyLease | null> {
   const retained = [];
   const removed: string[] = [];
   for (const site of lease.sites) {
-    if (await hasGrant(site.origin)) retained.push(site);
+    const grant = await checkedGrant(site.origin);
+    if (grant === null) throw new Error("Chrome access could not be checked; capture is paused");
+    if (grant) retained.push(site);
     else removed.push(site.origin);
   }
   if (!removed.length) return lease;
@@ -251,11 +298,22 @@ async function captureNavigation(details: ChromeNavigationDetails): Promise<void
   await writeQueue(queue);
 }
 
-async function installPolicy(lease: PolicyLease, resumeAfterConfirmation: boolean): Promise<WorkerStatus> {
+async function installPolicy(
+  lease: PolicyLease,
+  resumeAfterConfirmation: boolean,
+  resumeAfterPauseToken: string | null,
+): Promise<WorkerStatus> {
   if (!isPolicyLease(lease) || lease.expires_at <= Date.now()) {
     throw new Error("Host policy lease is invalid or expired");
   }
-  if (await pausePending() && !resumeAfterConfirmation) return currentStatus();
+  if (await pausePending()) {
+    if (!resumeAfterConfirmation) return currentStatus();
+    // A pause requested during native confirmation must win over an older
+    // enable operation, even if that enable later commits its host config.
+    if (lease.capture_enabled && resumeAfterPauseToken !== await readPauseToken()) {
+      return currentStatus();
+    }
+  }
   const removed = await readLocallyRemovedSites();
   const stillRemoved = removed.filter((site) => lease.sites.some((entry) => sameSite(entry, site)));
   const effectiveLease: PolicyLease = {
@@ -297,6 +355,7 @@ async function currentStatus(
     policy_expires_at: policy?.expires_at ?? null,
     revoked_origins: await readRevocations(),
     pause_pending: paused,
+    pause_token: await readPauseToken(),
     navigation_ready: navigationReady,
     locally_removed_sites: await readLocallyRemovedSites(),
   };
@@ -307,19 +366,36 @@ async function handleMessage(message: WorkerRequest): Promise<unknown> {
   await ensureTrustedStorage();
   switch (message.kind) {
     case "install_policy":
-      return installPolicy(message.lease, message.resume_after_confirmation);
-    case "clear_policy": {
-      const queue = await readQueue().catch(() => emptyQueue());
-      queue.items = [];
-      await chrome.storage.local.set({ [PAUSE_KEY]: true, [POLICY_KEY]: null, [QUEUE_KEY]: queue });
-      return currentStatus(null, queue);
-    }
+      return installPolicy(message.lease, message.resume_after_confirmation,
+        message.resume_after_pause_token);
+    case "suspend_policy":
+      // A repairable host config issue is not a user revocation. Remove the
+      // capture lease immediately, but leave queued visits and an explicit
+      // local pause untouched until a valid host policy can reconcile them.
+      await chrome.storage.local.set({ [POLICY_KEY]: null });
+      await reconcileGrants();
+      return currentStatus();
     case "pause_capture": {
       const queue = await readQueue().catch(() => emptyQueue());
       queue.items = [];
       await chrome.storage.local.set({
-        [PAUSE_KEY]: true, [POLICY_KEY]: null, [QUEUE_KEY]: queue,
+        [PAUSE_KEY]: true, [PAUSE_TOKEN_KEY]: crypto.randomUUID(),
+        [POLICY_KEY]: null, [QUEUE_KEY]: queue,
       });
+      return currentStatus(null, queue);
+    }
+    case "get_pending_ids":
+      return (await readQueue()).items.map((item) => item.event.event_id);
+    case "discard_pending": {
+      if (!Array.isArray(message.event_ids) ||
+          message.event_ids.length > MAX_QUEUED_VISITS ||
+          !message.event_ids.every((id) => typeof id === "string")) {
+        throw new Error("Invalid pending-visit discard request");
+      }
+      const selected = new Set(message.event_ids);
+      const queue = await readQueue();
+      queue.items = queue.items.filter((item) => !selected.has(item.event.event_id));
+      await writeQueue(queue);
       return currentStatus(null, queue);
     }
     case "remove_site": {
@@ -373,6 +449,23 @@ async function handleMessage(message: WorkerRequest): Promise<unknown> {
     case "get_status":
       await reconcileGrants();
       return currentStatus();
+    case "ack_reenabled_origin": {
+      // An older revocation must not delete a newly confirmed site. Clear it
+      // only when this exact host revision is active and Chrome still grants
+      // the origin. A fresh removal event queued after this message restores
+      // the revocation marker.
+      const lease = await readPolicy();
+      if (!lease || lease.revision !== message.revision || !lease.capture_enabled ||
+          !lease.sites.some((site) => site.origin === message.origin) ||
+          await checkedGrant(message.origin) !== true) {
+        return currentStatus();
+      }
+      const known = await readRevocations();
+      await chrome.storage.local.set({
+        [REVOCATIONS_KEY]: known.filter((origin) => origin !== message.origin),
+      });
+      return currentStatus();
+    }
     case "ack_revocations": {
       const known = await readRevocations();
       const acknowledged = new Set(message.origins);

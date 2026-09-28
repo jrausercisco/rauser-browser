@@ -16,6 +16,7 @@ import {
   type WorkerRequest,
   type WorkerStatus,
 } from "./model.js";
+import { finishHostPause, withLatestHostState } from "./coordination.js";
 import { HostClient, HostError, PROTOCOL_VERSION, newRequestId } from "./native.js";
 
 const status = element<HTMLDivElement>("status");
@@ -29,6 +30,7 @@ const sitesList = element<HTMLUListElement>("sites-list");
 const queueSummary = element<HTMLParagraphElement>("queue-summary");
 const queueWarning = element<HTMLParagraphElement>("queue-warning");
 const replayButton = element<HTMLButtonElement>("replay");
+const discardButton = element<HTMLButtonElement>("discard-pending");
 const noteTitle = element<HTMLInputElement>("note-title");
 const noteBody = element<HTMLTextAreaElement>("note-body");
 const noteButton = element<HTMLButtonElement>("create-note");
@@ -47,6 +49,7 @@ let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let lastWorkerStatus: WorkerStatus | null = null;
 const RETRY_POLL_MS = 30_000;
 const LEASE_RENEW_WINDOW_MS = 60 * 60_000;
+const CONFIG_MUTATION_LOCK = "rauser-config-permissions";
 let preflightVersion = 0;
 let preflight: {
   origin: string;
@@ -73,6 +76,13 @@ function show(message: string, warning = false): void {
   status.classList.toggle("warning", warning);
 }
 
+async function withConfigMutationLock<T>(action: () => Promise<T>): Promise<T> {
+  if (!navigator.locks?.request) {
+    throw new Error("Chrome cannot coordinate configuration and permission changes in this panel");
+  }
+  return navigator.locks.request(CONFIG_MUTATION_LOCK, { mode: "exclusive" }, action);
+}
+
 function updateControls(): void {
   const connected = currentConfig !== null && revision !== null;
   const changing = busy || replaying || renewing || tickRunning;
@@ -82,6 +92,7 @@ function updateControls(): void {
   pauseButton.disabled = !connected || changing || currentConfig?.capture_enabled !== true;
   replayButton.disabled = !connected || changing || currentConfig?.capture_enabled !== true ||
     lastWorkerStatus?.pause_pending === true;
+  discardButton.disabled = changing || (lastWorkerStatus?.queued ?? 0) === 0;
   noteButton.disabled = !connected || changing || !currentConfig?.storage ||
     currentConfig?.capture_enabled !== true || lastWorkerStatus?.pause_pending === true;
   for (const button of sitesList.querySelectorAll("button")) {
@@ -187,10 +198,13 @@ function leaseFor(config: ConfigSnapshot, currentRevision: string): PolicyLease 
   };
 }
 
-async function installHostPolicy(resumeAfterConfirmation = false): Promise<void> {
+async function installHostPolicy(
+  resumeAfterConfirmation = false,
+  resumeAfterPauseToken: string | null = null,
+): Promise<void> {
   if (!currentConfig || !revision) return;
   if (!currentConfig.storage && currentConfig.capture_enabled) {
-    await worker<WorkerStatus>({ kind: "clear_policy" });
+    await worker<WorkerStatus>({ kind: "suspend_policy" });
     return;
   }
   await worker<WorkerStatus>({
@@ -199,6 +213,7 @@ async function installHostPolicy(resumeAfterConfirmation = false): Promise<void>
     // A disabled config returned by the host proves that a pending local pause
     // reached the host and can now be cleared safely.
     resume_after_confirmation: resumeAfterConfirmation || !currentConfig.capture_enabled,
+    resume_after_pause_token: resumeAfterPauseToken,
   });
 }
 
@@ -227,6 +242,20 @@ async function refreshQueue(): Promise<WorkerStatus> {
   return state;
 }
 
+function readHostConfig() {
+  return host.call({
+    type: "get_config", protocol_version: PROTOCOL_VERSION, request_id: newRequestId(),
+  }, "config_result");
+}
+
+async function applyHostConfig(response: Awaited<ReturnType<typeof readHostConfig>>): Promise<void> {
+  currentConfig = response.config;
+  revision = response.revision;
+  renderConfig();
+  if (response.config_issue) await worker<WorkerStatus>({ kind: "suspend_policy" });
+  else await installHostPolicy();
+}
+
 function scheduleReplay(state: WorkerStatus): void {
   if (retryTimer !== null) clearTimeout(retryTimer);
   retryTimer = null;
@@ -240,24 +269,17 @@ function scheduleReplay(state: WorkerStatus): void {
 }
 
 async function reloadConfig(): Promise<void> {
-  const response = await host.call({
-    type: "get_config", protocol_version: PROTOCOL_VERSION, request_id: newRequestId(),
-  }, "config_result");
-  currentConfig = response.config;
-  revision = response.revision;
-  renderConfig();
-  if (response.config_issue) {
-    await worker<WorkerStatus>({ kind: "clear_policy" });
-    show(response.config_issue, true);
-  } else {
-    await installHostPolicy();
-    show(currentConfig.capture_enabled
-      ? "Capture is enabled for the listed sites."
-      : "Capture is off. Choose a folder and enable a site to begin.");
-  }
+  // Keep the host read and worker lease update together. Otherwise an older
+  // panel can reinstall a site after another panel has removed it.
+  const response = await withLatestHostState(
+    withConfigMutationLock, readHostConfig, applyHostConfig);
+  if (response.config_issue) show(response.config_issue, true);
+  else show(currentConfig!.capture_enabled
+    ? "Capture is enabled for the listed sites."
+    : "Capture is off. Choose a folder and enable a site to begin.");
   await reconcileRevocations();
   const state = await refreshQueue();
-  if (state.pause_pending && currentConfig.capture_enabled) {
+  if (state.pause_pending && currentConfig?.capture_enabled) {
     show("Capture is paused locally. Use Pause capture to finish saving this setting in the host.", true);
   }
 }
@@ -267,6 +289,7 @@ async function saveConfig(
   pickerToken: string | null,
   onCommitted?: () => void,
   resumeAfterConfirmation = false,
+  resumeAfterPauseToken: string | null = null,
 ): Promise<void> {
   if (!revision) throw new Error("Host configuration has not loaded");
   const expectedRevision = revision;
@@ -293,7 +316,7 @@ async function saveConfig(
   picker = null;
   onCommitted?.();
   renderConfig();
-  await installHostPolicy(resumeAfterConfirmation);
+  await installHostPolicy(resumeAfterConfirmation, resumeAfterPauseToken);
   await refreshQueue();
 }
 
@@ -302,15 +325,28 @@ async function reconcileRevocations(): Promise<void> {
   const state = await worker<WorkerStatus>({ kind: "get_status" });
   if (!state.revoked_origins.length) return;
   const revoked = new Set(state.revoked_origins);
-  const sites = currentConfig.sites.filter((site) => !revoked.has(site.origin));
-  if (sites.length !== currentConfig.sites.length) {
-    await saveConfig({
-      ...currentConfig,
-      sites,
-      capture_enabled: currentConfig.capture_enabled && sites.length > 0,
-    }, null);
-  }
-  await worker<WorkerStatus>({ kind: "ack_revocations", origins: state.revoked_origins });
+  await withConfigMutationLock(async () => {
+    // A different panel may have committed since our previous read. Recompute
+    // from the host's current revision while holding the same mutation lock.
+    const latest = await readHostConfig();
+    currentConfig = latest.config;
+    revision = latest.revision;
+    if (latest.config_issue) {
+      await worker<WorkerStatus>({ kind: "suspend_policy" });
+      throw new Error(latest.config_issue);
+    }
+    const sites = latest.config.sites.filter((site) => !revoked.has(site.origin));
+    if (sites.length !== latest.config.sites.length) {
+      await saveConfig({
+        ...latest.config,
+        sites,
+        capture_enabled: latest.config.capture_enabled && sites.length > 0,
+      }, null);
+    } else {
+      await installHostPolicy();
+    }
+    await worker<WorkerStatus>({ kind: "ack_revocations", origins: state.revoked_origins });
+  });
   renderConfig();
 }
 
@@ -361,18 +397,12 @@ async function renewHostPolicy(): Promise<void> {
   renewing = true;
   updateControls();
   try {
-    const response = await host.call({
-      type: "get_config", protocol_version: PROTOCOL_VERSION, request_id: newRequestId(),
-    }, "config_result");
-    currentConfig = response.config;
-    revision = response.revision;
-    renderConfig();
+    const response = await withLatestHostState(
+      withConfigMutationLock, readHostConfig, applyHostConfig);
     if (response.config_issue) {
-      await worker<WorkerStatus>({ kind: "clear_policy" });
       show(response.config_issue, true);
     } else {
-      await installHostPolicy();
-      if (!currentConfig.capture_enabled) show("Capture is off in the host configuration.");
+      if (!currentConfig!.capture_enabled) show("Capture is off in the host configuration.");
     }
   } catch (error) {
     show(`Cannot renew the host policy lease: ${describe(error)}. Capture stops when the current lease expires.`, true);
@@ -423,12 +453,41 @@ async function chooseFolder(): Promise<void> {
 }
 
 async function rollbackNewPermissions(grant: {
-  pattern: string; apiGranted: boolean; originGranted: boolean;
+  origin: string; pattern: string; apiGranted: boolean; originGranted: boolean;
 }): Promise<void> {
+  if (grant.originGranted && grant.apiGranted) return;
+  const latest = await host.call({
+    type: "get_config", protocol_version: PROTOCOL_VERSION, request_id: newRequestId(),
+  }, "config_result");
+  if (latest.config_issue) {
+    throw new Error("The host configuration needs repair; review Chrome access in extension settings");
+  }
   const removals: Promise<boolean>[] = [];
-  if (!grant.originGranted) removals.push(chrome.permissions.remove({ origins: [grant.pattern] }));
-  if (!grant.apiGranted) removals.push(chrome.permissions.remove({ permissions: ["webNavigation"] }));
+  if (!grant.originGranted && !latest.config.sites.some((site) => site.origin === grant.origin)) {
+    removals.push(chrome.permissions.remove({ origins: [grant.pattern] }));
+  }
+  if (!grant.apiGranted && latest.config.sites.length === 0) {
+    removals.push(chrome.permissions.remove({ permissions: ["webNavigation"] }));
+  }
   await Promise.all(removals);
+}
+
+async function completePausedHostConfig(): Promise<void> {
+  await finishHostPause(
+    async () => {
+      const latest = await readHostConfig();
+      currentConfig = latest.config;
+      revision = latest.revision;
+      renderConfig();
+      return latest;
+    },
+    async () => { await worker<WorkerStatus>({ kind: "pause_capture" }); },
+    async (latest) => {
+      await saveConfig({ ...latest.config, capture_enabled: false }, null);
+    },
+    async () => { await installHostPolicy(); },
+    (error) => error instanceof HostError && error.code === "conflict",
+  );
 }
 
 function enableSite(): void {
@@ -449,6 +508,12 @@ function enableSite(): void {
     show("Choose a notes folder first.", true);
     return;
   }
+  if (!navigator.locks?.request) {
+    show("This Chrome build cannot coordinate configuration changes. Capture remains off.", true);
+    return;
+  }
+
+  const initialPauseToken = lastWorkerStatus?.pause_token ?? null;
 
   // This call must run in the click stack. An await before it loses Chrome's
   // user gesture, which prevents the optional permission prompt.
@@ -467,24 +532,56 @@ function enableSite(): void {
         show("Chrome access was declined. Capture remains off.", true);
         return;
       }
-      const storage: StorageConfig = picker
-        ? {
-            root: picker.path,
-            profile: "neutral",
-            log_dir: currentConfig!.storage?.log_dir ?? "log",
-            pages_dir: currentConfig!.storage?.pages_dir ?? "pages",
-            later_dir: currentConfig!.storage?.later_dir ?? "later",
-          }
-        : { ...currentConfig!.storage!, profile: "neutral" };
-      const sites = currentConfig!.sites.filter(
-        (site) => site.origin !== parsed.site.origin || site.path_prefix !== parsed.site.path_prefix,
-      );
-      sites.push(parsed.site);
-      const next: ConfigSnapshot = {
-        ...currentConfig!, storage, sites, capture_enabled: true,
-      };
-      await saveConfig(next, picker?.token ?? null, () => { committed = true; }, true);
+      await withConfigMutationLock(async () => {
+        // The permission request ran in the click gesture, before the lock.
+        // Another panel may have removed it while we waited for this lock.
+        const stillGranted = await chrome.permissions.contains({
+          permissions: ["webNavigation"], origins: [parsed.pattern],
+        });
+        if (!stillGranted) throw new Error("Chrome access changed during setup; click Enable again");
+        const storage: StorageConfig = picker
+          ? {
+              root: picker.path,
+              profile: "neutral",
+              log_dir: currentConfig!.storage?.log_dir ?? "log",
+              pages_dir: currentConfig!.storage?.pages_dir ?? "pages",
+              later_dir: currentConfig!.storage?.later_dir ?? "later",
+            }
+          : { ...currentConfig!.storage!, profile: "neutral" };
+        const sites = currentConfig!.sites.filter(
+          (site) => site.origin !== parsed.site.origin || site.path_prefix !== parsed.site.path_prefix,
+        );
+        sites.push(parsed.site);
+        const next: ConfigSnapshot = {
+          ...currentConfig!, storage, sites, capture_enabled: true,
+        };
+        await saveConfig(next, picker?.token ?? null, () => { committed = true; },
+          true, initialPauseToken);
+        if (revision) {
+          await worker<WorkerStatus>({
+            kind: "ack_reenabled_origin", origin: parsed.site.origin, revision,
+          });
+        }
+      });
       const workerState = await refreshQueue();
+      if (workerState.pause_pending) {
+        try {
+          await withConfigMutationLock(async () => {
+            // The other panel may already have finished pausing while we
+            // waited. Only finish a pause that is still pending.
+            const latestState = await worker<WorkerStatus>({ kind: "get_status" });
+            if (latestState.pause_pending) await completePausedHostConfig();
+            await applyHostConfig(await readHostConfig());
+          });
+          show(currentConfig?.capture_enabled
+            ? "Capture settings changed in another panel. Review the current sites."
+            : "Capture was paused in another panel. Pending visits were cleared.",
+          currentConfig?.capture_enabled === true);
+        } catch (error) {
+          show(`Capture is paused locally; the host pause needs attention: ${describe(error)}`, true);
+        }
+        return;
+      }
       if (!workerState.navigation_ready) {
         show("Chrome is restarting the extension to activate the new navigation permission. Reopen the panel.", true);
         setTimeout(() => chrome.runtime.reload(), 1_000);
@@ -501,7 +598,7 @@ function enableSite(): void {
     } finally {
       if (!committed && permissionGranted) {
         try {
-          await rollbackNewPermissions(previous);
+          await withConfigMutationLock(() => rollbackNewPermissions(previous));
         } catch (error) {
           show(`Could not remove new Chrome access: ${describe(error)}`, true);
         }
@@ -521,7 +618,7 @@ async function pauseCapture(): Promise<void> {
   try {
     // Stop local buffering immediately, even if the host is unavailable.
     await worker<WorkerStatus>({ kind: "pause_capture" });
-    await saveConfig({ ...currentConfig, capture_enabled: false }, null);
+    await withConfigMutationLock(completePausedHostConfig);
     show("Capture paused. Pending visits cleared.");
   } catch (error) {
     show(`Could not pause capture: ${describe(error)}`, true);
@@ -532,55 +629,108 @@ async function pauseCapture(): Promise<void> {
   }
 }
 
+async function discardPendingVisits(): Promise<void> {
+  if (busy || replaying || renewing || tickRunning) return;
+  busy = true;
+  updateControls();
+  try {
+    const eventIds = await worker<string[]>({ kind: "get_pending_ids" });
+    if (!eventIds.length) return;
+    const count = eventIds.length;
+    if (!window.confirm(`Discard ${count} pending visit${count === 1 ? "" : "s"}? This cannot be undone.`)) {
+      return;
+    }
+    await worker<WorkerStatus>({ kind: "discard_pending", event_ids: eventIds });
+    show("Selected pending visits discarded.");
+  } catch (error) {
+    show(`Could not discard pending visits: ${describe(error)}`, true);
+  } finally {
+    busy = false;
+    await refreshQueue().catch((error: unknown) => show(describe(error), true));
+    updateControls();
+  }
+}
+
 async function removeSite(site: SiteConfig): Promise<void> {
   if (busy || replaying || renewing || tickRunning || !currentConfig || !revision ||
       !currentConfig.sites.some((entry) => sameSite(entry, site))) return;
+  const baseConfig = currentConfig;
   busy = true;
   updateControls();
   let locallyRemoved = false;
   let hostCommitted = false;
+  let committedRevision: string | null = null;
   let hostFailure: string | null = null;
   let permissionFailure: string | null = null;
+  let permissionRetained: string | null = null;
+  let refreshAfter = false;
   try {
     // The worker serializes this with navigation capture and persists a local
     // block before the host update. A failed update stays blocked on reload.
     lastWorkerStatus = await worker<WorkerStatus>({ kind: "remove_site", site });
     locallyRemoved = true;
     renderConfig();
-    const sites = currentConfig.sites.filter((entry) => !sameSite(entry, site));
-    const removeOriginGrant = !sites.some((entry) => entry.origin === site.origin);
-    try {
-      await saveConfig({
-        ...currentConfig,
-        sites,
-        capture_enabled: currentConfig.capture_enabled && sites.length > 0,
-      }, null, () => { hostCommitted = true; });
-    } catch (error) {
-      hostFailure = hostCommitted
-        ? `The host saved removal, but the extension policy refresh failed: ${describe(error)}`
-        : `Host update failed: ${describe(error)}`;
-      if (error instanceof HostError && error.code === "conflict") {
-        await reloadConfig().catch(() => undefined);
-      }
-    }
-    if (removeOriginGrant) {
+    await withConfigMutationLock(async () => {
+      const sites = baseConfig.sites.filter((entry) => !sameSite(entry, site));
       try {
-        await chrome.permissions.remove({ origins: [exactOriginPattern(site.origin)] });
-        if (sites.length === 0) {
-          await chrome.permissions.remove({ permissions: ["webNavigation"] });
-        }
+        await saveConfig({
+          ...baseConfig,
+          sites,
+          capture_enabled: baseConfig.capture_enabled && sites.length > 0,
+        }, null, () => {
+          hostCommitted = true;
+          committedRevision = revision;
+        });
       } catch (error) {
-        permissionFailure = `Could not remove Chrome access: ${describe(error)}`;
+        hostFailure = hostCommitted
+          ? `The host saved removal, but the extension policy refresh failed: ${describe(error)}`
+          : `Host update failed: ${describe(error)}`;
+        if (error instanceof HostError && error.code === "conflict") {
+          refreshAfter = true;
+        }
       }
+      if (hostCommitted && committedRevision !== null) {
+        try {
+          // Chrome permissions are shared by every path rule for an origin. A
+          // second panel may have committed another rule while this panel was
+          // refreshing its worker lease, so inspect the host again before
+          // removing the shared grant.
+          const latest = await host.call({
+            type: "get_config", protocol_version: PROTOCOL_VERSION, request_id: newRequestId(),
+          }, "config_result");
+          if (latest.config_issue) {
+            await worker<WorkerStatus>({ kind: "suspend_policy" });
+            currentConfig = latest.config;
+            revision = latest.revision;
+            renderConfig();
+            permissionRetained = "Chrome access was retained while the host configuration needs repair.";
+          } else if (latest.revision !== committedRevision) {
+            permissionRetained = "Chrome access was retained because the host configuration changed in another panel. Review the current sites before removing it.";
+            refreshAfter = true;
+          } else if (!latest.config.sites.some((entry) => entry.origin === site.origin)) {
+            await chrome.permissions.remove({ origins: [exactOriginPattern(site.origin)] });
+            if (latest.config.sites.length === 0) {
+              await chrome.permissions.remove({ permissions: ["webNavigation"] });
+            }
+          }
+        } catch (error) {
+          permissionFailure = `Could not remove Chrome access: ${describe(error)}`;
+        }
+      }
+    });
+    if (refreshAfter) {
+      await reloadConfig().catch((error: unknown) => {
+        permissionRetained = `${permissionRetained ?? "Host policy refresh failed."} ${describe(error)}`;
+      });
     }
-    if (hostFailure || permissionFailure) {
+    if (hostFailure || permissionFailure || permissionRetained) {
       const next = !hostFailure ? "" : hostCommitted
         ? " The host removal is saved. Reopen the panel to refresh its policy."
         : " The site remains locally off; use Remove again to finish the host update.";
       const grant = permissionFailure
         ? " Remove this origin from Chrome extension settings if it remains granted."
         : "";
-      show(`${[hostFailure, permissionFailure].filter(Boolean).join(" ")}${next}${grant}`, true);
+      show(`${[hostFailure, permissionFailure, permissionRetained].filter(Boolean).join(" ")}${next}${grant}`, true);
     } else if (hostCommitted) {
       show(`Removed ${site.origin}${site.path_prefix}.`);
     } else {
@@ -641,6 +791,7 @@ chooseFolderButton.addEventListener("click", () => void chooseFolder());
 enableButton.addEventListener("click", enableSite);
 pauseButton.addEventListener("click", () => void pauseCapture());
 replayButton.addEventListener("click", () => void replayVisits());
+discardButton.addEventListener("click", () => void discardPendingVisits());
 noteButton.addEventListener("click", () => void createPageNote());
 siteUrl.addEventListener("input", () => void refreshPreflight());
 sitePath.addEventListener("input", () => void refreshPreflight());

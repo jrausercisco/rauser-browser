@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -12,6 +13,7 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, Messag
 use uuid::Uuid;
 
 use crate::config;
+use crate::vault::selected_root_identity;
 
 const TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAX_PENDING_GRANTS: usize = 32;
@@ -29,6 +31,7 @@ pub struct ConfigConfirmation {
 
 struct PickerGrant {
     root: String,
+    identity: String,
     revision: String,
     expires_at: Instant,
 }
@@ -69,7 +72,8 @@ impl ConsentAuthority {
             .to_str()
             .context("selected notes folder path cannot be represented as UTF-8")?
             .to_owned();
-        let picker_token = self.mint_picker(root.clone(), revision);
+        let identity = selected_root_identity(Path::new(&root))?;
+        let picker_token = self.mint_picker(root.clone(), identity, revision);
         Ok(Some(FolderSelection {
             path: root,
             picker_token,
@@ -126,9 +130,9 @@ impl ConsentAuthority {
         next: &ConfigSnapshot,
         picker_token: Option<&str>,
         consent_token: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         config::validate(next)?;
-        self.check_picker(current, revision, next, picker_token)?;
+        let selected_identity = self.check_picker(current, revision, next, picker_token)?;
         if !approval_lines(current, next).is_empty() {
             let token =
                 consent_token.context("native confirmation is required for this config change")?;
@@ -143,7 +147,7 @@ impl ConsentAuthority {
                 bail!("native confirmation is stale or does not match this change");
             }
         }
-        Ok(())
+        Ok(selected_identity)
     }
 
     /// Call only after ConfigStore::update returns a committed revision.
@@ -169,14 +173,14 @@ impl ConsentAuthority {
         revision: &str,
         next: &ConfigSnapshot,
         picker_token: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let old_root = current
             .storage
             .as_ref()
             .map(|storage| storage.root.as_str());
         let new_root = next.storage.as_ref().map(|storage| storage.root.as_str());
-        if new_root.is_none() || new_root == old_root {
-            return Ok(());
+        if new_root.is_none() || (new_root == old_root && picker_token.is_none()) {
+            return Ok(None);
         }
         let root = new_root.expect("checked above");
         let token = picker_token.context("a native folder selection is required")?;
@@ -186,16 +190,20 @@ impl ConsentAuthority {
         if grant.expires_at <= Instant::now() || grant.revision != revision || grant.root != root {
             bail!("folder selection is stale or does not match the proposed notes folder");
         }
-        Ok(())
+        if selected_root_identity(Path::new(root))? != grant.identity {
+            bail!("selected notes folder changed; choose it again");
+        }
+        Ok(Some(grant.identity.clone()))
     }
 
-    fn mint_picker(&mut self, root: String, revision: &str) -> String {
+    fn mint_picker(&mut self, root: String, identity: String, revision: &str) -> String {
         self.prune();
         let token = Uuid::new_v4().to_string();
         self.picker_grants.insert(
             token.clone(),
             PickerGrant {
                 root,
+                identity,
                 revision: revision.to_owned(),
                 expires_at: Instant::now() + TOKEN_LIFETIME,
             },
@@ -325,4 +333,38 @@ fn site_covers(prior: &SiteConfig, next: &SiteConfig) -> bool {
         || (next.path_prefix.starts_with(&prior.path_prefix)
             && (prior.path_prefix.ends_with('/')
                 || next.path_prefix.as_bytes().get(prior.path_prefix.len()) == Some(&b'/')))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rauser_protocol::StorageConfig;
+
+    #[test]
+    fn fresh_picker_token_can_reconfirm_the_same_path() {
+        let folder = tempfile::tempdir().unwrap();
+        let storage = StorageConfig {
+            root: folder.path().to_string_lossy().into_owned(),
+            profile: "neutral".into(),
+            log_dir: "log".into(),
+            pages_dir: "pages".into(),
+            later_dir: "later".into(),
+        };
+        let snapshot = ConfigSnapshot {
+            storage: Some(storage.clone()),
+            capture_enabled: false,
+            sites: Vec::new(),
+            strip_params: Vec::new(),
+            near_repeat_secs: 300,
+        };
+        let mut authority = ConsentAuthority::new();
+        let identity = selected_root_identity(folder.path()).unwrap();
+        let token = authority.mint_picker(storage.root, identity.clone(), "revision");
+        assert_eq!(
+            authority
+                .check_picker(&snapshot, "revision", &snapshot, Some(&token))
+                .unwrap(),
+            Some(identity)
+        );
+    }
 }
