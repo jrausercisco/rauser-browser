@@ -18,4 +18,4 @@ The release plan calls for the browser extension to be distributed through the C
 
 ## License
 
-Rauser Browser is planned to be released under the [Apache License 2.0](LICENSE).
+This repository is licensed under the [Apache License 2.0](LICENSE). The design specifies Apache-2.0 for the planned software as well.
