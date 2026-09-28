@@ -15,7 +15,13 @@ fn run() -> Result<()> {
     match args.next().as_deref() {
         None | Some("serve") => native::serve(ConfigStore::load()?),
         Some("--version") => {
-            println!("{NAMESPACE} {}", env!("CARGO_PKG_VERSION"));
+            // Test runners check this marker before relying on scripted dialogs.
+            let variant = if cfg!(feature = "scripted-dialogs") {
+                " (scripted dialogs)"
+            } else {
+                ""
+            };
+            println!("{NAMESPACE} {}{variant}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("--config-path") => {

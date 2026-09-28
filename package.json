@@ -7,6 +7,7 @@
     "build:extension": "node extension/build.mjs",
     "test:extension": "node --test extension/tests/worker.test.mjs",
     "smoke:macos": "node scripts/smoke-macos.mjs",
+    "smoke:macos:headless": "node scripts/smoke-macos.mjs --headless",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0"
   },

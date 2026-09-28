@@ -7,6 +7,11 @@ license = "Apache-2.0"
 publish = false
 description = "Local native messaging host for Brauser"
 
+[features]
+# Test-only: dialog children read their answers from a directory named by an
+# environment variable instead of showing UI. Debug builds only; see dialog.rs.
+scripted-dialogs = []
+
 [dependencies]
 anyhow = "1"
 cap-std = "4.0"
