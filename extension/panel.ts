@@ -21,7 +21,6 @@ const queueWarning = element<HTMLParagraphElement>("queue-warning");
 const dismissButton = element<HTMLButtonElement>("dismiss-notices");
 const replayButton = element<HTMLButtonElement>("replay");
 const discardButton = element<HTMLButtonElement>("discard-pending");
-const noteTitle = element<HTMLInputElement>("note-title");
 const noteBody = element<HTMLTextAreaElement>("note-body");
 const noteButton = element<HTMLButtonElement>("create-note");
 const noteResult = element<HTMLParagraphElement>("note-result");
@@ -309,7 +308,7 @@ async function createPageNote(): Promise<void> {
       protocol_version: PROTOCOL_VERSION,
       request_id: newRequestId(),
       url: url.href,
-      title: noteTitle.value.trim() || tab.title || url.hostname,
+      title: tab.title || url.hostname,
       body: noteBody.value,
     }, "page_note_result");
     const label = {

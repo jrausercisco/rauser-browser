@@ -133,6 +133,7 @@ The extension runs in a hostile environment (arbitrary web pages), and the host 
 ### 5.3 Page notes
 
 - One markdown file per normalized URL.
+- The note's title comes from the page's title (or its host name when the page has none); the panel asks only for the note text.
 - The user edits notes in the sidebar or in any external editor. Both are first-class.
 
 ### 5.4 Read later
@@ -390,7 +391,7 @@ The layout above is the planned release layout. M0 currently contains `protocol/
 | **M2 — Agent** | Harness setup with native confirmation, content extraction, streaming with cancellation, `/summarize`, denylist enforcement |
 | **M3 — Related** | FTS5 index, related pages, read later, `reindex` |
 | **M4 — Omnibar** | Built-in commands, free text, custom commands |
-| **M5 — Release** | Installers, store listings, signing and provenance, docs; compact durable visit-ID index and migration |
+| **M5 — Release** | Installers, store listings, signing and provenance, docs; compact durable visit-ID index and migration; Windows smoke run and directory-entry durability |
 
 M1 is a usable capture slice for development with no agent required. It is not a public download until the extension and signed installers complete M5.
 
@@ -412,11 +413,14 @@ The plan follows Chrome's current [optional-permission rules](https://developer.
 
 **macOS smoke pass (2026-09-28):** `npm run smoke:macos` completed the full flow on macOS with Chrome 154: first-run warning, picker cancellation, declined consent (with the new Chrome grants rolled back), confirmed setup, allowed and blocked visit replay, panel reopen without duplication, page note creation, identical retry, one review draft and its retry, site removal with Chrome grants removed, and no capture after removal. No busy cursor persisted after any native dialog, which confirms the child-process dialog fix. The fixture's nondefault port was accepted by Chrome's permission request. Re-requesting access that Rauser had just removed did not show a second Chrome prompt, so the host's native confirmation, not Chrome's prompt, is the gate for that re-enable; the host still required it. The runner now drives the extension pages itself through the DevTools pipe and stops only for the picker, Chrome's prompt, and the host dialog.
 
+**Page note title (2026-09-28):** The panel's page-note form no longer has a title field. The host receives the tab's title, or the host name when the page has none; a change in that title still produces a review draft.
+
 **Settings page (2026-09-28):** Configuration moved from the side panel to a dedicated `options_ui` page. The panel shows a gear button and a setup warning until a folder, a site, and capture are all in place. The page opened from the panel on macOS once Rauser was reloaded in `chrome://extensions`. Chrome keeps an unpacked extension's manifest and service worker from load time but serves rebuilt pages from disk, so a build that changes `manifest.json` or `worker.ts` needs that reload; the panel now says so when the settings page cannot open. `npm run smoke:macos` starts a fresh profile and is unaffected. This is not a smoke-test pass for the flow above.
 
 ### 12.2 Next steps
 
-1. **Finish M1 acceptance.** The macOS run passed (above). Port the runner to Windows (Chrome path, native-host registration in the registry rather than the profile, and no `pbcopy`) and complete that run. Check an explicit default port on both operating systems; the nondefault port passed on macOS. Record each result here; M1 is accepted only when both runs pass.
+1. **Finish M1 acceptance on macOS.** The macOS run passed (above). Check an explicit default port (for example `:80`) on macOS; the nondefault port passed. M1 is accepted for development on macOS once that check is recorded here.
+   - **Windows parked (2026-09-28).** No Windows machine is available, so the Windows smoke runner and its interactive run are deferred. Windows CI continues to build and test every PR. Porting the runner (Chrome path, native-host registration in the registry rather than the profile, and no `pbcopy`), the Windows run, and its default-port check are release blockers tracked under M5.
 2. **Catch page-load regressions in CI (optional, recommended).** Unit tests import the pages but do not load the built extension. A headless Chrome step that loads `extension/dist/` and opens the panel and settings page would have caught the stale-manifest class of failure before a manual run.
 3. **Settle M2 design before code.** Resolve the M2 questions in §14 and record the answers in §4.5, §5.2, §7.1, and §8.
 4. **Build M2 in this order**, each step reviewed and merged separately:
@@ -425,7 +429,7 @@ The plan follows Chrome's current [optional-permission rules](https://developer.
    3. Streaming protocol: the host currently answers one request at a time, so it needs a reader that stays responsive while a harness runs. Add chunk, completion, error, and `cancel` messages correlated by `request_id`, each under the 1 MB native-messaging limit. Closing the panel (stdin EOF) kills the harness.
    4. Content extraction with a bundled, pinned Readability-style library, and the permissions §14 settles.
    5. `/summarize` in the panel, with denylist checks and the summary write described in §5.2.
-5. **M3–M5** follow as in the table. The compact visit-ID index and Windows directory-entry durability are release blockers tracked under M5.
+5. **M3–M5** follow as in the table. The compact visit-ID index, the Windows smoke run, and Windows directory-entry durability are release blockers tracked under M5.
 
 ## 13. Platforms and License
 
