@@ -54,9 +54,9 @@ The development registration in step 3 changes only the current user's Chrome na
 
 The host binds the chosen folder to its filesystem identity. If that folder is moved or replaced, choose it again before capture resumes. M1 keeps a synced visit-ID intent file in the OS config directory for each saved visit so retries can recover across log dates and interrupted appends. These files remain indefinitely in the development build; compacting the index is part of the public-release work.
 
-Existing page notes are never overwritten. An unchanged create request returns the existing note; a new title or body produces a sibling review draft with a stable proposal ID, so retrying the same request does not create another draft. The panel shows the draft path. The host checks the original URL against its confirmed site rule before normalizing or logging it. See [protocol/README.md](protocol/README.md) for the message contract.
+Existing page notes are never overwritten. An unchanged create request returns the existing note; a changed note (or page title) produces a sibling review draft with a stable proposal ID, so retrying the same request does not create another draft. The panel shows the draft path. The host checks the original URL against its confirmed site rule before normalizing or logging it. See [protocol/README.md](protocol/README.md) for the message contract.
 
-M1 still needs interactive Chrome checks on both macOS and Windows. Windows power-loss durability for newly created Markdown file names is not yet established. The public package remains a later release milestone.
+The guided M1 smoke run has passed on macOS; an explicit default-port check is still outstanding there. Windows interactive testing is parked until a Windows machine is available; Windows CI still builds and tests every change. Windows power-loss durability for newly created Markdown file names is not yet established. The public package remains a later release milestone.
 
 ## License
 

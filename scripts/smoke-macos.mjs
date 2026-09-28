@@ -611,11 +611,10 @@ async function run() {
     ]).then(([origin, api]) => ({ origin, api }))`));
   }
 
-  async function createNote(expected, title, body) {
+  async function createNote(expected, body) {
     await waitFor(() => onPanel(async (page) =>
       requireCondition(await page.enabled("#create-note"), "Create page note is disabled")));
     await onPanel(async (page) => {
-      await page.fill("#note-title", title);
       await page.fill("#note-body", body);
       await page.click("#create-note");
     });
@@ -654,7 +653,8 @@ async function run() {
     const allowed = `${origin}/allowed/page?case=${caseId}`;
     const blocked = `${origin}/blocked/page?case=${caseId}`;
     const afterRemoval = `${origin}/allowed/after-removal?case=${caseId}`;
-    const title = `Rauser smoke ${caseId}`;
+    // The panel titles a page note from the tab, so this is the fixture page title.
+    const title = "Rauser smoke /allowed/page";
     const firstBody = `First note ${caseId}`;
     const changedBody = `Review note ${caseId}`;
     await writeFile(path.join(runDir, "run-info.json"), `${JSON.stringify({
@@ -843,7 +843,7 @@ async function run() {
     await step("Page note creation", async () => {
       await navigate(origin, allowed);
       await cdp.send("Target.activateTarget", { targetId: (await fixtureTarget(origin)).targetId });
-      await createNote("Page note created", title, firstBody);
+      await createNote("Page note created", firstBody);
       const files = await markdownFiles(path.join(notesRoot, "pages"));
       const base = files.filter((file) => !file.path.includes(".rauser-review-"));
       requireCondition(base.length === 1 && files.length === 1, "Expected one page note and no review draft");
@@ -853,7 +853,7 @@ async function run() {
     });
 
     await step("Identical page note is idempotent", async () => {
-      await createNote("Page note already exists", title, firstBody);
+      await createNote("Page note already exists", firstBody);
       const files = await markdownFiles(path.join(notesRoot, "pages"));
       requireCondition(files.length === 1 && files[0].path === originalNote.path &&
         files[0].text === originalNote.text, "Identical retry changed the note or created a file");
@@ -862,7 +862,7 @@ async function run() {
     let reviewNote;
     let reviewResult;
     await step("Changed page note creates one review draft", async () => {
-      reviewResult = await createNote("Page note needs review", title, changedBody);
+      reviewResult = await createNote("Page note needs review", changedBody);
       const files = await markdownFiles(path.join(notesRoot, "pages"));
       const review = files.filter((file) => file.path.includes(".rauser-review-"));
       const base = files.find((file) => file.path === originalNote.path);
@@ -875,7 +875,7 @@ async function run() {
     });
 
     await step("Review draft retry is idempotent", async () => {
-      const result = await createNote("Page note needs review", title, changedBody);
+      const result = await createNote("Page note needs review", changedBody);
       requireCondition(result === reviewResult, `Retry reported a different result: ${result}`);
       const files = await markdownFiles(path.join(notesRoot, "pages"));
       requireCondition(files.length === 2 &&
