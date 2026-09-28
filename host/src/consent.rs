@@ -925,7 +925,8 @@ mod tests {
         brauser_protocol::AgentConfig {
             harness_id: "claude-code".into(),
             adapter: brauser_protocol::HarnessAdapter::ClaudeCode,
-            binary: "/usr/local/bin/claude".into(),
+            // Valid here, so `set_up()` is a trusted current config.
+            binary: crate::config::fixtures::absent_binary("claude"),
             args: crate::harness::template_args(crate::harness::Adapter::ClaudeCode),
             env_allow: Vec::new(),
             timeout_secs: 120,
@@ -1008,7 +1009,7 @@ mod tests {
         let current = set_up();
         let next = ConfigSnapshot {
             agent: Some(brauser_protocol::AgentConfig {
-                binary: "/tmp/other-claude".into(),
+                binary: crate::config::fixtures::absent_binary("other-claude"),
                 ..agent()
             }),
             ..current.clone()
@@ -1443,7 +1444,13 @@ mod tests {
         assert_eq!(all[2], "");
         let lines = &all[3..];
         assert_eq!(lines[0], "Harness: Claude Code 2.1.284");
-        assert_eq!(lines[1], "Program: \"/usr/local/bin/claude\"");
+        assert_eq!(
+            lines[1],
+            format!(
+                "Program: {:?}",
+                crate::config::fixtures::absent_binary("claude")
+            )
+        );
         assert_eq!(lines[2], "Runs: \"/opt/claude/versions/2.1.284/claude\"");
         assert_eq!(
             lines[3],
@@ -1609,6 +1616,19 @@ mod tests {
         crate::config::validate(&next).unwrap();
         let error = harness_confirmation_text(&hand_candidate(), &next, &current).unwrap_err();
         assert!(error.to_string().contains("too long"), "{error}");
+    }
+
+    /// Step 1 refuses harness setup off unix: even a checked candidate gets
+    /// a refusal and no offer id to confirm.
+    #[cfg(not(unix))]
+    #[test]
+    fn setup_offer_is_refused_on_this_platform() {
+        let offer = ConsentAuthority::new().offer("revision", hand_candidate());
+        assert_eq!(offer.offer_id, None);
+        assert_eq!(
+            offer.refusal.as_deref(),
+            Some(harness::UNSUPPORTED_PLATFORM)
+        );
     }
 
     #[test]

@@ -103,6 +103,7 @@ const CHOOSE_SUMMARIES: &str = concat!(
     crate::app_name!(),
     " settings."
 );
+const AI_UNAVAILABLE_HERE: &str = "AI commands are not available on this platform yet.";
 const HARNESS_CHANGED: &str = concat!(
     "The AI harness changed on disk; run setup again in ",
     crate::app_name!(),
@@ -468,7 +469,7 @@ impl ConfigStore {
             return Err(refuse(
                 AgentState::HarnessProblem,
                 ErrorCode::NotConfigured,
-                "AI commands are not available on this platform yet.",
+                AI_UNAVAILABLE_HERE,
             ));
         }
         // Fail closed until step 5.2 adds the automatic re-check (§7.1).
@@ -1390,6 +1391,16 @@ pub(crate) mod fixtures {
         (path, root, binary)
     }
 
+    /// An absolute harness path on this platform for tests that never read
+    /// or run it. Unix keeps the path a real install would have.
+    pub(crate) fn absent_binary(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\Program Files\\{name}\\{name}.exe")
+        } else {
+            format!("/usr/local/bin/{name}")
+        }
+    }
+
     /// A fake harness file. It is never executed; only its identity matters.
     pub(crate) fn fake_harness(folder: &Path) -> std::path::PathBuf {
         let path = folder.join("claude");
@@ -1420,11 +1431,17 @@ pub(crate) mod fixtures {
     pub(crate) fn record_table_for(harness_id: &str, version: &str, binary: &Path) -> String {
         let identity = harness::identity(binary).unwrap();
         format!(
-            "[harness_record]\nharness_id = \"{harness_id}\"\nreal_path = {}\nsize = {}\nmtime_ns = {}\nfile_id = {}\nversion = \"{version}\"\nhelp_sha256 = \"00\"\nconfirmed_flags = [\"-p\"]\nprobe_passed_at = \"2026-09-28T00:00:00Z\"\n",
+            "[harness_record]\nharness_id = \"{harness_id}\"\nreal_path = {}\nsize = {}\nmtime_ns = {}\n{}version = \"{version}\"\nhelp_sha256 = \"00\"\nconfirmed_flags = [\"-p\"]\nprobe_passed_at = \"2026-09-28T00:00:00Z\"\n",
             quoted(&identity.real_path),
             identity.size,
             quoted(&identity.mtime_ns),
-            quoted(identity.file_id.as_deref().unwrap_or_default()),
+            // Only unix identities carry a file id; an empty string would
+            // not match the `None` a Windows identity has.
+            identity
+                .file_id
+                .as_deref()
+                .map(|file_id| format!("file_id = {}\n", quoted(file_id)))
+                .unwrap_or_default(),
         )
     }
 }
@@ -1444,6 +1461,24 @@ mod tests {
             .agent_readiness()
             .err()
             .expect("agent should be refused")
+    }
+
+    /// The gate passes a config setup would write. Other platforms refuse
+    /// AI commands for now (DESIGN.md), before any identity check, so the
+    /// same config gets that refusal there.
+    fn assert_ready_here(store: &ConfigStore, harness_id: &str, version: &str) {
+        if cfg!(unix) {
+            let ready = store.agent_readiness().expect("agent should be ready");
+            assert_eq!(ready.harness_id, harness_id);
+            assert_eq!(ready.harness_version, version);
+            assert_eq!(store.agent_status().state, AgentState::Ready);
+        } else {
+            assert_eq!(
+                refusal(store),
+                (ErrorCode::NotConfigured, AI_UNAVAILABLE_HERE.into())
+            );
+            assert_eq!(store.agent_status().state, AgentState::HarnessProblem);
+        }
     }
 
     #[test]
@@ -1597,6 +1632,7 @@ mod tests {
         validate_storage(&storage).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_readiness_is_ready_with_confirmed_denylist_and_unchanged_harness() {
         let folder = tempfile::tempdir().unwrap();
@@ -1626,11 +1662,11 @@ mod tests {
         };
         let revision = store.revision().to_owned();
         store.update(next, &revision).unwrap().unwrap();
-        assert_eq!(store.agent_status().state, AgentState::Ready);
+        assert_ready_here(&store, "claude-code", "2.1.284");
         let reloaded = loaded(&path);
         assert_eq!(reloaded.snapshot().near_repeat_secs, 60);
         assert!(reloaded.snapshot().agent.is_some());
-        assert_eq!(reloaded.agent_status().state, AgentState::Ready);
+        assert_ready_here(&reloaded, "claude-code", "2.1.284");
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
@@ -1715,7 +1751,7 @@ mod tests {
 
     #[test]
     fn agent_entry_rejects_dyld_env_name() {
-        let agent = claude(Path::new("/usr/local/bin/claude"));
+        let agent = claude(Path::new(&fixtures::absent_binary("claude")));
         validate_agent(&agent).unwrap();
         for name in [
             "DYLD_INSERT_LIBRARIES",
@@ -1740,7 +1776,7 @@ mod tests {
 
     #[test]
     fn agent_entry_args_must_be_the_adapter_template() {
-        let agent = claude(Path::new("/usr/local/bin/claude"));
+        let agent = claude(Path::new(&fixtures::absent_binary("claude")));
         let mut loosened = agent.args.clone();
         loosened.retain(|arg| arg != "--strict-mcp-config");
         let mut extra = agent.args.clone();
@@ -1791,9 +1827,7 @@ mod tests {
         );
         let store = loaded(&path);
         assert!(store.snapshot().agent.is_some());
-        let ready = store.agent_readiness().unwrap();
-        assert_eq!(ready.harness_version, "0.144.4");
-        assert_eq!(store.agent_status().state, AgentState::Ready);
+        assert_ready_here(&store, "codex", "0.144.4");
 
         // Setup recorded a version whose reviewed args differ (none here).
         fixtures::write(
@@ -1817,7 +1851,7 @@ mod tests {
 
     #[test]
     fn agent_entry_needs_one_standalone_prompt_and_absolute_binary() {
-        let agent = claude(Path::new("/usr/local/bin/claude"));
+        let agent = claude(Path::new(&fixtures::absent_binary("claude")));
         for args in [
             vec!["-p".to_owned()],
             vec!["{prompt}".to_owned(), "{prompt}".to_owned()],
@@ -1972,7 +2006,7 @@ mod tests {
         let store = loaded(&path);
         assert!(store.snapshot().agent_denylist_confirmed);
         assert_eq!(store.snapshot().agent, Some(claude(&binary)));
-        assert_eq!(store.agent_status().state, AgentState::Ready);
+        assert_ready_here(&store, "claude-code", "2.1.284");
     }
 
     /// A config with a notes folder and no harness, then one harness commit.
@@ -2046,18 +2080,36 @@ mod tests {
         assert_eq!(store.snapshot().near_repeat_secs, 600);
         assert!(store.snapshot().agent_denylist_confirmed);
         assert_eq!(store.agent.record, record);
-        assert_eq!(store.agent_status().state, AgentState::Ready);
+        assert_ready_here(&store, "claude-code", "2.1.284");
     }
 
     #[test]
     fn agent_readiness_ready_after_commit() {
         let folder = tempfile::tempdir().unwrap();
         let (path, _, _) = committed(folder.path());
-        let ready = loaded(&path).agent_readiness().ok().unwrap();
-        assert_eq!(ready.harness_id, "claude-code");
-        assert_eq!(ready.harness_version, "2.1.284");
+        assert_ready_here(&loaded(&path), "claude-code", "2.1.284");
     }
 
+    /// Step 1 refuses AI commands off unix even for a harness whose identity
+    /// is unchanged since setup.
+    #[cfg(not(unix))]
+    #[test]
+    fn agent_readiness_refuses_on_this_platform() {
+        let folder = tempfile::tempdir().unwrap();
+        let (path, _, binary) = fixtures::ready(folder.path());
+        let store = loaded(&path);
+        assert_eq!(
+            store.agent.record.as_ref().map(HarnessRecord::identity),
+            Some(harness::identity(&binary).unwrap())
+        );
+        assert_eq!(
+            refusal(&store),
+            (ErrorCode::NotConfigured, AI_UNAVAILABLE_HERE.into())
+        );
+        assert_eq!(store.agent_status().state, AgentState::HarnessProblem);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn agent_readiness_refuses_changed_identity() {
         let folder = tempfile::tempdir().unwrap();

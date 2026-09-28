@@ -1365,6 +1365,7 @@ mod tests {
         assert!(message.contains(&format!("{} settings", crate::brand::APP_NAME)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn check_agent_reports_harness_and_denylisted_url() {
         let folder = tempfile::tempdir().unwrap();
@@ -1389,6 +1390,33 @@ mod tests {
             })
             .collect();
         assert_eq!(allowed, vec![Some(false), Some(true), None]);
+    }
+
+    /// Step 1 refuses AI commands off unix, for any URL, even when setup's
+    /// record still matches the harness.
+    #[cfg(not(unix))]
+    #[test]
+    fn check_agent_refused_on_this_platform() {
+        let folder = tempfile::tempdir().unwrap();
+        let (path, _, _) = config::fixtures::ready(folder.path());
+        let responses = served(
+            &[
+                check_agent_json(Some("https://www.bank.example/account")),
+                check_agent_json(Some("https://example.com/")),
+                check_agent_json(None),
+            ],
+            loaded(&path),
+        );
+        assert_eq!(responses.len(), 3);
+        for response in &responses {
+            assert_eq!(
+                refused(response),
+                (
+                    ErrorCode::NotConfigured,
+                    "AI commands are not available on this platform yet."
+                )
+            );
+        }
     }
 
     #[test]
