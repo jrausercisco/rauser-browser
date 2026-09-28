@@ -355,26 +355,38 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
             let root_unconfirmed = stored.storage.is_some()
                 && (!stored.root_picker_confirmed || root_identity.is_none());
             let config: ConfigSnapshot = stored.into();
-            let issue = if root_unconfirmed {
-                Some("This notes folder predates native picker confirmation. Choose it again to activate capture; the original config will be backed up.".to_owned())
-            } else if validate_persisted(&config).is_err() {
-                Some("Configuration settings or notes folder are invalid or unavailable. Choose a notes folder and save a repair; the original config will be backed up.".to_owned())
-            } else if config.storage.as_ref().is_some_and(|storage| {
+            if root_unconfirmed || validate(&config).is_err() {
+                let issue = if root_unconfirmed {
+                    "This notes folder predates native picker confirmation. Choose it again to activate capture; the original config will be backed up."
+                } else {
+                    "Configuration settings are invalid. Choose a notes folder and save a repair; the original config will be backed up."
+                };
+                return Ok(DiskState {
+                    config: empty_config(),
+                    revision,
+                    issue: Some(issue.to_owned()),
+                    needs_backup: true,
+                    root_identity: None,
+                });
+            }
+            // The settings themselves are valid. A folder that is missing or
+            // no longer matches its stored identity (an unmounted drive, or a
+            // remount with a new device number) blocks vault I/O and needs
+            // reselection, but it must not discard the allowlist: keep every
+            // setting for the repair, which rewrites the file with a fresh
+            // identity, so there is nothing to back up.
+            let folder_changed = config.storage.as_ref().is_some_and(|storage| {
                 match selected_root_identity(Path::new(&storage.root)) {
                     Ok(actual) => Some(actual.as_str()) != root_identity.as_deref(),
                     Err(_) => true,
                 }
-            }) {
-                Some("The selected notes folder changed. Choose it again to repair this configuration; the original config will be backed up.".to_owned())
-            } else {
-                None
-            };
+            });
             Ok(DiskState {
-                config: if issue.is_some() { empty_config() } else { config },
+                config,
                 revision,
-                needs_backup: issue.is_some(),
-                issue,
-                root_identity: if root_unconfirmed { None } else { root_identity },
+                issue: folder_changed.then(|| "The selected notes folder is unavailable or changed. Reconnect it, or choose it again to repair this configuration; your other settings are kept.".to_owned()),
+                needs_backup: false,
+                root_identity,
             })
         }
         Err(_) => Ok(DiskState {
@@ -816,16 +828,86 @@ mod tests {
         fs::create_dir(&root).unwrap();
         store.refresh().unwrap();
         assert!(store.config_issue().is_some());
-        assert!(store.snapshot().storage.is_none());
+        assert!(!store.configured());
+        // Only the folder needs reselection; the settings are kept for repair.
+        assert_eq!(store.snapshot(), &config);
+        let revision = store.revision().to_owned();
+        // The stored identity no longer matches, so the same path alone is
+        // not enough to authorize the replacement folder.
+        assert!(store.update(config.clone(), &revision).is_err());
         let new_identity = selected_root_identity(&root).unwrap();
         assert_ne!(identity, new_identity);
-        let revision = store.revision().to_owned();
         store
             .update_with_root_identity(config, &revision, Some(&new_identity))
             .unwrap()
             .unwrap();
         store.refresh().unwrap();
         assert!(store.config_issue().is_none());
+        // The file was valid; only its identity was stale, so nothing to back up.
+        assert_eq!(backup_count(base.path()), 0);
+    }
+
+    #[test]
+    fn remounted_or_missing_folder_keeps_settings_without_a_backup() {
+        // An external or network volume can disappear, or come back with a
+        // new device number. Neither may wipe the site allowlist.
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("selected");
+        let away = base.path().join("away");
+        fs::create_dir(&root).unwrap();
+        let path = base.path().join("config.toml");
+        let mut store = ConfigStore::for_test(path.clone());
+        let config = ConfigSnapshot {
+            storage: Some(StorageConfig {
+                root: root.to_string_lossy().into_owned(),
+                profile: "neutral".into(),
+                log_dir: "log".into(),
+                pages_dir: "pages".into(),
+                later_dir: "later".into(),
+            }),
+            capture_enabled: true,
+            sites: vec![SiteConfig {
+                origin: "https://example.com".into(),
+                path_prefix: "/".into(),
+            }],
+            ..empty_config()
+        };
+        let identity = selected_root_identity(&root).unwrap();
+        store
+            .update_with_root_identity(config.clone(), MISSING_REVISION, Some(&identity))
+            .unwrap()
+            .unwrap();
+        let saved = fs::read(&path).unwrap();
+
+        // Unmounted: the folder is gone. Capture stops, settings stay.
+        fs::rename(&root, &away).unwrap();
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_some());
+        assert!(!store.configured());
+        assert_eq!(store.snapshot(), &config);
+        assert_eq!(store.root_identity(), Some(identity.as_str()));
+
+        // Remounted with the same identity: no repair is needed at all.
+        fs::rename(&away, &root).unwrap();
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
+        assert!(store.configured());
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        assert_eq!(backup_count(base.path()), 0);
+    }
+
+    fn backup_count(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config-invalid-")
+            })
+            .count()
     }
 
     #[test]
