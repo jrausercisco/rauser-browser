@@ -2,7 +2,7 @@
 
 ## Current state
 
-M0 is merged. M1 development code adds a Chrome side panel and settings page, opt-in site capture, native folder selection and consent, durable visit IDs, and create-only page notes with sibling review drafts. The agent integration, search index, signed installers, Chrome Web Store listing, and public release do not exist yet. M1 still needs interactive Chrome checks on macOS and Windows; Windows new-file power-loss durability is not established. Use [DESIGN.md](DESIGN.md) for intended behavior and update it when implementation changes a contract.
+M0 is merged. M1 development code adds a Chrome side panel and settings page, opt-in site capture, native folder selection and consent, and durable visit IDs. The side panel was then reworked, before M2 (DESIGN.md §12.2 step 4): page notes are no longer create-only with sibling review drafts. The panel follows the active tab, loads that page's note on any HTTP(S) page (not gated by the logging allowlist), and autosaves the whole note about a second after typing stops, on tab change, and on panel close, via new `load_note`/`save_note` protocol messages (protocol version 3) that reuse `get_config`/`update_config`'s revision-check pattern. A save based on a stale version is refused; the host returns the note's current content and the panel shows a copy-out of the text it could not save. The first note on a page the extension has no standing Chrome access to starts from the toolbar action, the `note` keyboard command, or a page context-menu entry, which brings `activeTab` and `contextMenus` forward from M2 (and raises `minimum_chrome_version` to 116). The capture housekeeping controls from M1 collapsed into a one-line, expandable capture strip. The answer card, Summary section, and full omnibar are not built (M2/M3). The agent integration, search index, signed installers, Chrome Web Store listing, and public release do not exist yet. M1 still needs interactive Chrome checks on macOS and Windows; Windows new-file power-loss durability is not established. Use [DESIGN.md](DESIGN.md) for intended behavior and update it when implementation changes a contract.
 
 ## Repository map
 
@@ -23,6 +23,6 @@ For end-to-end checks, use `npm run smoke:macos:headless`. It never shows a wind
 
 - Treat all extension messages and page-derived content as untrusted.
 - Keep vault paths rooted in a user-selected directory; never accept a raw file path from a page or extension request.
-- Preserve existing user files. The M0 vault API creates new files only; later edits require managed-block ownership and conflict detection.
+- Preserve existing user files. Page notes are the one file kind the host replaces whole, and only after checking the caller's version and the file's recorded canonical URL and Brauser ownership (`host/src/note.rs`); an unrelated or unowned file at that path is a conflict, never adopted or overwritten. Every other content location (log, later) stays create-only.
 - Keep capture off until a folder is chosen, Chrome grants the requested site origin, and the native host confirms the policy. An M0 config with a manually set root needs folder reselection through the native picker before M1 can use it.
 - Do not claim an installer, browser extension, or agent mode works until it has been built and exercised.

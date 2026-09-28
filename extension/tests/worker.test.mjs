@@ -22,6 +22,13 @@ globalThis.chrome = {
     id: "test-extension",
     getURL: (path) => `chrome-extension://test-extension/${path}`,
     onMessage: { addListener(listener) { onMessage = listener; } },
+    onInstalled: { addListener() {} },
+  },
+  commands: { onCommand: { addListener() {} } },
+  contextMenus: {
+    create() {},
+    removeAll(callback) { callback?.(); },
+    onClicked: { addListener() {} },
   },
   storage: {
     local: {

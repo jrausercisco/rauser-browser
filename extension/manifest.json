@@ -3,13 +3,22 @@
   "name": "{{FULL_NAME}} (M1 development)",
   "version": "0.1.0",
   "description": "Private, local browsing notes. Development build; requires a registered {{APP_NAME}} native host.",
-  "minimum_chrome_version": "114",
+  "minimum_chrome_version": "116",
   "incognito": "not_allowed",
-  "permissions": ["sidePanel", "nativeMessaging", "storage"],
+  "permissions": ["sidePanel", "nativeMessaging", "storage", "activeTab", "contextMenus"],
   "optional_permissions": ["webNavigation"],
   "optional_host_permissions": ["http://*/*", "https://*/*"],
   "action": {
     "default_title": "Open {{APP_NAME}}"
+  },
+  "commands": {
+    "note": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+9",
+        "mac": "Command+Shift+9"
+      },
+      "description": "Add a note in {{APP_NAME}}"
+    }
   },
   "options_ui": {
     "page": "options.html",

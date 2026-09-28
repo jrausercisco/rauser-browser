@@ -14,9 +14,15 @@ interface ChromePermissionSet {
 
 interface ChromeTab {
   id?: number;
+  windowId?: number;
   url?: string;
   title?: string;
   incognito: boolean;
+}
+
+interface ChromeTabActivatedInfo {
+  tabId: number;
+  windowId: number;
 }
 
 interface ChromeTabChangeInfo {
@@ -39,6 +45,10 @@ interface ChromeMessageSender {
   url?: string;
 }
 
+interface ChromeContextMenuClickInfo {
+  menuItemId: string | number;
+}
+
 interface ChromeApi {
   runtime: {
     id: string;
@@ -58,9 +68,26 @@ interface ChromeApi {
         ) => boolean | void,
       ): void;
     };
+    onInstalled: { addListener(listener: () => void): void };
   };
   sidePanel: {
     setPanelBehavior(options: { openPanelOnActionClick: boolean }): Promise<void>;
+    open(options: { tabId?: number; windowId?: number }): Promise<void>;
+  };
+  commands: {
+    onCommand: {
+      addListener(listener: (command: string, tab?: ChromeTab) => void): void;
+    };
+  };
+  contextMenus: {
+    create(
+      properties: { id: string; title: string; contexts: string[] },
+      callback?: () => void,
+    ): void;
+    removeAll(callback?: () => void): void;
+    onClicked: {
+      addListener(listener: (info: ChromeContextMenuClickInfo, tab?: ChromeTab) => void): void;
+    };
   };
   permissions: {
     contains(permissions: ChromePermissionSet): Promise<boolean>;
@@ -92,6 +119,9 @@ interface ChromeApi {
       addListener(
         listener: (tabId: number, changeInfo: ChromeTabChangeInfo, tab: ChromeTab) => void,
       ): void;
+    };
+    onActivated: {
+      addListener(listener: (info: ChromeTabActivatedInfo) => void): void;
     };
   };
   webNavigation?: {

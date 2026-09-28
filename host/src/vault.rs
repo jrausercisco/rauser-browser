@@ -1,6 +1,6 @@
 //! Capability-scoped vault access. The extension never supplies a filesystem
-//! path. M0 only creates new page files; later note edits must add managed
-//! block ownership and conflict detection before replacing an existing file.
+//! path. Page notes are replaced whole under a caller-checked version and
+//! ownership (§4.4); callers own that check, this module trusts it.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -32,10 +32,6 @@ pub struct CreatedPage {
 
 #[derive(Debug)]
 pub enum PostPublishWarning {
-    TemporaryFileRemoval {
-        temporary_name: String,
-        error: io::Error,
-    },
     DirectorySync(io::Error),
 }
 
@@ -56,57 +52,24 @@ impl Vault {
         Ok(Self { root, pages_dir })
     }
 
-    /// Atomically publish a new note, refusing to replace any existing file.
-    /// The filename is derived from the URL, never from an extension path.
-    pub fn create_page(&self, page_url: &str, markdown: &str) -> Result<CreatedPage> {
-        self.create_page_with_post_publish_ops(
-            page_url,
-            markdown,
-            |pages, name| pages.remove_file(name),
-            sync_directory,
-        )
-    }
-
-    /// Preserve a proposed change beside an existing note for manual review.
-    /// The sibling name is stable for the normalized proposal, so retrying a
-    /// lost acknowledgement cannot create an unbounded series of drafts.
-    pub fn create_review_artifact(
-        &self,
-        page_url: &str,
-        proposal_id: &str,
-        markdown: &str,
-    ) -> Result<CreatedPage> {
-        let review_name = review_filename(page_url, proposal_id)?;
-        self.create_named_with_post_publish_ops(
-            &review_name,
-            markdown,
-            |pages, name| pages.remove_file(name),
-            sync_directory,
-        )
+    /// Atomically replace (or create) the whole note. The filename is derived
+    /// from the URL, never from an extension path. Callers must already have
+    /// checked the caller's expected version and Brauser ownership of any
+    /// existing file (§4.4); this call trusts the markdown it is given and
+    /// replaces whatever currently occupies the generated name.
+    pub fn replace_page(&self, page_url: &str, markdown: &str) -> Result<CreatedPage> {
+        self.replace_page_with_post_publish_ops(page_url, markdown, sync_directory)
     }
 
     pub fn page_relative_path(&self, page_url: &str) -> Result<PathBuf> {
         Ok(self.pages_dir.join(page_filename(page_url)?))
     }
 
-    pub fn review_relative_path(&self, page_url: &str, proposal_id: &str) -> Result<PathBuf> {
-        Ok(self.pages_dir.join(review_filename(page_url, proposal_id)?))
-    }
-
-    /// Read a page generated from the same canonical URL. This is used only
-    /// to distinguish an owned existing note from a filename conflict; M1
-    /// never replaces or adopts the file.
+    /// Read a page generated from the same canonical URL. Callers must check
+    /// ownership and identity themselves before treating an existing file as
+    /// an owned note (§6.4).
     pub fn read_page(&self, page_url: &str) -> Result<Option<String>> {
         let filename = page_filename(page_url)?;
-        self.read_named(&filename)
-    }
-
-    pub fn read_review_artifact(
-        &self,
-        page_url: &str,
-        proposal_id: &str,
-    ) -> Result<Option<String>> {
-        let filename = review_filename(page_url, proposal_id)?;
         self.read_named(&filename)
     }
 
@@ -148,35 +111,23 @@ impl Vault {
         ))
     }
 
-    fn create_page_with_post_publish_ops<F, G>(
+    /// Write a temp file, fsync it, then atomically rename it over the note's
+    /// generated name, replacing whatever is currently there (§4.4). Unlike
+    /// the old no-clobber hard-link publish, a rename is itself the atomic
+    /// cleanup step: on success no temporary name is left to remove.
+    fn replace_page_with_post_publish_ops<G>(
         &self,
         page_url: &str,
         markdown: &str,
-        remove_temporary: F,
         sync_parent: G,
     ) -> Result<CreatedPage>
     where
-        F: FnOnce(&Dir, &str) -> io::Result<()>,
-        G: FnOnce(&Dir) -> io::Result<()>,
-    {
-        let filename = page_filename(page_url)?;
-        self.create_named_with_post_publish_ops(&filename, markdown, remove_temporary, sync_parent)
-    }
-
-    fn create_named_with_post_publish_ops<F, G>(
-        &self,
-        filename: &str,
-        markdown: &str,
-        remove_temporary: F,
-        sync_parent: G,
-    ) -> Result<CreatedPage>
-    where
-        F: FnOnce(&Dir, &str) -> io::Result<()>,
         G: FnOnce(&Dir) -> io::Result<()>,
     {
         if markdown.len() > MAX_NOTE_BYTES {
             bail!("page note exceeds the 4 MiB write limit");
         }
+        let filename = page_filename(page_url)?;
         self.root
             .create_dir_all(&self.pages_dir)
             .context("creating page notes directory")?;
@@ -198,25 +149,14 @@ impl Vault {
         drop(file);
         write_result?;
 
-        // A hard link is an atomic no-clobber publication on the same volume.
-        // rename() would silently replace a user file with this name.
         pages
-            .hard_link(&temporary, &pages, filename)
-            .with_context(|| {
-                format!("page note already exists or cannot be created: {filename}")
-            })?;
-
-        let removal = remove_temporary(&pages, &temporary);
+            .rename(&temporary, &pages, &filename)
+            .with_context(|| format!("replacing page note: {filename}"))?;
         cleanup.disarm();
         drop(cleanup);
+
         let directory_sync = sync_parent(&pages);
         let mut warnings = Vec::new();
-        if let Err(error) = removal {
-            warnings.push(PostPublishWarning::TemporaryFileRemoval {
-                temporary_name: temporary,
-                error,
-            });
-        }
         if let Err(error) = directory_sync {
             warnings.push(PostPublishWarning::DirectorySync(error));
         }
@@ -292,21 +232,6 @@ fn directory_identity(dir: &Dir) -> Result<String> {
             info.file_index()
         ))
     }
-}
-
-fn review_filename(page_url: &str, proposal_id: &str) -> Result<String> {
-    if proposal_id.len() != 64
-        || !proposal_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("review proposal ID must be a lowercase SHA-256 digest");
-    }
-    let filename = page_filename(page_url)?;
-    let stem = filename
-        .strip_suffix(".md")
-        .context("page filename has no Markdown suffix")?;
-    Ok(format!("{stem}.{NAMESPACE}-review-{proposal_id}.md"))
 }
 
 pub(crate) fn checked_relative_dir(value: &str) -> Result<PathBuf> {
@@ -436,33 +361,51 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_page_never_replaces_an_existing_file() {
+    fn replacing_a_page_creates_it_when_absent() {
         let root = tempfile::tempdir().unwrap();
         let vault = Vault::open(&storage(root.path(), "pages")).unwrap();
-        let relative = vault
-            .create_page("https://example.com/article#part-1", "first")
+        let created = vault
+            .replace_page("https://example.com/article#part-1", "first")
             .unwrap();
-        assert!(relative.warnings.is_empty());
-        assert!(
-            vault
-                .create_page("https://example.com/article#part-2", "second")
-                .is_err()
-        );
+        assert!(created.warnings.is_empty());
         assert_eq!(
-            fs::read_to_string(root.path().join(relative.relative_path)).unwrap(),
+            fs::read_to_string(root.path().join(&created.relative_path)).unwrap(),
             "first"
+        );
+        // The fragment is not part of the generated identity.
+        assert_eq!(
+            created.relative_path,
+            vault
+                .page_relative_path("https://example.com/article#part-2")
+                .unwrap()
         );
     }
 
     #[test]
-    fn post_publish_failures_report_created_page_with_warnings() {
+    fn replacing_a_page_overwrites_existing_content() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = Vault::open(&storage(root.path(), "pages")).unwrap();
+        let first = vault
+            .replace_page("https://example.com/article", "first")
+            .unwrap();
+        let second = vault
+            .replace_page("https://example.com/article", "second")
+            .unwrap();
+        assert_eq!(first.relative_path, second.relative_path);
+        assert_eq!(
+            fs::read_to_string(root.path().join(second.relative_path)).unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn post_publish_directory_sync_failure_reports_a_warning_but_still_publishes() {
         let root = tempfile::tempdir().unwrap();
         let vault = Vault::open(&storage(root.path(), "pages")).unwrap();
         let created = vault
-            .create_page_with_post_publish_ops(
+            .replace_page_with_post_publish_ops(
                 "https://example.com/article",
                 "saved content",
-                |_, _| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
                 |_| Err(io::Error::other("simulated directory sync failure")),
             )
             .unwrap();
@@ -473,15 +416,16 @@ mod tests {
         );
         assert!(matches!(
             created.warnings.as_slice(),
-            [
-                PostPublishWarning::TemporaryFileRemoval { .. },
-                PostPublishWarning::DirectorySync(_)
-            ]
+            [PostPublishWarning::DirectorySync(_)]
         ));
     }
 
     #[test]
-    fn an_existing_user_file_with_the_generated_name_is_preserved() {
+    fn replace_page_overwrites_whatever_occupies_the_generated_name() {
+        // vault::replace_page trusts its caller. The note module (§4.4) is
+        // responsible for checking the caller's version and ownership of an
+        // existing file before calling this; this low-level test documents
+        // that this layer itself does not refuse an unrelated occupant.
         let root = tempfile::tempdir().unwrap();
         let pages = root.path().join("pages");
         fs::create_dir(&pages).unwrap();
@@ -490,12 +434,10 @@ mod tests {
         fs::write(&user_file, "user content").unwrap();
 
         let vault = Vault::open(&storage(root.path(), "pages")).unwrap();
-        assert!(
-            vault
-                .create_page("https://example.com/user-note", "generated")
-                .is_err()
-        );
-        assert_eq!(fs::read_to_string(user_file).unwrap(), "user content");
+        vault
+            .replace_page("https://example.com/user-note", "generated")
+            .unwrap();
+        assert_eq!(fs::read_to_string(user_file).unwrap(), "generated");
     }
 
     #[cfg(unix)]
@@ -507,7 +449,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         symlink(outside.path(), root.path().join("pages")).unwrap();
         let vault = Vault::open(&storage(root.path(), "pages")).unwrap();
-        assert!(vault.create_page("https://example.com", "content").is_err());
+        assert!(
+            vault
+                .replace_page("https://example.com", "content")
+                .is_err()
+        );
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }

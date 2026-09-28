@@ -1,7 +1,7 @@
 import type { ErrorCode, Request, Response } from "../protocol/ts/generated.js";
 import { NATIVE_HOST_NAME } from "./brand.js";
 
-export const PROTOCOL_VERSION: Request["protocol_version"] = 2;
+export const PROTOCOL_VERSION: Request["protocol_version"] = 3;
 
 export function newRequestId(): string {
   return crypto.randomUUID();
@@ -75,10 +75,16 @@ function isResponseShape(value: Record<string, unknown>): boolean {
       return typeof value.event_id === "string" &&
         ["persisted", "suppressed", "rejected", "retryable"].includes(String(value.outcome)) &&
         stringOrNull(value.reason) && stringOrNull(value.relative_path);
-    case "page_note_result":
-      return ["created", "already_present", "conflict", "created_with_warning"]
+    case "note_loaded":
+      return typeof value.exists === "boolean" && typeof value.revision === "string" &&
+        typeof value.title === "string" && typeof value.body === "string";
+    case "note_saved":
+      return ["created", "replaced", "created_with_warning", "replaced_with_warning"]
         .includes(String(value.outcome)) &&
-        stringOrNull(value.relative_path) && stringOrNull(value.message);
+        typeof value.revision === "string" && typeof value.relative_path === "string";
+    case "note_conflict":
+      return typeof value.exists === "boolean" && typeof value.revision === "string" &&
+        typeof value.title === "string" && typeof value.body === "string";
     default:
       return false;
   }
@@ -108,6 +114,27 @@ export class HostClient {
       throw new HostError(
         "invalid_response",
         `Native host returned ${response.type} instead of ${expected}`,
+      );
+    }
+    return response as Extract<Response, { type: K }>;
+  }
+
+  /** Like {@link call}, but the host may legitimately answer with any of
+   * several response types (for example `save_note`'s `note_saved` or
+   * `note_conflict`). */
+  async callAny<K extends Exclude<Response["type"], "error">>(
+    request: Request,
+    expected: readonly K[],
+    timeoutMs = 30_000,
+  ): Promise<Extract<Response, { type: K }>> {
+    const response = await this.send(request, timeoutMs);
+    if (response.type === "error") {
+      throw new HostError(response.code, response.message);
+    }
+    if (!(expected as readonly string[]).includes(response.type)) {
+      throw new HostError(
+        "invalid_response",
+        `Native host returned ${response.type} instead of ${expected.join(" or ")}`,
       );
     }
     return response as Extract<Response, { type: K }>;
