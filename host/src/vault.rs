@@ -5,6 +5,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::brand::NAMESPACE;
 use anyhow::{Context, Result, bail};
@@ -16,6 +17,10 @@ use url::Url;
 use uuid::Uuid;
 
 const MAX_NOTE_BYTES: usize = 4 * 1024 * 1024;
+/// A live save renames its temporary within one request, so one this old was
+/// left by a host that was killed mid-save. The margin keeps a startup sweep
+/// from racing another host process's save in progress.
+pub(crate) const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(60 * 60);
 
 pub struct Vault {
     root: Dir,
@@ -109,6 +114,43 @@ impl Vault {
         Ok(Some(
             String::from_utf8(bytes).context("existing page note is not UTF-8")?,
         ))
+    }
+
+    /// Remove page-note temporaries left by a host killed between creating
+    /// and renaming them. Only regular files whose whole name is one this
+    /// module generates, and that are older than `STALE_TEMPORARY_AGE`, are
+    /// removed. Returns how many were removed.
+    pub fn sweep_stale_temporaries(&self) -> Result<usize> {
+        let pages = match self.root.open_dir(&self.pages_dir) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error).context("opening page notes directory"),
+        };
+        let prefix = format!(".{NAMESPACE}-");
+        let now = SystemTime::now();
+        let mut removed = 0;
+        for entry in pages.entries().context("listing page notes directory")? {
+            let entry = entry.context("listing page notes directory")?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !is_generated_temporary(name, &prefix) {
+                continue;
+            }
+            // Not following symlinks: a link is not ours, whatever its name.
+            let Ok(metadata) = pages.symlink_metadata(name) else {
+                continue;
+            };
+            let stale = metadata.is_file()
+                && metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified.into_std()).ok())
+                    .is_some_and(|elapsed| elapsed >= STALE_TEMPORARY_AGE);
+            if stale && pages.remove_file(name).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Write a temp file, fsync it, then atomically rename it over the note's
@@ -234,6 +276,14 @@ fn directory_identity(dir: &Dir) -> Result<String> {
     }
 }
 
+/// True only for `<prefix><hyphenated UUID>.tmp`, the exact shape this host
+/// generates, so a user's own file is never mistaken for a leftover.
+pub(crate) fn is_generated_temporary(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .is_some_and(|id| Uuid::try_parse(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id))
+}
+
 pub(crate) fn checked_relative_dir(value: &str) -> Result<PathBuf> {
     let path = Path::new(value);
     if path.as_os_str().is_empty()
@@ -340,7 +390,7 @@ pub(crate) fn sync_directory_chain(root: &Dir, relative: &Path) -> io::Result<()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn storage(root: &Path, pages_dir: &str) -> StorageConfig {
@@ -438,6 +488,70 @@ mod tests {
             .replace_page("https://example.com/user-note", "generated")
             .unwrap();
         assert_eq!(fs::read_to_string(user_file).unwrap(), "generated");
+    }
+
+    pub(crate) fn age_file(path: &Path, age: Duration) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn startup_sweep_removes_only_stale_page_note_temporaries() {
+        let root = tempfile::tempdir().unwrap();
+        let pages = root.path().join("pages");
+        fs::create_dir(&pages).unwrap();
+        let old = STALE_TEMPORARY_AGE + Duration::from_secs(60);
+        let stale = pages.join(format!(".{NAMESPACE}-{}.tmp", Uuid::new_v4()));
+        let fresh = pages.join(format!(".{NAMESPACE}-{}.tmp", Uuid::new_v4()));
+        // Other writers' temporaries and user files are never touched.
+        let log_temp = pages.join(format!(".{NAMESPACE}-log-{}.tmp", Uuid::new_v4()));
+        let user_file = pages.join(format!(".{NAMESPACE}-notes.tmp"));
+        let note = pages.join("note.md");
+        for path in [&stale, &fresh, &log_temp, &user_file, &note] {
+            fs::write(path, "content").unwrap();
+        }
+        for path in [&stale, &log_temp, &user_file, &note] {
+            age_file(path, old);
+        }
+
+        let vault = Vault::open(&storage(root.path(), "pages")).unwrap();
+        assert_eq!(vault.sweep_stale_temporaries().unwrap(), 1);
+        assert!(!stale.exists());
+        for path in [&fresh, &log_temp, &user_file, &note] {
+            assert!(path.exists(), "{} was removed", path.display());
+        }
+    }
+
+    #[test]
+    fn startup_sweep_tolerates_a_missing_pages_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = Vault::open(&storage(root.path(), "pages")).unwrap();
+        assert_eq!(vault.sweep_stale_temporaries().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_sweep_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target");
+        fs::write(&target, "outside").unwrap();
+        let pages = root.path().join("pages");
+        fs::create_dir(&pages).unwrap();
+        let link = pages.join(format!(".{NAMESPACE}-{}.tmp", Uuid::new_v4()));
+        symlink(&target, &link).unwrap();
+        age_file(&target, STALE_TEMPORARY_AGE + Duration::from_secs(60));
+
+        let vault = Vault::open(&storage(root.path(), "pages")).unwrap();
+        assert_eq!(vault.sweep_stale_temporaries().unwrap(), 0);
+        assert!(link.symlink_metadata().is_ok());
+        assert_eq!(fs::read_to_string(target).unwrap(), "outside");
     }
 
     #[cfg(unix)]
