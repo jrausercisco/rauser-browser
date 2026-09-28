@@ -14,3 +14,6 @@ pub const NAMESPACE: &str = namespace!();
 pub const BLOCK_START: &str = concat!("<!-- ", namespace!(), ":start -->");
 pub const BLOCK_END: &str = concat!("<!-- ", namespace!(), ":end -->");
 pub const FRONTMATTER_KEY: &str = concat!(namespace!(), ":");
+/// Names the scripted-answer directory in `scripted-dialogs` test builds.
+#[cfg(feature = "scripted-dialogs")]
+pub const SCRIPTED_DIALOGS_ENV: &str = "BRAUSER_SCRIPTED_DIALOGS";
