@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jrausercisco/rauser-browser/blob/main/protocol/schema.json",
+  "title": "Rauser native messaging protocol",
+  "description": "Version 1 messages exchanged by the Chrome extension and native host. The host checks the version before deserializing a request so it can return an error for incompatible versions.",
+  "oneOf": [
+    { "$ref": "#/$defs/Request" },
+    { "$ref": "#/$defs/Response" }
+  ],
+  "$defs": {
+    "Request": {
+      "oneOf": [
+        { "$ref": "#/$defs/HelloRequest" },
+        { "$ref": "#/$defs/GetConfigRequest" },
+        { "$ref": "#/$defs/UpdateConfigRequest" }
+      ]
+    },
+    "Response": {
+      "oneOf": [
+        { "$ref": "#/$defs/HelloResult" },
+        { "$ref": "#/$defs/ConfigResult" },
+        { "$ref": "#/$defs/ConfigUpdated" },
+        { "$ref": "#/$defs/ErrorResponse" }
+      ]
+    },
+    "HelloRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "protocol_version", "request_id"],
+      "properties": {
+        "type": { "const": "hello" },
+        "protocol_version": { "type": "integer", "const": 1 },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "GetConfigRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "protocol_version", "request_id"],
+      "properties": {
+        "type": { "const": "get_config" },
+        "protocol_version": { "type": "integer", "const": 1 },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "UpdateConfigRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "protocol_version", "request_id", "config"],
+      "properties": {
+        "type": { "const": "update_config" },
+        "protocol_version": { "type": "integer", "const": 1 },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "config": { "$ref": "#/$defs/ConfigSnapshot" }
+      }
+    },
+    "HelloResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "protocol_version", "request_id", "host_version", "configured"],
+      "properties": {
+        "type": { "const": "hello_result" },
+        "protocol_version": { "type": "integer", "const": 1 },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "host_version": { "type": "string" },
+        "configured": { "type": "boolean" }
+      }
+    },
+    "ConfigResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "protocol_version", "request_id", "config"],
+      "properties": {
+        "type": { "const": "config_result" },
+        "protocol_version": { "type": "integer", "const": 1 },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "config": { "$ref": "#/$defs/ConfigSnapshot" }
+      }
+    },
+    "ConfigUpdated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "protocol_version", "request_id", "config"],
+      "properties": {
+        "type": { "const": "config_updated" },
+        "protocol_version": { "type": "integer", "const": 1 },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "config": { "$ref": "#/$defs/ConfigSnapshot" }
+      }
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "An empty request_id is allowed only when the host could not recover an ID from a malformed request.",
+      "required": ["type", "protocol_version", "request_id", "code", "message"],
+      "properties": {
+        "type": { "const": "error" },
+        "protocol_version": { "type": "integer", "const": 1 },
+        "request_id": { "type": "string", "maxLength": 128 },
+        "code": { "$ref": "#/$defs/ErrorCode" },
+        "message": { "type": "string" }
+      }
+    },
+    "ErrorCode": {
+      "type": "string",
+      "enum": [
+        "invalid_request",
+        "unsupported_protocol_version",
+        "invalid_config",
+        "not_configured",
+        "unauthorized",
+        "conflict",
+        "message_too_large",
+        "internal"
+      ]
+    },
+    "ConfigSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["storage", "capture_enabled"],
+      "properties": {
+        "storage": {
+          "oneOf": [
+            { "$ref": "#/$defs/StorageConfig" },
+            { "type": "null" }
+          ]
+        },
+        "capture_enabled": { "type": "boolean" }
+      }
+    },
+    "StorageConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "profile", "log_dir", "pages_dir", "later_dir"],
+      "properties": {
+        "root": { "type": "string", "minLength": 1 },
+        "profile": { "type": "string", "minLength": 1 },
+        "log_dir": { "type": "string", "minLength": 1 },
+        "pages_dir": { "type": "string", "minLength": 1 },
+        "later_dir": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
