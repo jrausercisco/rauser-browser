@@ -1,7 +1,12 @@
-import type { ErrorCode, Request, Response } from "../protocol/ts/generated.js";
+import type {
+  ErrorCode, PROTOCOL_VERSION as GENERATED_PROTOCOL_VERSION, Request, Response,
+} from "../protocol/ts/generated.js";
 import { NATIVE_HOST_NAME } from "./brand.js";
+import { isResponseShape } from "./protocol-shape.js";
 
-export const PROTOCOL_VERSION: Request["protocol_version"] = 3;
+// A value import would pull the generated module out of the flat dist layout;
+// this annotation fails typecheck whenever the generated version changes.
+export const PROTOCOL_VERSION: typeof GENERATED_PROTOCOL_VERSION = 4;
 
 export function newRequestId(): string {
   return crypto.randomUUID();
@@ -21,73 +26,6 @@ interface Pending {
   resolve(response: Response): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
-}
-
-const ERROR_CODES: ReadonlySet<string> = new Set([
-  "invalid_request", "unsupported_protocol_version", "invalid_config", "not_configured",
-  "unauthorized", "conflict", "message_too_large", "internal", "cancelled",
-]);
-
-function stringOrNull(value: unknown): boolean {
-  return value === null || typeof value === "string";
-}
-
-function isConfig(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const config = value as Record<string, unknown>;
-  const storage = config.storage;
-  if (storage !== null) {
-    if (typeof storage !== "object" || storage === null) return false;
-    const record = storage as Record<string, unknown>;
-    if (!["root", "profile", "log_dir", "pages_dir", "later_dir"]
-      .every((key) => typeof record[key] === "string")) return false;
-  }
-  return typeof config.capture_enabled === "boolean" &&
-    Array.isArray(config.sites) &&
-    config.sites.every((site: unknown) =>
-      typeof site === "object" && site !== null &&
-      typeof (site as Record<string, unknown>).origin === "string" &&
-      typeof (site as Record<string, unknown>).path_prefix === "string") &&
-    Array.isArray(config.strip_params) &&
-    config.strip_params.every((value: unknown) => typeof value === "string") &&
-    typeof config.near_repeat_secs === "number" &&
-    Number.isInteger(config.near_repeat_secs);
-}
-
-function isResponseShape(value: Record<string, unknown>): boolean {
-  switch (value.type) {
-    case "error":
-      return typeof value.code === "string" && ERROR_CODES.has(value.code) &&
-        typeof value.message === "string";
-    case "hello_result":
-      return typeof value.host_version === "string" &&
-        typeof value.configured === "boolean" && stringOrNull(value.config_issue);
-    case "config_result":
-      return typeof value.revision === "string" && isConfig(value.config) &&
-        stringOrNull(value.config_issue);
-    case "config_updated":
-      return typeof value.revision === "string" && isConfig(value.config);
-    case "folder_chosen":
-      return typeof value.path === "string" && typeof value.picker_token === "string";
-    case "config_confirmed":
-      return typeof value.consent_token === "string" && typeof value.summary === "string";
-    case "visit_recorded":
-      return typeof value.event_id === "string" &&
-        ["persisted", "suppressed", "rejected", "retryable"].includes(String(value.outcome)) &&
-        stringOrNull(value.reason) && stringOrNull(value.relative_path);
-    case "note_loaded":
-      return typeof value.exists === "boolean" && typeof value.revision === "string" &&
-        typeof value.title === "string" && typeof value.body === "string";
-    case "note_saved":
-      return ["created", "replaced", "created_with_warning", "replaced_with_warning"]
-        .includes(String(value.outcome)) &&
-        typeof value.revision === "string" && typeof value.relative_path === "string";
-    case "note_conflict":
-      return typeof value.exists === "boolean" && typeof value.revision === "string" &&
-        typeof value.title === "string" && typeof value.body === "string";
-    default:
-      return false;
-  }
 }
 
 /** A version mismatch is the one error a host out of step with this build

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 const { storageKey } = await import("../dist/brand.js");
+const { PROTOCOL_VERSION } = await import("../dist/native.js");
 
 // Run after build:extension. Each test loads a fresh copy of the settings page
 // against a fake DOM, a scripted native host, a stub worker, and a Chrome
@@ -9,6 +10,7 @@ const { storageKey } = await import("../dist/brand.js");
 const NOTE_ORIGINS_KEY = storageKey("note_origins_v1");
 const SITE = { origin: "https://a.com", path_prefix: "/" };
 const PATTERN = "https://a.com:443/*";
+const AGENT_STATUS = { state: "not_set_up", harness_version: null, message: "Set up an AI harness." };
 
 class FakeElement {
   constructor(tagName) {
@@ -17,6 +19,7 @@ class FakeElement {
     this.value = "";
     this.disabled = false;
     this.children = [];
+    this.dataset = {};
     this.listeners = new Map();
     this.classList = { toggle() {}, add() {}, remove() {} };
   }
@@ -59,11 +62,18 @@ function statusFor(overrides = {}) {
 
 function configWith(sites) {
   return {
-    storage: { root: "/vault", profile: "neutral", log_dir: "log", pages_dir: "pages", later_dir: "later" },
+    storage: {
+      root: "/vault", profile: "neutral", log_dir: "log", pages_dir: "pages", later_dir: "later",
+      summaries_dir: null,
+    },
     capture_enabled: sites.length > 0,
     sites,
     strip_params: [],
     near_repeat_secs: 60,
+    agent_denylist: [],
+    agent_denylist_confirmed: false,
+    log_incognito: false,
+    agent: null,
   };
 }
 
@@ -86,6 +96,10 @@ function install({ sites = [SITE], grants = [], storage = {}, host = {}, workerS
   for (const [id, tag] of [
     ["status", "div"], ["folder-path", "output"], ["choose-folder", "button"], ["site-url", "input"],
     ["site-path", "input"], ["enable-site", "button"], ["pause-capture", "button"], ["sites-list", "ul"],
+    ["agent-state", "p"], ["detect-harnesses", "button"], ["harness-offers", "ul"], ["harness-env", "ul"],
+    ["summaries-dir", "input"], ["denylist-input", "input"], ["denylist-preview", "output"],
+    ["denylist-add", "button"], ["denylist-suggestions", "div"], ["denylist-list", "ul"],
+    ["setup-harness", "button"], ["remove-harness", "button"],
   ]) {
     elements.set(id, new FakeElement(tag));
   }
@@ -101,7 +115,7 @@ function install({ sites = [SITE], grants = [], storage = {}, host = {}, workerS
       case "get_config":
         return {
           type: "config_result", revision: String(state.revision), config: state.config,
-          config_issue: state.configIssue,
+          config_issue: state.configIssue, agent_status: AGENT_STATUS,
         };
       case "choose_folder":
         return { type: "folder_chosen", path: "/vault", picker_token: `picker-${state.connects}` };
@@ -142,7 +156,7 @@ function install({ sites = [SITE], grants = [], storage = {}, host = {}, workerS
             setTimeout(() => {
               const reply = hostReply(request);
               for (const listener of messageListeners) {
-                listener({ ...reply, protocol_version: 3, request_id: request.request_id });
+                listener({ ...reply, protocol_version: PROTOCOL_VERSION, request_id: request.request_id });
               }
             }, 0);
           },
@@ -281,6 +295,7 @@ test("a settings load failure after hello is not reported as a missing host", as
     host: {
       get_config: (_request, current) => ({
         type: "config_result", revision: "1", config: current.config, config_issue: "config.json is unreadable",
+        agent_status: AGENT_STATUS,
       }),
     },
   });
@@ -372,4 +387,28 @@ test("a host restart drops a folder selection only the old host knew", async () 
   await until(() => !env.elements.get("enable-site").disabled, "Enable after the second pick");
   env.elements.get("enable-site").click();
   await until(() => statusText().startsWith("Capture enabled") && idle(), "setup to finish");
+});
+
+test("a host restart drops harness offers only the old host knew", async () => {
+  const offer = {
+    offer_id: "offer-1", adapter: "claude_code", harness_id: "claude-code",
+    binary: "/usr/local/bin/claude", real_path: "/opt/claude/bin/claude", version: "2.1.284",
+    args: ["-p", "{prompt}"], env_required: ["HOME", "PATH"], env_optional: [], refusal: null,
+  };
+  const state = install({
+    host: {
+      discover_harnesses: (_request, current) =>
+        ({ type: "harnesses_discovered", offers: [{ ...offer, offer_id: `offer-${current.connects}` }] }),
+    },
+  });
+  await openSettings();
+  env.elements.get("detect-harnesses").click();
+  await until(() => !env.elements.get("setup-harness").disabled, "Set up to become available");
+
+  state.exitHost();
+  assert.match(statusText(), /detected harnesses were lost\. Detect harnesses again/);
+  assert.equal(env.elements.get("setup-harness").disabled, true);
+
+  env.elements.get("detect-harnesses").click();
+  await until(() => !env.elements.get("setup-harness").disabled, "Set up after detecting again");
 });

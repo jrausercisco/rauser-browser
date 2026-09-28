@@ -940,6 +940,7 @@ mod tests {
             log_dir: log_dir.into(),
             pages_dir: "pages".into(),
             later_dir: "later".into(),
+            summaries_dir: None,
         }
     }
 

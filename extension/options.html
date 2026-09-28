@@ -10,7 +10,7 @@
     <main>
       <header>
         <h1>{{APP_NAME}} settings</h1>
-        <p class="eyebrow">M1 development build · Chrome</p>
+        <p class="eyebrow">M2 development build · Chrome</p>
       </header>
 
       <div id="status" class="status" role="status" aria-live="polite">Connecting to native host…</div>
@@ -46,6 +46,46 @@
           <h3>Enabled sites</h3>
           <ul id="sites-list" class="plain-list"><li>None</li></ul>
         </div>
+      </section>
+
+      <section aria-labelledby="agent-heading">
+        <h2 id="agent-heading">AI harness (optional)</h2>
+        <p id="agent-no-ai">No AI runs until you set up a harness here. Capture and page notes work without one.</p>
+        <p id="agent-state" role="status">AI harness status is unavailable.</p>
+
+        <div class="field">
+          <button id="detect-harnesses" type="button" class="secondary" disabled>Detect harnesses</button>
+          <small>{{APP_NAME}} looks for Claude Code and Codex on the native host's PATH and runs only their version and help checks (for Codex, also its feature list).</small>
+          <ul id="harness-offers" class="plain-list offer-list"><li>Not detected yet.</li></ul>
+        </div>
+
+        <div class="field">
+          <h3>Environment variables passed to the harness</h3>
+          <small>Names only; {{APP_NAME}} never shows or stores their values.</small>
+          <ul id="harness-env" class="plain-list offer-list"><li>Detect a harness first.</li></ul>
+        </div>
+
+        <div class="field">
+          <label for="summaries-dir">Summaries folder</label>
+          <input id="summaries-dir" type="text" value="summaries" spellcheck="false" autocomplete="off" />
+          <small>A folder inside the notes folder, separate from the visit log, page notes, and read-later folders.</small>
+        </div>
+
+        <div class="field">
+          <h3>AI privacy exclusions</h3>
+          <small>Pages on these sites and their subdomains are never sent to an AI harness. Until the first harness setup confirms this list, changes wait for that setup. After it, adding an exclusion applies at once and removing one asks for confirmation, even if the harness is later removed.</small>
+          <label for="denylist-input">Exclude a domain</label>
+          <input id="denylist-input" type="text" placeholder="bank.example" spellcheck="false" autocomplete="off" />
+          <output id="denylist-preview"></output>
+          <div>
+            <button id="denylist-add" type="button" class="secondary" disabled>Add exclusion</button>
+          </div>
+          <div id="denylist-suggestions"><small>Common kinds of site to exclude. Choosing one fills the box with an example to edit:</small></div>
+          <ul id="denylist-list" class="plain-list"><li>No domains excluded.</li></ul>
+        </div>
+
+        <button id="setup-harness" type="button" disabled>Set up harness…</button>
+        <button id="remove-harness" type="button" class="secondary" disabled>Remove harness</button>
       </section>
 
       <footer>

@@ -17,6 +17,9 @@ anyhow = "1"
 cap-std = "4.0"
 directories = "6"
 hex = "0.4"
+# Case-insensitive, normalization-insensitive path comparison (APFS rules).
+icu_casemap = "2.3"
+icu_normalizer = "2.3"
 brauser-protocol = { path = "../protocol" }
 rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +32,11 @@ uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 brauser-macos-alert = { path = "../macos-alert" }
+
+# Safe process-group kill and uid lookup for harness runs; the crates keep
+# #![forbid(unsafe_code)], so libc's unsafe killpg is not used directly.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1.11"

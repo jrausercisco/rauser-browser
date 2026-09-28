@@ -4,6 +4,7 @@ import test from "node:test";
 const { finishHostPause, withLatestHostState } = await import("../dist/coordination.js");
 const { localTimestamp } = await import("../dist/model.js");
 const { storageKey } = await import("../dist/brand.js");
+const { isConfig, isResponseShape } = await import("../dist/protocol-shape.js");
 
 // Run after build:extension. The mock copies storage values as Chrome does,
 // which catches accidental reliance on mutating an object returned by get().
@@ -658,4 +659,78 @@ test("unaddressed host errors and version mismatches reach the caller", async ()
   await assert.rejects(oversized,
     (error) => error instanceof HostError && error.code === "message_too_large");
   client.disconnect();
+});
+
+test("host config shape requires every v4 privacy and agent key", () => {
+  const config = {
+    storage: {
+      root: "/notes", profile: "neutral", log_dir: "log", pages_dir: "pages", later_dir: "later",
+      summaries_dir: null,
+    },
+    capture_enabled: false, sites: [], strip_params: [], near_repeat_secs: 300,
+    agent_denylist: ["bank.example"], agent_denylist_confirmed: false, log_incognito: false,
+    agent: null,
+  };
+  assert.equal(isConfig(config), true);
+  const agent = {
+    harness_id: "claude-code", adapter: "claude_code", binary: "/usr/local/bin/claude",
+    args: ["-p", "{prompt}"], env_allow: [], timeout_secs: 120,
+  };
+  assert.equal(isConfig({ ...config, agent }), true);
+  for (const key of ["agent_denylist", "agent_denylist_confirmed", "log_incognito", "agent"]) {
+    const without = { ...config };
+    delete without[key];
+    assert.equal(isConfig(without), false, key);
+  }
+  assert.equal(isConfig({ ...config, log_incognito: true }), false);
+  assert.equal(isConfig({ ...config, agent: { ...agent, adapter: "claude-code" } }), false);
+  // The host always sends summaries_dir, as null until a folder is chosen.
+  const { summaries_dir: _omitted, ...m1Storage } = config.storage;
+  assert.equal(isConfig({ ...config, storage: m1Storage }), false);
+  assert.equal(isConfig({ ...config, storage: { ...m1Storage, summaries_dir: 7 } }), false);
+
+  const result = { type: "config_result", revision: "missing", config, config_issue: null };
+  assert.equal(isResponseShape(result), false);
+  const agentStatus = { state: "not_set_up", harness_version: null, message: "Set up" };
+  assert.equal(isResponseShape({ ...result, agent_status: agentStatus }), true);
+  assert.equal(isResponseShape({ ...result, agent_status: { ...agentStatus, state: "on" } }), false);
+  assert.equal(isResponseShape({
+    type: "agent_checked", harness_id: "claude-code", harness_version: "2.1.0", url_allowed: null,
+  }), true);
+
+  // Harness setup: every offer key is present, nullable ones as null.
+  const offer = {
+    offer_id: "offer-1", adapter: "claude_code", harness_id: "claude-code",
+    binary: "/usr/local/bin/claude", real_path: "/opt/claude/bin/claude", version: "2.1.284",
+    args: ["-p", "{prompt}"], env_required: ["HOME", "PATH"],
+    env_optional: [{ name: "ANTHROPIC_API_KEY", present: true }], refusal: null,
+  };
+  const refused = {
+    ...offer, offer_id: null, adapter: "codex", harness_id: "codex", real_path: null,
+    version: null, env_optional: [], refusal: "Codex setup is not available yet",
+  };
+  const discovered = { type: "harnesses_discovered", offers: [offer, refused] };
+  assert.equal(isResponseShape(discovered), true);
+  assert.equal(isResponseShape({ ...discovered, offers: [] }), true);
+  assert.equal(isResponseShape({ ...discovered, offers: null }), false);
+  for (const key of Object.keys(offer)) {
+    const without = { ...offer };
+    delete without[key];
+    assert.equal(isResponseShape({ ...discovered, offers: [without] }), false, key);
+  }
+  assert.equal(isResponseShape({ ...discovered, offers: [{ ...offer, adapter: "generic" }] }), false);
+  assert.equal(isResponseShape({
+    ...discovered, offers: [{ ...offer, env_optional: ["ANTHROPIC_API_KEY"] }],
+  }), false);
+  assert.equal(isResponseShape({
+    ...discovered, offers: [{ ...offer, env_optional: [{ name: "X", present: "yes" }] }],
+  }), false);
+
+  const setUp = { type: "harness_setup_confirmed", harness_token: "t", config, summary: "Harness" };
+  assert.equal(isResponseShape(setUp), true);
+  for (const key of ["harness_token", "config", "summary"]) {
+    const without = { ...setUp };
+    delete without[key];
+    assert.equal(isResponseShape(without), false, key);
+  }
 });

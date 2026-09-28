@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 
-// Guided real-Chrome M1 smoke run. Native dialogs and Chrome permission prompts
-// are answered by a person, or with --auto through UI scripting; all host and
-// vault state is kept in a temp home. --headless runs the same flow with
-// nothing on screen: headless Chrome, a scripted-dialogs host build, and
-// Chrome access granted ahead of time instead of through Chrome's prompt.
+// Guided real-Chrome M1 smoke run, plus M2 step 1 harness setup. Native
+// dialogs and Chrome permission prompts are answered by a person, or with
+// --auto through UI scripting; all host and vault state is kept in a temp
+// home. --headless runs the same flow with nothing on screen: headless Chrome,
+// a scripted-dialogs host build, and Chrome access granted ahead of time
+// instead of through Chrome's prompt. Only --headless runs harness setup, with
+// fake harnesses on a pinned PATH and a cleared host environment.
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
   access, chmod, cp, lstat, mkdir, mkdtemp, open, readFile,
-  readdir, realpath, rename, unlink, writeFile,
+  readdir, realpath, rename, symlink, unlink, writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
@@ -26,11 +28,26 @@ const DEFAULT_HOST = path.join(REPO, "target", "debug", BINARY_NAME);
 // A separate target directory keeps the scripted build away from the host a
 // developer registers for everyday use.
 const SCRIPTED_HOST = path.join(REPO, "target", "scripted-dialogs", "debug", BINARY_NAME);
-const SCRIPTED_BUILD = `cargo build --locked -p ${BINARY_NAME} --features scripted-dialogs --target-dir target/scripted-dialogs`;
+// An absolute target directory, so the printed command builds where the
+// runner looks even when run from host/.
+const SCRIPTED_BUILD = `cargo build --locked -p ${BINARY_NAME} --features scripted-dialogs --target-dir ${shellQuote(path.dirname(path.dirname(SCRIPTED_HOST)))}`;
 const SCRIPTED_DIALOGS_ENV = `${BINARY_NAME.toUpperCase()}_SCRIPTED_DIALOGS`;
 const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const DEV_DESCRIPTION = `${APP_NAME} development native host`;
+// Keep in step with PROTOCOL_VERSION in protocol/schema.json.
+const PROTOCOL_VERSION = 4;
 const EXTENSION_ID = /^[a-p]{32}$/;
+const CLAUDE_HELP = path.join(REPO, "host", "tests", "fixtures", "harness", "claude_help.txt");
+const CODEX_EXEC_HELP = path.join(REPO, "host", "tests", "fixtures", "harness", "codex_exec_help.txt");
+const CODEX_FEATURES = path.join(REPO, "host", "tests", "fixtures", "harness", "codex_features.txt");
+// The probe argv the host must run: the §7.1 Claude Code template with its
+// test prompt in place of {prompt}. Any other flag is a fallback it must not try.
+const PROBE_ARGV = [
+  "-p", "Reply with the single word OK.", "--tools", "", "--disallowedTools", "*",
+  "--strict-mcp-config", "--setting-sources", "", "--permission-mode", "dontAsk",
+  "--no-session-persistence", "--output-format", "stream-json", "--verbose",
+  "--include-partial-messages",
+];
 const EXTENSION_ID_ALPHABET = "abcdefghijklmnop";
 
 function usage() {
@@ -213,6 +230,102 @@ async function allowInChrome(press, pid) {
   }), { timeout: 20_000 });
 }
 
+// Fake harnesses for AI setup. Each logs one tab-separated line per run: its
+// name, its argv as [arg][arg]..., and its environment variable names (never
+// values). Only shell builtins and /bin/cat run, so nothing depends on PATH.
+// fake-bin holds symlinks into fake-install, which the run re-points to swap
+// a passing harness for a failing one.
+function fakeHarnessScript(name, log, body) {
+  return `#!/bin/sh
+log=${shellQuote(log)}
+line=''
+for arg in "$@"; do line="$line[$arg]"; done
+names=''
+while IFS= read -r entry; do
+  case "$entry" in
+    'export '*|'declare -x '*)
+      entry=\${entry#export }; entry=\${entry#declare -x }; entry=\${entry%%=*}
+      case "$entry" in PWD|OLDPWD|SHLVL|_) ;; *) names="$names $entry" ;; esac ;;
+  esac
+done <<ENV
+$(export -p)
+ENV
+printf '%s\\t%s\\t%s\\n' ${shellQuote(name)} "$line" "$names" >> "$log"
+${body}
+`;
+}
+
+async function installFakeHarnesses(runDir) {
+  const fakeBin = path.join(runDir, "fake-bin");
+  const fakeInstall = path.join(runDir, "fake-install");
+  const argvLog = path.join(runDir, "harness-argv.log");
+  const help = path.join(fakeInstall, "claude-help.txt");
+  for (const dir of [fakeBin, fakeInstall, ...["good", "bad", "codex"].map((name) => path.join(fakeInstall, name))]) {
+    await mkdir(dir, { mode: 0o700 });
+    await chmod(dir, 0o700);
+  }
+  await writeFile(help, await readFile(CLAUDE_HELP), { mode: 0o600 });
+  const codexHelp = path.join(fakeInstall, "codex-exec-help.txt");
+  const codexFeatures = path.join(fakeInstall, "codex-features.txt");
+  await writeFile(codexHelp, await readFile(CODEX_EXEC_HELP), { mode: 0o600 });
+  await writeFile(codexFeatures, await readFile(CODEX_FEATURES), { mode: 0o600 });
+  const checks = `case "$1" in
+  --version) echo '2.1.284 (Claude Code)'; exit 0 ;;
+  --help) /bin/cat ${shellQuote(help)}; exit 0 ;;
+esac
+/bin/cat > /dev/null`;
+  const scripts = {
+    good: fakeHarnessScript("claude-good", argvLog, `${checks}
+printf '%s\\n' '{"type":"system","subtype":"init","tools":[]}' '{"type":"result","subtype":"success","is_error":false,"result":"OK"}'`),
+    bad: fakeHarnessScript("claude-bad", argvLog, `${checks}
+echo 'fake harness: simulated failure' >&2
+exit 1`),
+    // A reviewed codex-cli whose features list honors the --disable pairs it
+    // is given, and fails unless the host gave it an empty CODEX_HOME (runs
+    // ignore the user's config, so the list must too). Setup is never
+    // started for it, so any other run fails.
+    codex: fakeHarnessScript("codex", argvLog, `if [ "$1" = --version ]; then echo 'codex-cli 0.144.4'; exit 0; fi
+if [ "$1" = exec ] && [ "$2" = --help ]; then /bin/cat ${shellQuote(codexHelp)}; exit 0; fi
+if [ "$1" = features ] && [ "$2" = list ]; then
+  [ -d "$CODEX_HOME" ] && [ -z "$(/bin/ls -A "$CODEX_HOME")" ] || exit 3
+  disabled=' '; previous=''
+  for arg in "$@"; do [ "$previous" = --disable ] && disabled="$disabled$arg "; previous=$arg; done
+  while IFS= read -r feature; do
+    case "$disabled" in *" \${feature%% *} "*) feature="\${feature% true} false" ;; esac
+    printf '%s\\n' "$feature"
+  done < ${shellQuote(codexFeatures)}
+  exit 0
+fi
+exit 1`),
+  };
+  for (const [dir, text] of Object.entries(scripts)) {
+    const file = path.join(fakeInstall, dir, dir === "codex" ? "codex" : "claude");
+    await writeFile(file, text, { mode: 0o700 });
+    await chmod(file, 0o700);
+  }
+  await symlink(path.join(fakeInstall, "good", "claude"), path.join(fakeBin, "claude"));
+  await symlink(path.join(fakeInstall, "codex", "codex"), path.join(fakeBin, "codex"));
+  return { fakeBin, fakeInstall, argvLog };
+}
+
+// Re-point fake-bin/claude in one rename, so discovery never sees it missing.
+async function pointFakeClaude(fakeBin, fakeInstall, which) {
+  const staged = path.join(fakeBin, ".claude-next");
+  await unlink(staged).catch(() => undefined);
+  await symlink(path.join(fakeInstall, which, "claude"), staged);
+  await rename(staged, path.join(fakeBin, "claude"));
+}
+
+async function harnessRuns(argvLog) {
+  return (await readFile(argvLog, "utf8").catch(() => "")).split("\n").filter(Boolean).map((line) => {
+    const [program, argv, names = ""] = line.split("\t");
+    return { program, argv, env: names.split(" ").filter(Boolean).sort() };
+  });
+}
+
+const isCheckRun = (run) => ["[--version]", "[--help]", "[exec][--help]"].includes(run.argv) ||
+  run.argv.startsWith("[features][list]");
+
 // Spawn a short-lived host process for one framed request, independent of
 // whatever host process is serving the live panel or settings connection.
 // The host's config-file lock (§7) serializes these against each other.
@@ -247,7 +360,7 @@ function hostRequest(wrapper, request) {
           throw new Error("Native host returned an invalid response frame");
         }
         const reply = JSON.parse(frame.subarray(4).toString("utf8"));
-        if (reply.protocol_version !== 3) {
+        if (reply.protocol_version !== PROTOCOL_VERSION) {
           throw new Error(`Native host returned ${reply.type ?? "an unknown response"}`);
         }
         finish(null, reply);
@@ -261,7 +374,7 @@ function hostRequest(wrapper, request) {
 
 async function hostConfig(wrapper) {
   const reply = await hostRequest(wrapper, {
-    type: "get_config", protocol_version: 3, request_id: randomUUID(),
+    type: "get_config", protocol_version: PROTOCOL_VERSION, request_id: randomUUID(),
   });
   if (reply.type !== "config_result") {
     throw new Error(`Native host returned ${reply.type ?? "an unknown response"} instead of config_result`);
@@ -273,7 +386,7 @@ async function hostConfig(wrapper) {
 // panel's own next save is refused as stale (§4.4, §5.3).
 async function hostSaveNote(wrapper, url, title, body, expectedRevision) {
   const reply = await hostRequest(wrapper, {
-    type: "save_note", protocol_version: 3, request_id: randomUUID(),
+    type: "save_note", protocol_version: PROTOCOL_VERSION, request_id: randomUUID(),
     url, title, body, expected_revision: expectedRevision,
   });
   if (reply.type !== "note_saved") {
@@ -431,7 +544,7 @@ async function nativeHostPreflight(cdp, extensionId) {
         clearTimeout(timer);
         resolve({ok: false, error: chrome.runtime.lastError?.message ?? "disconnected"});
       });
-      port.postMessage({type: "hello", protocol_version: 3, request_id: "smoke-preflight"});
+      port.postMessage({type: "hello", protocol_version: ${PROTOCOL_VERSION}, request_id: "smoke-preflight"});
     })`;
     await cdp.withTarget(target.targetId, async (page) => {
       let lastError = "extension page did not load";
@@ -893,13 +1006,23 @@ async function run() {
     if (options.auto) {
       await commandOutput("/usr/bin/swiftc", ["-O", path.join(REPO, "scripts", "smoke-macos-press.swift"), "-o", press]);
     }
-    let scriptedEnv = "";
     if (options.headless) {
       await mkdir(dialogs, { mode: 0o700 });
-      scriptedEnv = `export ${SCRIPTED_DIALOGS_ENV}=${shellQuote(dialogs)}\n`;
       await commandOutput("/usr/bin/swiftc", ["-O", path.join(REPO, "scripts", "smoke-macos-windows.swift"), "-o", windowCheck]);
     }
-    await writeFile(wrapper, `#!/bin/sh\nexport HOME=${shellQuote(testHome)}\n${scriptedEnv}exec ${shellQuote(options.host)} "$@"\n`, { mode: 0o700 });
+    // PATH is pinned in every mode, so harness discovery finds only the fakes,
+    // never a real harness. Headless also clears the environment: the host
+    // sees a fake credential and one name setup must never pass on.
+    const { fakeBin, fakeInstall, argvLog } = await installFakeHarnesses(runDir);
+    const fakeInstallReal = await realpath(fakeInstall);
+    const hostPath = `${fakeBin}:/usr/bin:/bin`;
+    const secret = `smoke-secret-${caseId}`;
+    const wrapperBody = options.headless
+      ? `exec /usr/bin/env -i HOME=${shellQuote(testHome)} PATH=${shellQuote(hostPath)} ` +
+        `ANTHROPIC_API_KEY=${shellQuote(secret)} SMOKE_NOT_ALLOWED=x ` +
+        `${SCRIPTED_DIALOGS_ENV}=${shellQuote(dialogs)} ${shellQuote(options.host)} "$@"\n`
+      : `export HOME=${shellQuote(testHome)}\nexport PATH=${shellQuote(hostPath)}\nexec ${shellQuote(options.host)} "$@"\n`;
+    await writeFile(wrapper, `#!/bin/sh\n${wrapperBody}`, { mode: 0o700 });
     await chmod(wrapper, 0o700);
     const configPath = await commandOutput(wrapper, ["--config-path"]);
     const actualHome = await realpath(testHome);
@@ -932,7 +1055,7 @@ async function run() {
     const firstBody = `First note ${caseId}`;
     await writeFile(path.join(runDir, "run-info.json"), `${JSON.stringify({
       origin, allowed, blocked, afterRemoval, notes, profile, testHome, configPath,
-      manifest, host: options.host, chrome: options.chrome, siteInput,
+      manifest, host: options.host, chrome: options.chrome, siteInput, fakeBin, argvLog,
     }, null, 2)}\n`);
 
     console.log(`\nSmoke artifacts: ${runDir}`);
@@ -1172,7 +1295,7 @@ async function run() {
     let externalBody;
     await step("A refused stale save shows the current note and keeps the unsaved text", async () => {
       const loaded = await hostRequest(wrapper, {
-        type: "load_note", protocol_version: 3, request_id: randomUUID(), url: allowed,
+        type: "load_note", protocol_version: PROTOCOL_VERSION, request_id: randomUUID(), url: allowed,
       });
       requireCondition(loaded.type === "note_loaded" && loaded.exists,
         `Expected the note saved above to load; got ${loaded.type}`);
@@ -1205,12 +1328,238 @@ async function run() {
         "The recovered edit was not saved after the conflict");
     });
 
+    // AI harness setup (§7.1-§7.3) runs only the fakes under fake-install.
+    // Guided runs skip it: their dialogs would need a person for five more
+    // prompts, and the headless run already covers the host's side.
+    const probeArgv = PROBE_ARGV.map((arg) => `[${arg}]`).join("");
+    const agentRequest = (fields) => hostRequest(wrapper, {
+      protocol_version: PROTOCOL_VERSION, request_id: randomUUID(), ...fields,
+    });
+    const offerRows = () => onSettings((page) => page.evaluate(`[...document.querySelectorAll("#harness-offers li[data-adapter]")]
+      .map((row) => ({ adapter: row.dataset.adapter, ready: row.dataset.ready === "true",
+        realPath: row.dataset.realPath ?? null, text: row.textContent }))`));
+    // Never click Set up unless every offer the host found is one of the fakes.
+    async function onlyFakeHarnesses() {
+      const rows = await offerRows();
+      const stray = rows.find((row) => !row.realPath || !inside(fakeInstallReal, row.realPath));
+      if (!rows.length || stray) {
+        throw Object.assign(new Error(`A harness outside the fakes was offered: ${JSON.stringify(stray ?? rows)}`),
+          { fatal: true });
+      }
+      return rows;
+    }
+    async function detect() {
+      await inSettings(async (page) => {
+        await page.evaluate('document.getElementById("status").textContent = ""');
+        await page.click("#detect-harnesses");
+      });
+      await waitFor(async () => {
+        const status = await settingsStatus();
+        requireCondition(status?.startsWith("Found Claude Code 2.1.284"), `Settings page says: ${status}`);
+        requireCondition(await onSettings((page) => page.enabled("#setup-harness")), "Set up harness is disabled");
+      }, { timeout: 60_000 });
+      return onlyFakeHarnesses();
+    }
+    async function startSetup() {
+      await onlyFakeHarnesses();
+      await inSettings(async (page) => {
+        await page.evaluate('document.getElementById("status").textContent = ""');
+        await page.click("#setup-harness");
+      });
+    }
+    const probeRuns = async () => (await harnessRuns(argvLog)).filter((run) => !isCheckRun(run));
+    const settledStatus = (prefix) => waitFor(async () => {
+      const status = await settingsStatus();
+      requireCondition(status?.startsWith(prefix), `Settings page says: ${status}`);
+      return status;
+    }, { timeout: 60_000 });
+    function describesSetup(text, denylist) {
+      for (const expected of [`${fakeInstallReal}/`, `"${fakeBin}/claude"`, "--disallowedTools", "{prompt}",
+        "HOME", "PATH", "ANTHROPIC_API_KEY", "\"summaries\""]) {
+        requireCondition(text.includes(expected), `The setup dialog does not show ${expected}: ${JSON.stringify(text)}`);
+      }
+      requireCondition(!text.includes(secret) && !text.includes("SMOKE_NOT_ALLOWED"),
+        "The setup dialog shows an environment value or a name it must not pass");
+      requireCondition(denylist.length ? denylist.every((entry) => text.includes(JSON.stringify(entry))) &&
+        !text.includes("No domains excluded.") : text.includes("No domains excluded."),
+      `The setup dialog does not list the exclusions ${JSON.stringify(denylist)}: ${JSON.stringify(text)}`);
+    }
+
+    if (!options.headless) {
+      console.log("\nAI harness setup steps skipped: they run with --headless only.");
+    } else {
+      await step("AI commands refused until privacy list is confirmed", async () => {
+        const refused = await agentRequest({ type: "check_agent", url: null });
+        requireCondition(refused.type === "error" && refused.code === "not_configured" &&
+          refused.message.includes("settings"), `check_agent answered ${JSON.stringify(refused)}`);
+        const before = await hostConfig(wrapper);
+        const forged = { ...before.config, agent_denylist_confirmed: true };
+        for (const harnessToken of [null, randomUUID()]) {
+          const reply = await agentRequest({
+            type: "update_config", expected_revision: before.revision, config: forged,
+            picker_token: null, consent_token: null, harness_token: harnessToken,
+          });
+          requireCondition(reply.type === "error" && reply.code === "unauthorized",
+            `Confirming the privacy list without setup answered ${reply.type} ${reply.code ?? ""}`);
+        }
+        const after = await hostConfig(wrapper);
+        requireCondition(after.revision === before.revision && !after.config.agent_denylist_confirmed &&
+          after.config.agent === null && after.agent_status.state === "not_set_up",
+        `The refused updates changed the config: ${JSON.stringify(after.agent_status)}`);
+      });
+
+      await step("Detect harnesses", async () => {
+        const rows = await detect();
+        const claude = rows.find((row) => row.adapter === "claude_code");
+        const codex = rows.find((row) => row.adapter === "codex");
+        requireCondition(claude?.ready && claude.text.includes("Claude Code 2.1.284"),
+          `Claude Code offer: ${JSON.stringify(claude)}`);
+        // Codex passes its checks, and the page says it shares the user's
+        // own Codex instructions and skills (DESIGN §14).
+        requireCondition(codex?.ready && codex.text.includes("Codex 0.144.4") &&
+          codex.text.includes("instructions (AGENTS.md) and skills can shape its answers"),
+        `Codex offer: ${JSON.stringify(codex)}`);
+        const runs = await harnessRuns(argvLog);
+        requireCondition(runs.length > 0 && runs.every((run) => ["claude-good", "codex"].includes(run.program) &&
+          isCheckRun(run) && run.env.join(",") ===
+            (run.argv.startsWith("[features][list]") ? "CODEX_HOME,HOME,PATH" : "HOME,PATH")),
+        `Discovery ran: ${JSON.stringify(runs)}`);
+        const codexRuns = runs.filter((run) => run.program === "codex").map((run) => run.argv);
+        requireCondition(codexRuns.length === 3 && codexRuns[1] === "[exec][--help]" &&
+          codexRuns[2].startsWith("[features][list][--disable][shell_tool]"),
+        `Codex discovery ran: ${JSON.stringify(codexRuns)}`);
+        const env = await onSettings((page) => page.evaluate(`({
+          key: document.querySelector('#harness-env input[data-env="ANTHROPIC_API_KEY"]')?.checked ?? null,
+          text: document.body.textContent })`));
+        requireCondition(env.key === true, "ANTHROPIC_API_KEY is not offered, or not preselected though set");
+        requireCondition(!env.text.includes("SMOKE_NOT_ALLOWED") && !env.text.includes(secret),
+          "The settings page shows an environment name or value it must not");
+      });
+
+      await step("Harness setup canceled", async () => {
+        const before = await hostConfig(wrapper);
+        await startSetup();
+        describesSetup(await scriptedDialog("confirm", "canceled"), []);
+        await settledStatus("Harness setup did not finish: Canceled");
+        const after = await hostConfig(wrapper);
+        requireCondition(after.revision === before.revision && after.config.agent === null,
+          "A canceled setup changed the config");
+        requireCondition((await probeRuns()).length === 0, "A canceled setup ran the harness");
+      });
+
+      await step("Failing harness refused", async () => {
+        await pointFakeClaude(fakeBin, fakeInstall, "bad");
+        const before = await hostConfig(wrapper);
+        await detect();
+        await startSetup();
+        await scriptedDialog("confirm", "confirmed");
+        const status = await settledStatus("Harness setup did not finish");
+        requireCondition(status.includes("failed its test run"), `Settings page says: ${status}`);
+        const after = await hostConfig(wrapper);
+        requireCondition(after.revision === before.revision && !after.config.agent_denylist_confirmed &&
+          after.config.agent === null, "A failed test run changed the config");
+        const probes = await probeRuns();
+        requireCondition(probes.length === 1 && probes[0].program === "claude-bad" && probes[0].argv === probeArgv,
+          `Expected one test run with the template argv; got ${JSON.stringify(probes)}`);
+      });
+
+      await step("Harness setup confirmed", async () => {
+        await pointFakeClaude(fakeBin, fakeInstall, "good");
+        await onSettings((page) => page.fill("#denylist-input", "Bank.Example"));
+        await inSettings((page) => page.click("#denylist-add"));
+        await waitFor(async () => requireCondition(
+          await onSettings((page) => page.evaluate('!!document.querySelector(\'#denylist-list button[aria-label="Remove bank.example"]\')')),
+          "bank.example is not in the pending list"));
+        requireCondition((await hostConfig(wrapper)).config.agent_denylist.length === 0,
+          "A pending exclusion was saved before setup");
+        await detect();
+        await startSetup();
+        describesSetup(await scriptedDialog("confirm", "confirmed"), ["bank.example"]);
+        await settledStatus("Claude Code is set up.");
+        const reply = await hostConfig(wrapper);
+        requireCondition(reply.config.agent_denylist_confirmed &&
+          reply.config.agent?.binary === `${fakeBin}/claude` &&
+          reply.config.agent_denylist.join(",") === "bank.example" &&
+          reply.config.storage?.summaries_dir === "summaries",
+        `The host config after setup: ${JSON.stringify({ ...reply.config, sites: undefined })}`);
+        requireCondition(reply.agent_status.state === "ready" && reply.agent_status.harness_version === "2.1.284",
+          `Agent status: ${JSON.stringify(reply.agent_status)}`);
+        const probes = await probeRuns();
+        const good = probes.filter((run) => run.program === "claude-good");
+        requireCondition(probes.length === 2 && good.length === 1 && good[0].argv === probeArgv &&
+          good[0].env.join(",") === "ANTHROPIC_API_KEY,HOME,PATH",
+        `Expected one passing test run with the chosen env names; got ${JSON.stringify(probes)}`);
+        requireCondition(!(await readFile(configPath, "utf8")).includes(secret), "config.toml holds an environment value");
+        for (const [url, allowedUrl] of [["https://www.bank.example/x", false], ["https://example.org/", true]]) {
+          const checked = await agentRequest({ type: "check_agent", url });
+          requireCondition(checked.type === "agent_checked" && checked.url_allowed === allowedUrl,
+            `check_agent for ${url} answered ${JSON.stringify(checked)}`);
+        }
+      });
+
+      // Run while edits are live, so an auto-add would save at once (§7.3).
+      await step("Suggestion only fills the box", async () => {
+        const shownEntries = () => onSettings((page) => page.evaluate(
+          '[...document.querySelectorAll("#denylist-list button[aria-label^=\\"Remove \\"]")].map((b) => b.getAttribute("aria-label"))'));
+        const before = await hostConfig(wrapper);
+        const listBefore = await shownEntries();
+        await onSettings((page) => page.fill("#denylist-input", ""));
+        // The second suggestion (Email) is mail.example, not yet excluded.
+        await inSettings((page) => page.click("#denylist-suggestions button:nth-of-type(2)"));
+        const value = await onSettings((page) => page.evaluate('document.getElementById("denylist-input").value'));
+        requireCondition(value === "mail.example", `The suggestion filled the box with ${JSON.stringify(value)}`);
+        await delay(500);
+        const after = await hostConfig(wrapper);
+        requireCondition(after.revision === before.revision &&
+          after.config.agent_denylist.join(",") === before.config.agent_denylist.join(","),
+        `Choosing a suggestion changed the host denylist: ${JSON.stringify(after.config.agent_denylist)}`);
+        requireCondition(JSON.stringify(await shownEntries()) === JSON.stringify(listBefore),
+          `Choosing a suggestion changed the shown list: ${JSON.stringify(await shownEntries())}`);
+      });
+
+      await step("Denylist add is immediate, removal asks", async () => {
+        const hasEntry = (entry) => onSettings((page) => page.evaluate(
+          `!!document.querySelector('#denylist-list button[aria-label="Remove ${entry}"]')`));
+        const shownCount = async () => (await readFile(path.join(dialogs, "shown.jsonl"), "utf8"))
+          .split("\n").filter(Boolean).length;
+        const shownBefore = await shownCount();
+        await onSettings((page) => page.fill("#denylist-input", "mail.example"));
+        await inSettings((page) => page.click("#denylist-add"));
+        await settledStatus("AI commands now exclude mail.example");
+        requireCondition(await shownCount() === shownBefore, "Adding an exclusion opened a dialog");
+        requireCondition((await hostConfig(wrapper)).config.agent_denylist.includes("mail.example"),
+          "mail.example was not saved");
+
+        await inSettings((page) => page.click('#denylist-list button[aria-label="Remove bank.example"]'));
+        await scriptedDialog("confirm", "canceled");
+        await settledStatus("Could not change AI privacy exclusions: Canceled");
+        requireCondition(await hasEntry("bank.example") &&
+          (await hostConfig(wrapper)).config.agent_denylist.includes("bank.example"),
+        "A canceled removal still removed bank.example");
+
+        await inSettings((page) => page.click('#denylist-list button[aria-label="Remove bank.example"]'));
+        const text = await scriptedDialog("confirm", "confirmed");
+        requireCondition(text.includes('Allow AI commands to read pages on "bank.example"'),
+          `The removal dialog does not describe the change: ${JSON.stringify(text)}`);
+        await settledStatus("AI commands may now read pages on bank.example");
+        const reply = await hostConfig(wrapper);
+        requireCondition(reply.config.agent_denylist.join(",") === "mail.example" &&
+          reply.config.agent_denylist_confirmed && !(await hasEntry("bank.example")),
+        `The denylist after removal: ${JSON.stringify(reply.config.agent_denylist)}`);
+      });
+    }
+
     await step("Site removal", async () => {
       await inSettings((page) => page.click(`button[aria-label="Remove ${origin}/allowed"]`));
       await waitFor(async () => {
         const reply = await hostConfig(wrapper);
         requireCondition(!reply.config.capture_enabled && reply.config.sites.length === 0,
           "Host still has capture enabled or the site rule");
+        // A capture change echoes the harness and its confirmation unchanged.
+        if (options.headless) {
+          requireCondition(reply.config.agent !== null && reply.config.agent_denylist_confirmed,
+            "Site removal dropped the AI harness or its privacy-list confirmation");
+        }
       }, { timeout: 20_000, interval: 1_000 });
       await waitFor(async () => {
         const grants = await chromeGrants(pattern);
@@ -1222,6 +1571,22 @@ async function run() {
         requireCondition(reason === "No sites are enabled for capture.", `Setup warning says: ${reason}`);
       }), { timeout: 20_000 });
     });
+
+    if (options.headless) {
+      await step("Denylist stays live after harness removal", async () => {
+        await inSettings((page) => page.click("#remove-harness"));
+        await settledStatus("Harness removed.");
+        const removed = await hostConfig(wrapper);
+        requireCondition(removed.config.agent === null && removed.config.agent_denylist_confirmed,
+          `Removing the harness changed the confirmation: ${JSON.stringify(removed.agent_status)}`);
+        // With no harness the list still saves at once, not on the next setup.
+        await onSettings((page) => page.fill("#denylist-input", "hr.example"));
+        await inSettings((page) => page.click("#denylist-add"));
+        await settledStatus("AI commands now exclude hr.example");
+        requireCondition((await hostConfig(wrapper)).config.agent_denylist.includes("hr.example"),
+          "hr.example was not saved after the harness was removed");
+      });
+    }
 
     await step("No capture after removal", async () => {
       await closePanel();
@@ -1238,7 +1603,7 @@ async function run() {
         const pids = (await commandOutput("/usr/bin/pgrep", ["-f", `${options.host} __dialog-`]).catch(() => ""))
           .split("\n").filter(Boolean);
         requireCondition(pids.length === 0, "A dialog process is still running");
-        requireCondition(dialogsShown === 4, `Expected four scripted dialogs; answered ${dialogsShown}`);
+        requireCondition(dialogsShown === 9, `Expected nine scripted dialogs; answered ${dialogsShown}`);
         requireCondition(!(await maybeLstat(path.join(dialogs, "answer"))), "An unused scripted answer remains");
         await nothingOnScreen();
       });
@@ -1259,7 +1624,7 @@ async function run() {
       requireCondition(cursor.toLowerCase() === "no", "A busy cursor persisted after a native dialog");
     }
 
-    console.log(`\nPASS: ${options.headless ? "headless" : "guided"} macOS Chrome M1 smoke run completed.`);
+    console.log(`\nPASS: ${options.headless ? "headless" : "guided"} macOS Chrome M2 step 1 smoke run completed.`);
   } catch (error) {
     failed = true;
     console.error(`\nSmoke run stopped: ${error.message}`);

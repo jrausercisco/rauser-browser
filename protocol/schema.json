@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/rausified/rauser-browser/blob/main/protocol/schema.json",
   "title": "Brauser native messaging protocol",
-  "description": "Version 3 messages exchanged by the Chrome extension and native host. Host-owned configuration and consent tokens gate capture and writes.",
+  "description": "Version 4 messages exchanged by the Chrome extension and native host. Host-owned configuration and consent tokens gate capture and writes.",
   "oneOf": [
     {
       "$ref": "#/$defs/Request"
@@ -37,6 +37,15 @@
         },
         {
           "$ref": "#/$defs/SaveNoteRequest"
+        },
+        {
+          "$ref": "#/$defs/CheckAgentRequest"
+        },
+        {
+          "$ref": "#/$defs/DiscoverHarnessesRequest"
+        },
+        {
+          "$ref": "#/$defs/ConfirmHarnessSetupRequest"
         }
       ]
     },
@@ -70,6 +79,15 @@
           "$ref": "#/$defs/NoteConflict"
         },
         {
+          "$ref": "#/$defs/AgentChecked"
+        },
+        {
+          "$ref": "#/$defs/HarnessesDiscovered"
+        },
+        {
+          "$ref": "#/$defs/HarnessSetupConfirmed"
+        },
+        {
           "$ref": "#/$defs/ErrorResponse"
         }
       ]
@@ -88,7 +106,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -111,7 +129,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -130,7 +148,8 @@
         "expected_revision",
         "config",
         "picker_token",
-        "consent_token"
+        "consent_token",
+        "harness_token"
       ],
       "properties": {
         "type": {
@@ -138,7 +157,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -176,6 +195,18 @@
               "type": "null"
             }
           ]
+        },
+        "harness_token": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -196,7 +227,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -230,7 +261,8 @@
         "request_id",
         "revision",
         "config",
-        "config_issue"
+        "config_issue",
+        "agent_status"
       ],
       "properties": {
         "type": {
@@ -238,7 +270,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -262,6 +294,9 @@
               "type": "null"
             }
           ]
+        },
+        "agent_status": {
+          "$ref": "#/$defs/AgentStatus"
         }
       }
     },
@@ -281,7 +316,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -315,7 +350,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -351,7 +386,11 @@
         "capture_enabled",
         "sites",
         "strip_params",
-        "near_repeat_secs"
+        "near_repeat_secs",
+        "agent_denylist",
+        "agent_denylist_confirmed",
+        "log_incognito",
+        "agent"
       ],
       "properties": {
         "storage": {
@@ -387,6 +426,33 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 86400
+        },
+        "agent_denylist": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          }
+        },
+        "agent_denylist_confirmed": {
+          "type": "boolean",
+          "description": "Set only by the host through native harness setup; update_config accepts it unchanged."
+        },
+        "log_incognito": {
+          "type": "boolean",
+          "const": false
+        },
+        "agent": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AgentConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -398,7 +464,8 @@
         "profile",
         "log_dir",
         "pages_dir",
-        "later_dir"
+        "later_dir",
+        "summaries_dir"
       ],
       "properties": {
         "root": {
@@ -420,8 +487,122 @@
         "later_dir": {
           "type": "string",
           "minLength": 1
+        },
+        "summaries_dir": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
+    },
+    "AgentConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A confirmed harness entry. Only native harness setup can create or change it.",
+      "required": [
+        "harness_id",
+        "adapter",
+        "binary",
+        "args",
+        "env_allow",
+        "timeout_secs"
+      ],
+      "properties": {
+        "harness_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "adapter": {
+          "$ref": "#/$defs/HarnessAdapter"
+        },
+        "binary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "args": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "env_allow": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600
+        }
+      }
+    },
+    "HarnessAdapter": {
+      "type": "string",
+      "enum": [
+        "claude_code",
+        "codex"
+      ]
+    },
+    "AgentStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Host-derived AI readiness. Reported in config_result only; never accepted from the extension.",
+      "required": [
+        "state",
+        "harness_version",
+        "message"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/AgentState"
+        },
+        "harness_version": {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AgentState": {
+      "type": "string",
+      "enum": [
+        "not_set_up",
+        "denylist_unconfirmed",
+        "harness_problem",
+        "ready"
+      ]
     },
     "ChooseFolderRequest": {
       "type": "object",
@@ -437,7 +618,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -463,7 +644,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -507,7 +688,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -534,7 +715,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -566,7 +747,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -592,6 +773,43 @@
         }
       }
     },
+    "CheckAgentRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ask whether AI commands may run, and optionally whether a page URL passes the agent denylist.",
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "url"
+      ],
+      "properties": {
+        "type": {
+          "const": "check_agent"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 4
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "url": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "FolderChosen": {
       "type": "object",
       "additionalProperties": false,
@@ -608,7 +826,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -642,7 +860,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -677,7 +895,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -732,7 +950,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -774,7 +992,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -813,7 +1031,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 3
+          "const": 4
         },
         "request_id": {
           "type": "string",
@@ -835,6 +1053,51 @@
         "body": {
           "type": "string",
           "maxLength": 98304
+        }
+      }
+    },
+    "AgentChecked": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "harness_id",
+        "harness_version",
+        "url_allowed"
+      ],
+      "properties": {
+        "type": {
+          "const": "agent_checked"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 4
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "harness_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "harness_version": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "url_allowed": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -917,6 +1180,294 @@
         "created_with_warning",
         "replaced_with_warning"
       ]
+    },
+    "DiscoverHarnessesRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ask the host to look for supported AI harnesses on its own search path. The extension never supplies a binary path.",
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "expected_revision"
+      ],
+      "properties": {
+        "type": {
+          "const": "discover_harnesses"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 4
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expected_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "ConfirmHarnessSetupRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ask the host to show its own confirmation dialog for one discovered harness offer, then run one test prompt.",
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "expected_revision",
+        "offer_id",
+        "env_names",
+        "agent_denylist",
+        "summaries_dir"
+      ],
+      "properties": {
+        "type": {
+          "const": "confirm_harness_setup"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 4
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expected_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "offer_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "env_names": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "agent_denylist": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          }
+        },
+        "summaries_dir": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "HarnessesDiscovered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "offers"
+      ],
+      "properties": {
+        "type": {
+          "const": "harnesses_discovered"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 4
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "offers": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/HarnessOffer"
+          }
+        }
+      }
+    },
+    "HarnessSetupConfirmed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "harness_token",
+        "config",
+        "summary"
+      ],
+      "properties": {
+        "type": {
+          "const": "harness_setup_confirmed"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 4
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "harness_token": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "config": {
+          "$ref": "#/$defs/ConfigSnapshot"
+        },
+        "summary": {
+          "type": "string"
+        }
+      }
+    },
+    "HarnessOffer": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One harness the host found. offer_id is null exactly when refusal explains why it cannot be set up. Help and command output are never included.",
+      "required": [
+        "offer_id",
+        "adapter",
+        "harness_id",
+        "binary",
+        "real_path",
+        "version",
+        "args",
+        "env_required",
+        "env_optional",
+        "refusal"
+      ],
+      "properties": {
+        "offer_id": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "adapter": {
+          "$ref": "#/$defs/HarnessAdapter"
+        },
+        "harness_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "binary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "real_path": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "args": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "env_required": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "env_optional": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/EnvName"
+          }
+        },
+        "refusal": {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 512
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "EnvName": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "An environment variable name the harness may need. Values are never sent.",
+      "required": [
+        "name",
+        "present"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "present": {
+          "type": "boolean"
+        }
+      }
     }
   }
 }
