@@ -56,7 +56,7 @@ Captured notes, browse logs, and read-later items are plain Markdown in a folder
 
 ### 3.2 Native host
 
-- One Rust host binary per supported OS and CPU architecture, with `#![forbid(unsafe_code)]` in all first-party crates.
+- One Rust host binary per supported OS and CPU architecture, with `#![forbid(unsafe_code)]` in all first-party crates except `macos-alert`, a small macOS-only wrapper around `CFUserNotification` that lets the Yes/No confirmation time out and be canceled.
 - The only component with filesystem and process privileges.
 - Treats every inbound message as untrusted, because a compromised page or extension context could influence it.
 - Registered through a native messaging manifest whose `allowed_origins` lists only the official extension IDs.

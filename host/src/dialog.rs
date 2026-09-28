@@ -15,16 +15,24 @@
 //! dialog, as soon as that pipe closes, which happens however the parent
 //! ends, including when Chrome kills it on disconnect. The parent also kills
 //! a child still open at `DIALOG_TIMEOUT`.
+//!
+//! On macOS the confirmation is drawn by the system UserNotificationCenter,
+//! not by the child, so killing the child would leave it on screen. The child
+//! gives it a timeout shorter than `DIALOG_TIMEOUT` and cancels it before
+//! exiting, and the parent closes the child's stdin and waits briefly before
+//! it resorts to a kill.
 
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use crate::brand::APP_NAME;
 use anyhow::{Context, Result, bail};
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use rfd::FileDialog;
+#[cfg(not(target_os = "macos"))]
+use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 /// Internal subcommand names. They are not a supported CLI surface.
 pub const PICK_FOLDER_COMMAND: &str = "__dialog-pick-folder";
@@ -34,6 +42,13 @@ pub const CONFIRM_COMMAND: &str = "__dialog-confirm";
 /// dialog reply, so the host closes the dialog and answers first; an answer
 /// the extension has stopped waiting for would authorize nothing.
 const DIALOG_TIMEOUT: Duration = Duration::from_secs(270);
+/// How long a dialog the child shows itself may stay open. Shorter than
+/// `DIALOG_TIMEOUT`, so the dialog closes before the parent gives up.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const CHILD_DIALOG_TIMEOUT: Duration = Duration::from_secs(260);
+/// How long the parent waits, after closing a child's stdin, for the child to
+/// close its dialog and exit before killing it.
+const CHILD_EXIT_GRACE: Duration = Duration::from_secs(2);
 const MAX_CHILD_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_LENGTH_LINE_BYTES: u64 = 16;
 const MAX_CHILD_OUTPUT_BYTES: u64 = 64 * 1024;
@@ -85,14 +100,12 @@ pub fn run_child_command(command: &str) -> Result<()> {
         },
         CONFIRM_COMMAND => {
             let (title, description) = input.split_once('\n').unwrap_or((input.as_str(), ""));
-            let accepted = MessageDialog::new()
-                .set_title(title)
-                .set_description(description)
-                .set_level(MessageLevel::Warning)
-                .set_buttons(MessageButtons::YesNo)
-                .show()
-                == MessageDialogResult::Yes;
-            if accepted { CONFIRMED } else { CANCELED }.to_owned()
+            if confirm_in_child(title, description)? {
+                CONFIRMED
+            } else {
+                CANCELED
+            }
+            .to_owned()
         }
         other => bail!("unknown dialog command: {other}"),
     };
@@ -123,6 +136,19 @@ fn read_request(input: &mut impl BufRead) -> Result<String> {
     String::from_utf8(text).context("dialog request is not UTF-8")
 }
 
+/// A dialog drawn outside this process, which exiting would not close.
+/// Guarded with whether the parent has gone, so such a dialog is either never
+/// shown or is canceled before this process exits.
+struct ExternalDialog {
+    parent_gone: bool,
+    cancel: Option<Box<dyn FnOnce() + Send>>,
+}
+
+static EXTERNAL_DIALOG: Mutex<ExternalDialog> = Mutex::new(ExternalDialog {
+    parent_gone: false,
+    cancel: None,
+});
+
 /// End this process, and with it the dialog, once the parent's end of stdin
 /// closes. The parent sends nothing more after the request, so any read that
 /// returns means the parent is gone or has given up on the dialog.
@@ -138,12 +164,67 @@ fn exit_when_parent_goes_away() {
                 Err(_) => break,
             }
         }
+        // Held until exit, so no external dialog can open after this point.
+        let mut external = EXTERNAL_DIALOG
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        external.parent_gone = true;
+        if let Some(cancel) = external.cancel.take() {
+            cancel();
+        }
         eprintln!(
             "{}: dialog closed because its request ended",
             crate::brand::NAMESPACE
         );
         std::process::exit(1);
     });
+}
+
+/// Show the Yes/No confirmation. On macOS the system draws it, so it is shown
+/// as an alert that can time out and be canceled.
+#[cfg(target_os = "macos")]
+fn confirm_in_child(title: &str, description: &str) -> Result<bool> {
+    use brauser_macos_alert::{Alert, AlertText};
+    use std::sync::Arc;
+
+    let alert = {
+        let mut external = EXTERNAL_DIALOG
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if external.parent_gone {
+            bail!("the dialog request ended before the dialog opened");
+        }
+        let text = AlertText {
+            title,
+            message: description,
+            yes: "Yes",
+            no: "No",
+        };
+        let alert =
+            Arc::new(Alert::show(text, CHILD_DIALOG_TIMEOUT).map_err(|code| {
+                anyhow::anyhow!("showing the macOS confirmation failed ({code})")
+            })?);
+        let shared = Arc::clone(&alert);
+        external.cancel = Some(Box::new(move || shared.cancel()));
+        alert
+    };
+    let accepted = alert.wait();
+    EXTERNAL_DIALOG
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .cancel = None;
+    Ok(accepted)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn confirm_in_child(title: &str, description: &str) -> Result<bool> {
+    Ok(MessageDialog::new()
+        .set_title(title)
+        .set_description(description)
+        .set_level(MessageLevel::Warning)
+        .set_buttons(MessageButtons::YesNo)
+        .show()
+        == MessageDialogResult::Yes)
 }
 
 fn write_reply(reply: &str) -> Result<()> {
@@ -177,7 +258,13 @@ fn run_dialog_process(mut command: Command, input: &str, timeout: Duration) -> R
     let result = wait_for_reply(&mut child, input, timeout);
     if result.is_err() {
         // A child that failed or ran out of time may still be showing its
-        // dialog. Killing a child that already exited is harmless.
+        // dialog. Its stdin is closed now, so give it a moment to close the
+        // dialog itself, which a kill cannot do for one drawn elsewhere.
+        // Killing a child that already exited is harmless.
+        let deadline = Instant::now() + CHILD_EXIT_GRACE;
+        while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -424,6 +511,26 @@ mod tests {
             .status()
             .unwrap();
         assert!(!alive.success(), "the timed-out dialog is still running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_dialog_may_close_itself_before_it_is_killed() {
+        // Like the macOS confirmation child, this one closes its dialog when
+        // its stdin ends, which a kill would not give it the chance to do.
+        let directory = tempfile::tempdir().unwrap();
+        let closed = directory.path().join("closed");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(r#"head -c 7 >/dev/null; cat >/dev/null; echo closed > "$0""#)
+            .arg(&closed);
+        let error = run_dialog_process(command, "Title", Duration::from_millis(300)).unwrap_err();
+        assert!(format!("{error:#}").contains("not answered in time"));
+        assert!(
+            closed.exists(),
+            "the child was killed before it could close its dialog"
+        );
     }
 
     #[cfg(unix)]

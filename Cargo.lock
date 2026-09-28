@@ -43,6 +43,7 @@ name = "brauser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "brauser-macos-alert",
  "brauser-protocol",
  "cap-std",
  "directories",
@@ -57,6 +58,13 @@ dependencies = [
  "url",
  "uuid",
  "winapi-util",
+]
+
+[[package]]
+name = "brauser-macos-alert"
+version = "0.1.0"
+dependencies = [
+ "objc2-core-foundation",
 ]
 
 [[package]]
