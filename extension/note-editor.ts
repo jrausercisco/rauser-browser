@@ -7,7 +7,7 @@
 // switch whose token is no longer current does nothing further, so only the
 // latest active tab's note is loaded into the editor.
 
-/** Matches MAX_TITLE_BYTES in host/src/note.rs and the save_note schema. */
+/** Matches MAX_TITLE_BYTES in host/src/note.rs, which clamps longer titles. */
 export const MAX_NOTE_TITLE_BYTES = 2_048;
 
 /** Cuts `text` to at most `maxBytes` of UTF-8 without splitting a character. */
