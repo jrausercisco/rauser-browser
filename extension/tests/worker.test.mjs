@@ -15,7 +15,35 @@ let permissionChecks = 0;
 let tabReads = 0;
 let onMessage;
 let onCommitted;
+let onHistoryStateUpdated;
 let onTabUpdated;
+// Every native port the code under test opened, newest last.
+const ports = [];
+
+function fakePort() {
+  const messageListeners = [];
+  const disconnectListeners = [];
+  const port = {
+    sent: [],
+    closed: false,
+    postMessage(message) {
+      if (port.closed) throw new Error("Attempting to use a disconnected port object");
+      port.sent.push(message);
+    },
+    disconnect() { port.closed = true; },
+    onMessage: { addListener(listener) { messageListeners.push(listener); } },
+    onDisconnect: { addListener(listener) { disconnectListeners.push(listener); } },
+    // Deliver a host frame, as Chrome would.
+    reply(message) { for (const listener of messageListeners) listener(message); },
+    // The host process exited.
+    drop() {
+      port.closed = true;
+      for (const listener of disconnectListeners) listener();
+    },
+  };
+  ports.push(port);
+  return port;
+}
 
 globalThis.chrome = {
   runtime: {
@@ -23,6 +51,7 @@ globalThis.chrome = {
     getURL: (path) => `chrome-extension://test-extension/${path}`,
     onMessage: { addListener(listener) { onMessage = listener; } },
     onInstalled: { addListener() {} },
+    connectNative: () => fakePort(),
   },
   commands: { onCommand: { addListener() {} } },
   contextMenus: {
@@ -66,12 +95,14 @@ globalThis.chrome = {
   },
   webNavigation: {
     onCommitted: { addListener(listener) { onCommitted = listener; } },
-    onHistoryStateUpdated: { addListener() {} },
+    onHistoryStateUpdated: { addListener(listener) { onHistoryStateUpdated = listener; } },
   },
   sidePanel: { async setPanelBehavior() {} },
 };
 
 await import("../dist/worker.js");
+const { HostClient, HostError, PROTOCOL_VERSION } = await import("../dist/native.js");
+const { ConfigSession } = await import("../dist/settings.js");
 
 function send(message) {
   return new Promise((resolve, reject) => {
@@ -454,4 +485,73 @@ test("worker accepts messages only from the side panel and settings page", async
     assert.equal(accepted, false, JSON.stringify(sender));
     assert.equal(responded, false, JSON.stringify(sender));
   }
+});
+
+test("an SPA route change waits for its new title before the panel can send it", async () => {
+  values.clear();
+  grants.clear();
+  tabs.clear();
+  const origin = "https://spa.example";
+  grants.set("https://spa.example:443/*", true);
+  values.set(storageKey("policy_v1"), lease(origin));
+  // pushState has run, but the app has not set the new route's title yet.
+  tabs.set(9, { id: 9, url: `${origin}/b`, title: "Route A", incognito: false });
+
+  onHistoryStateUpdated({
+    tabId: 9, frameId: 0, documentId: "doc-spa", documentLifecycle: "active",
+    url: `${origin}/b`, timeStamp: Date.now(),
+  });
+  await flush();
+  const [queued] = values.get(storageKey("queue_v1")).items;
+  assert.equal(queued.event.title, "Route A");
+  assert.ok(queued.retry_after > Date.now(), "a history update waits for its title");
+  assert.deepEqual(await send({ kind: "get_pending" }), []);
+
+  onTabUpdated(9, { title: "Route B" }, { id: 9, url: `${origin}/b`, incognito: false });
+  await flush();
+  assert.equal(values.get(storageKey("queue_v1")).items[0].event.title, "Route B");
+});
+
+test("a retry notice clears once nothing is left to retry, and on dismissal", async () => {
+  values.clear();
+  grants.clear();
+  const origin = "https://retry.example";
+  grants.set("https://retry.example:443/*", true);
+  const setUp = (ids) => {
+    values.set(storageKey("policy_v1"), lease(origin));
+    values.set(storageKey("queue_v1"), {
+      version: 1,
+      items: ids.map((id) => visit(id, `${origin}/${id}`)),
+      overflow_count: 0,
+      rejected_count: 0,
+      last_error: null,
+    });
+  };
+  const retry = (id) => send({ kind: "ack_visit", event_id: id, outcome: "retryable", reason: "Host busy" });
+
+  setUp(["one"]);
+  assert.equal((await retry("one")).retry_error, "Host busy");
+  const rejected = await send({ kind: "ack_visit", event_id: "one", outcome: "rejected", reason: "No" });
+  assert.equal(rejected.queued, 0);
+  assert.equal(rejected.retry_error, null);
+
+  setUp(["two"]);
+  await retry("two");
+  assert.equal((await send({ kind: "discard_pending", event_ids: ["two"] })).retry_error, null);
+
+  setUp(["three"]);
+  await retry("three");
+  assert.equal((await send({ kind: "remove_site", site: { origin, path_prefix: "/" } })).retry_error, null);
+
+  values.delete(storageKey("locally_removed_sites_v1"));
+  setUp(["four"]);
+  await retry("four");
+  assert.equal((await send({ kind: "pause_capture" })).retry_error, null);
+  values.delete(storageKey("pause_pending_v1"));
+
+  setUp(["five"]);
+  await retry("five");
+  const dismissed = await send({ kind: "clear_notices" });
+  assert.equal(dismissed.queued, 1);
+  assert.equal(dismissed.retry_error, null);
 });
