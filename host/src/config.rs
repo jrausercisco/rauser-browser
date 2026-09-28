@@ -316,7 +316,7 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
     }
     let mut file = file.take(MAX_HASHED_CONFIG_BYTES);
     let mut contents = Vec::new();
-    let mut hasher = Sha256::new();
+    let mut hasher = RevisionHasher::new();
     let mut bytes_read = 0u64;
     let mut chunk = [0u8; 8192];
     loop {
@@ -333,10 +333,7 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
             .min(count);
         contents.extend_from_slice(&chunk[..keep]);
     }
-    if bytes_read == MAX_HASHED_CONFIG_BYTES {
-        hasher.update(metadata.len().to_le_bytes());
-    }
-    let revision = format!("sha256:{}", hex::encode(hasher.finalize()));
+    let revision = hasher.finish(metadata.len());
     if bytes_read > MAX_CONFIG_BYTES as u64 {
         return Ok(DiskState {
             config: empty_config(),
@@ -405,7 +402,10 @@ fn backup_invalid(parent: &Path, source_path: &Path, expected_revision: &str) ->
     let result = (|| -> Result<()> {
         let mut source = File::open(source_path)
             .with_context(|| format!("opening invalid config at {}", source_path.display()))?;
-        let mut hasher = Sha256::new();
+        // Copy every byte, but compute the revision exactly as
+        // read_disk_state does, or a file past the hash cap never matches.
+        let mut hasher = RevisionHasher::new();
+        let mut copied = 0u64;
         let mut chunk = [0u8; 8192];
         loop {
             let count = source.read(&mut chunk)?;
@@ -413,9 +413,10 @@ fn backup_invalid(parent: &Path, source_path: &Path, expected_revision: &str) ->
                 break;
             }
             hasher.update(&chunk[..count]);
+            copied += count as u64;
             file.write_all(&chunk[..count])?;
         }
-        if format!("sha256:{}", hex::encode(hasher.finalize())) != expected_revision {
+        if hasher.finish(copied) != expected_revision {
             bail!("configuration changed while it was being backed up");
         }
         file.sync_all()?;
@@ -429,7 +430,39 @@ fn backup_invalid(parent: &Path, source_path: &Path, expected_revision: &str) ->
 }
 
 fn revision_for(contents: &[u8]) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(contents)))
+    let mut hasher = RevisionHasher::new();
+    hasher.update(contents);
+    hasher.finish(contents.len() as u64)
+}
+
+/// The one definition of a config revision: the SHA-256 of at most
+/// `MAX_HASHED_CONFIG_BYTES`, plus the file length when that cap is reached.
+struct RevisionHasher {
+    hasher: Sha256,
+    hashed: u64,
+}
+
+impl RevisionHasher {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            hashed: 0,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        let room = MAX_HASHED_CONFIG_BYTES - self.hashed;
+        let take = (bytes.len() as u64).min(room) as usize;
+        self.hasher.update(&bytes[..take]);
+        self.hashed += take as u64;
+    }
+
+    fn finish(mut self, total_len: u64) -> String {
+        if self.hashed == MAX_HASHED_CONFIG_BYTES {
+            self.hasher.update(total_len.to_le_bytes());
+        }
+        format!("sha256:{}", hex::encode(self.hasher.finalize()))
+    }
 }
 
 fn create_temporary(path: &Path) -> Result<(File, TempFileCleanup<'_>)> {
@@ -894,6 +927,37 @@ mod tests {
         assert!(store.configured());
         assert_eq!(fs::read(&path).unwrap(), saved);
         assert_eq!(backup_count(base.path()), 0);
+    }
+
+    #[test]
+    fn oversized_config_past_the_hash_cap_can_be_repaired() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.toml");
+        let oversized = vec![b'#'; MAX_HASHED_CONFIG_BYTES as usize + 10];
+        fs::write(&path, &oversized).unwrap();
+        let mut store = ConfigStore::for_test(path.clone());
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_some());
+        let revision = store.revision().to_owned();
+        store
+            .update(empty_config(), &revision)
+            .unwrap()
+            .expect("repair should commit");
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
+        assert_eq!(backup_count(folder.path()), 1);
+        let backup = fs::read_dir(folder.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("config-invalid-")
+            })
+            .unwrap();
+        assert_eq!(fs::read(backup).unwrap(), oversized);
     }
 
     fn backup_count(dir: &Path) -> usize {
