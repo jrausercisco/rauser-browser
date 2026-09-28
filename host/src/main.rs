@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Result, bail};
-use rauser_host::{config::ConfigStore, dialog, native};
+use brauser_host::{brand::NAMESPACE, config::ConfigStore, dialog, native};
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("rauser: {error:#}");
+        eprintln!("{NAMESPACE}: {error:#}");
         std::process::exit(1);
     }
 }
@@ -15,7 +15,7 @@ fn run() -> Result<()> {
     match args.next().as_deref() {
         None | Some("serve") => native::serve(ConfigStore::load()?),
         Some("--version") => {
-            println!("rauser {}", env!("CARGO_PKG_VERSION"));
+            println!("{NAMESPACE} {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("--config-path") => {

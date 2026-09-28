@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use brauser_protocol::{SiteConfig, StorageConfig, VisitEvent};
 use cap_std::fs::{Dir, OpenOptions};
 use directories::ProjectDirs;
-use rauser_protocol::{SiteConfig, StorageConfig, VisitEvent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -20,12 +20,13 @@ use time::format_description::well_known::Rfc3339;
 use url::Url;
 use uuid::Uuid;
 
+use crate::brand::{APP_NAME, NAMESPACE};
 use crate::vault::{
     TempFileCleanup, checked_relative_dir, open_selected_root, sync_directory, sync_directory_chain,
 };
 
-const LOG_HEADER: &str = "<!-- rauser:daily-log v1 -->";
-const MARKER_PREFIX: &str = "<!-- rauser:visit id=";
+const LOG_HEADER: &str = concat!("<!-- ", crate::namespace!(), ":daily-log v1 -->");
+const MARKER_PREFIX: &str = concat!("<!-- ", crate::namespace!(), ":visit id=");
 const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_URL_BYTES: usize = 8192;
 const MAX_TITLE_BYTES: usize = 2048;
@@ -80,7 +81,7 @@ impl CaptureStore {
     }
 
     pub fn open_checked(storage: &StorageConfig, expected_identity: Option<&str>) -> Result<Self> {
-        let project = ProjectDirs::from("", "", "Rauser")
+        let project = ProjectDirs::from("", "", APP_NAME)
             .context("cannot locate this user's application config directory")?;
         Self::open_at(storage, expected_identity, project.config_dir())
     }
@@ -376,7 +377,7 @@ impl CaptureStore {
             filename.to_str().context("log filename is not UTF-8")?,
             metadata.len(),
         )? {
-            bail!("original daily log is not owned by Rauser");
+            bail!("original daily log is not owned by {APP_NAME}");
         }
         let mut file = day_dir
             .open_with(filename, OpenOptions::new().read(true).append(true))
@@ -697,7 +698,7 @@ fn publish_intent(path: &Path, intent: &VisitIntent) -> Result<()> {
     )?;
     sync_state_directory(journal_dir)?;
     sync_state_directory(parent)?;
-    let temporary = parent.join(format!(".rauser-intent-{}.tmp", Uuid::new_v4()));
+    let temporary = parent.join(format!(".{NAMESPACE}-intent-{}.tmp", Uuid::new_v4()));
     let mut options = StdOpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -717,7 +718,7 @@ fn publish_intent(path: &Path, intent: &VisitIntent) -> Result<()> {
         Ok(())
     })();
     if let Err(error) = fs::remove_file(&temporary) {
-        eprintln!("rauser: warning: could not remove visit intent temporary file: {error}");
+        eprintln!("{NAMESPACE}: warning: could not remove visit intent temporary file: {error}");
     }
     result
 }
@@ -747,7 +748,7 @@ fn ensure_daily_log(dir: &Dir, name: &str) -> Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("checking daily log"),
     }
-    let temporary = format!(".rauser-log-{}.tmp", Uuid::new_v4());
+    let temporary = format!(".{NAMESPACE}-log-{}.tmp", Uuid::new_v4());
     let mut file = dir
         .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
         .context("creating daily log temporary file")?;
@@ -768,7 +769,7 @@ fn ensure_daily_log(dir: &Dir, name: &str) -> Result<bool> {
     }
     cleanup.disarm();
     if let Err(error) = dir.remove_file(&temporary) {
-        eprintln!("rauser: warning: could not remove daily log temporary file: {error}");
+        eprintln!("{NAMESPACE}: warning: could not remove daily log temporary file: {error}");
     }
     sync_directory(dir).context("syncing new daily log directory")?;
     Ok(true)
@@ -785,7 +786,7 @@ fn existing_log_is_owned(dir: &Dir, name: &str, length: u64) -> Result<bool> {
 }
 
 /// Truncate a failed append back to `offset`, but only if everything after
-/// `offset` is a prefix of `entry`. The capture lock excludes other Rauser
+/// `offset` is a prefix of `entry`. The capture lock excludes other host
 /// writers; an unexpected tail is left for manual repair instead.
 ///
 /// This opens its own read-write handle: Windows refuses to truncate through
@@ -813,12 +814,14 @@ fn roll_back_append(dir: &Dir, name: &Path, offset: u64, entry: &[u8]) {
     })();
     match result {
         Ok(true) => {}
-        Ok(false) => eprintln!("rauser: warning: daily log changed during a failed append"),
-        Err(error) => eprintln!("rauser: warning: could not roll back a failed append: {error}"),
+        Ok(false) => eprintln!("{NAMESPACE}: warning: daily log changed during a failed append"),
+        Err(error) => {
+            eprintln!("{NAMESPACE}: warning: could not roll back a failed append: {error}")
+        }
     }
 }
 
-/// Length of the leading run of complete Rauser visit entries in `region`.
+/// Length of the leading run of complete owned visit entries in `region`.
 fn complete_entries_len(region: &[u8]) -> usize {
     let mut consumed = 0;
     while let Some(length) = complete_entry_len(&region[consumed..]) {
@@ -850,7 +853,7 @@ fn scan_log(
 ) -> Result<ScanResult> {
     let mut lines = BufReader::new(file).lines();
     if lines.next().transpose()?.as_deref() != Some(LOG_HEADER) {
-        bail!("daily log exists without Rauser ownership marker");
+        bail!("daily log exists without {APP_NAME} ownership marker");
     }
     let mut result = ScanResult {
         duplicate: false,

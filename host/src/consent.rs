@@ -8,9 +8,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use rauser_protocol::{ConfigSnapshot, SiteConfig};
+use brauser_protocol::{ConfigSnapshot, SiteConfig};
 use uuid::Uuid;
 
+use crate::brand::APP_NAME;
 use crate::config;
 use crate::dialog::{self, DialogText};
 use crate::vault::selected_root_identity;
@@ -57,7 +58,8 @@ impl ConsentAuthority {
     /// Blocks this connection until the user closes the picker, which runs
     /// in a child process (see `dialog`).
     pub fn choose_folder(&mut self, revision: &str) -> Result<Option<FolderSelection>> {
-        let Some(selected) = dialog::pick_folder("Choose Rauser notes folder")? else {
+        let Some(selected) = dialog::pick_folder(&format!("Choose {APP_NAME} notes folder"))?
+        else {
             return Ok(None);
         };
         let canonical = fs::canonicalize(&selected)
@@ -99,9 +101,9 @@ impl ConsentAuthority {
         }
         if !changes.is_empty() {
             let description =
-                format!("Rauser will make these changes:\n\n{summary}\n\nAllow these changes?");
+                format!("{APP_NAME} will make these changes:\n\n{summary}\n\nAllow these changes?");
             if !dialog::confirm(DialogText {
-                title: "Confirm Rauser settings",
+                title: &format!("Confirm {APP_NAME} settings"),
                 description: &description,
             })? {
                 return Ok(None);
@@ -331,7 +333,7 @@ fn site_covers(prior: &SiteConfig, next: &SiteConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rauser_protocol::StorageConfig;
+    use brauser_protocol::StorageConfig;
 
     #[test]
     fn fresh_picker_token_can_reconfirm_the_same_path() {

@@ -6,13 +6,14 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use brauser_protocol::{ConfigSnapshot, SiteConfig, StorageConfig};
 use directories::ProjectDirs;
-use rauser_protocol::{ConfigSnapshot, SiteConfig, StorageConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
+use crate::brand::{APP_NAME, NAMESPACE};
 use crate::vault::{Vault, selected_root_identity};
 
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
@@ -53,7 +54,7 @@ struct DiskState {
 
 impl ConfigStore {
     pub fn default_path() -> Result<PathBuf> {
-        let dirs = ProjectDirs::from("", "", "Rauser")
+        let dirs = ProjectDirs::from("", "", APP_NAME)
             .context("cannot locate this user's application config directory")?;
         Ok(dirs.config_dir().join("config.toml"))
     }
@@ -217,7 +218,9 @@ impl ConfigStore {
         self.issue = None;
         self.root_identity = next_identity;
         if let Err(error) = sync_parent(parent) {
-            eprintln!("rauser: warning: config was saved but directory sync failed: {error:#}");
+            eprintln!(
+                "{NAMESPACE}: warning: config was saved but directory sync failed: {error:#}"
+            );
         }
         Ok(Some(revision))
     }

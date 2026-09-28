@@ -15,17 +15,18 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { APP_NAME, BINARY_NAME, NATIVE_HOST_NAME } from "../extension/brand.ts";
 
 const REPO = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DIST = path.join(REPO, "extension", "dist");
-const DEFAULT_HOST = path.join(REPO, "target", "debug", "rauser");
+const DEFAULT_HOST = path.join(REPO, "target", "debug", BINARY_NAME);
 const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const DEV_DESCRIPTION = "Rauser development native host";
+const DEV_DESCRIPTION = `${APP_NAME} development native host`;
 const EXTENSION_ID = /^[a-p]{32}$/;
 const EXTENSION_ID_ALPHABET = "abcdefghijklmnop";
 
 function usage() {
-  console.log("Usage: node scripts/smoke-macos.mjs [--host /absolute/path/to/rauser] [--chrome /absolute/path/to/Google Chrome]");
+  console.log(`Usage: node scripts/smoke-macos.mjs [--host /absolute/path/to/${BINARY_NAME}] [--chrome /absolute/path/to/Google Chrome]`);
 }
 
 function argumentsForRun(args) {
@@ -286,7 +287,7 @@ async function nativeHostPreflight(cdp, extensionId) {
   });
   try {
     const expression = `new Promise(resolve => {
-      const port = chrome.runtime.connectNative("com.rauser.browser");
+      const port = chrome.runtime.connectNative("${NATIVE_HOST_NAME}");
       const timer = setTimeout(() => resolve({ok: false, error: "native host timed out"}), 5000);
       port.onMessage.addListener(message => {
         clearTimeout(timer);
@@ -337,7 +338,7 @@ function fixtureServer(caseId) {
       response.end("Not found");
       return;
     }
-    const title = pathname === "/" ? "Rauser smoke fixture" : `Rauser smoke ${pathname}`;
+    const title = pathname === "/" ? `${APP_NAME} smoke fixture` : `${APP_NAME} smoke ${pathname}`;
     response.end(`<!doctype html><html><head><title>${title}</title></head><body><h1>${title}</h1><p>Run ${caseId}</p><ul><li><a href="/allowed/page?case=${caseId}">Allowed page</a></li><li><a href="/blocked/page?case=${caseId}">Blocked page</a></li><li><a href="/allowed/after-removal?case=${caseId}">After removal</a></li></ul></body></html>`);
   });
   return server;
@@ -440,19 +441,19 @@ async function run() {
   if (!options) return;
   if (process.platform !== "darwin") throw new Error("This smoke runner supports macOS only");
   await access(options.host, constants.X_OK).catch(() => {
-    throw new Error(`Build the native host first: cargo build --locked -p rauser (${options.host} is unavailable)`);
+    throw new Error(`Build the native host first: cargo build --locked -p ${BINARY_NAME} (${options.host} is unavailable)`);
   });
   await access(options.chrome, constants.X_OK);
   await access(path.join(DIST, "manifest.json"), constants.R_OK).catch(() => {
     throw new Error(`Build the extension first: npm run build:extension (${DIST} is unavailable)`);
   });
 
-  const runDir = await mkdtemp(path.join(os.tmpdir(), "rauser-smoke-macos-"));
+  const runDir = await mkdtemp(path.join(os.tmpdir(), `${BINARY_NAME}-smoke-macos-`));
   const testHome = path.join(runDir, "home");
   const profile = path.join(runDir, "chrome-profile");
   const notes = path.join(runDir, "notes");
-  const wrapper = path.join(runDir, "rauser-host-wrapper");
-  const manifest = path.join(profile, "NativeMessagingHosts", "com.rauser.browser.json");
+  const wrapper = path.join(runDir, `${BINARY_NAME}-host-wrapper`);
+  const manifest = path.join(profile, "NativeMessagingHosts", `${NATIVE_HOST_NAME}.json`);
   const caseId = randomUUID().slice(0, 8);
   const server = fixtureServer(caseId);
   const abort = new AbortController();
@@ -481,7 +482,7 @@ async function run() {
     console.log(`PASS: ${title}`);
   }
 
-  // Only Chrome's permission prompt and Rauser's native dialogs need a person.
+  // Only Chrome's permission prompt and the host's native dialogs need a person.
   async function userAction(instruction, check) {
     console.log(`  ACTION: ${instruction}`);
     // Say what is still missing, so a stuck wait is diagnosable.
@@ -548,7 +549,7 @@ async function run() {
       await waitFor(async () => requireCondition(await cdp.targetFor(panelUrl()), "Side panel did not open"),
         { timeout: 4_000 });
     } catch {
-      await userAction("Click the Rauser toolbar button to open the side panel.",
+      await userAction(`Click the ${APP_NAME} toolbar button to open the side panel.`,
         async () => requireCondition(await cdp.targetFor(panelUrl()), "Side panel is not open yet"));
     }
   }
@@ -561,7 +562,7 @@ async function run() {
     try {
       await waitFor(closed, { timeout: 4_000 });
     } catch {
-      await userAction("Close the Rauser side panel.", closed);
+      await userAction(`Close the ${APP_NAME} side panel.`, closed);
     }
   }
 
@@ -638,7 +639,7 @@ async function run() {
     const dist = await realpath(DIST);
     extensionId = unpackedExtensionId(dist);
     const hostManifest = Buffer.from(`${JSON.stringify({
-      name: "com.rauser.browser",
+      name: NATIVE_HOST_NAME,
       description: DEV_DESCRIPTION,
       path: wrapper,
       type: "stdio",
@@ -654,7 +655,7 @@ async function run() {
     const blocked = `${origin}/blocked/page?case=${caseId}`;
     const afterRemoval = `${origin}/allowed/after-removal?case=${caseId}`;
     // The panel titles a page note from the tab, so this is the fixture page title.
-    const title = "Rauser smoke /allowed/page";
+    const title = `${APP_NAME} smoke /allowed/page`;
     const firstBody = `First note ${caseId}`;
     const changedBody = `Review note ${caseId}`;
     await writeFile(path.join(runDir, "run-info.json"), `${JSON.stringify({
@@ -690,7 +691,7 @@ async function run() {
     console.log(`Loaded and confirmed isolated Chrome profile extension ID ${extensionId}.`);
     await nativeHostPreflight(cdp, extensionId);
     console.log("Chrome-to-native-host hello passed.");
-    console.log("The runner drives Rauser's pages itself. Answer only the prompts it names; press Ctrl+C to stop.");
+    console.log(`The runner drives ${APP_NAME}'s pages itself. Answer only the prompts it names; press Ctrl+C to stop.`);
 
     const pattern = `${origin}/*`;
     // Any empty folder will do; the suggested one is only a convenience.
@@ -752,10 +753,10 @@ async function run() {
       await waitFor(() => onSettings(async (page) =>
         requireCondition(await page.enabled("#enable-site"), "Enable this site is disabled")));
       await inSettings((page) => page.click("#enable-site"));
-      await userAction("In Chrome's prompt, click Allow. Then click No in Rauser's confirmation dialog.", async () => {
+      await userAction(`In Chrome's prompt, click Allow. Then click No in ${APP_NAME}'s confirmation dialog.`, async () => {
         const status = await settingsStatus();
         if (status?.includes("Chrome access was declined")) {
-          throw Object.assign(new Error("Chrome access was declined; this step needs Allow in Chrome and No in Rauser"), { fatal: true });
+          throw Object.assign(new Error(`Chrome access was declined; this step needs Allow in Chrome and No in ${APP_NAME}`), { fatal: true });
         }
         requireCondition(status?.includes("Canceled"), `Settings page says: ${status}`);
         await onSettings(async (page) => requireCondition(await page.enabled("#enable-site"), "Setup is still running"));
@@ -773,7 +774,7 @@ async function run() {
         await page.evaluate('document.getElementById("status").textContent = ""');
         await page.click("#enable-site");
       });
-      await userAction("In Chrome's prompt, click Allow. Then click Yes in Rauser's confirmation dialog.", async () => {
+      await userAction(`In Chrome's prompt, click Allow. Then click Yes in ${APP_NAME}'s confirmation dialog.`, async () => {
         const status = await settingsStatus().catch(() => null);
         if (status?.startsWith("Setup failed")) {
           throw Object.assign(new Error(`${status} Rerun the smoke test; a folder selection expires after five minutes.`), { fatal: true });
@@ -788,7 +789,7 @@ async function run() {
         "Host site rule does not match the fixture origin and /allowed prefix");
       });
       // A first navigation grant makes the settings page restart the extension,
-      // which closes every Rauser page.
+      // which closes every extension page.
       const outcome = await waitFor(async () => {
         const target = await cdp.targetFor(settingsUrl());
         if (!target) return "restarted";
@@ -845,7 +846,7 @@ async function run() {
       await cdp.send("Target.activateTarget", { targetId: (await fixtureTarget(origin)).targetId });
       await createNote("Page note created", firstBody);
       const files = await markdownFiles(path.join(notesRoot, "pages"));
-      const base = files.filter((file) => !file.path.includes(".rauser-review-"));
+      const base = files.filter((file) => !file.path.includes(`.${BINARY_NAME}-review-`));
       requireCondition(base.length === 1 && files.length === 1, "Expected one page note and no review draft");
       requireCondition(base[0].text.includes(title) && base[0].text.includes(firstBody) &&
         base[0].text.includes(allowed), "Page note content does not match the fixture request");
@@ -864,7 +865,7 @@ async function run() {
     await step("Changed page note creates one review draft", async () => {
       reviewResult = await createNote("Page note needs review", changedBody);
       const files = await markdownFiles(path.join(notesRoot, "pages"));
-      const review = files.filter((file) => file.path.includes(".rauser-review-"));
+      const review = files.filter((file) => file.path.includes(`.${BINARY_NAME}-review-`));
       const base = files.find((file) => file.path === originalNote.path);
       requireCondition(files.length === 2 && review.length === 1, "Expected one original note and one sibling review draft");
       requireCondition(base?.text === originalNote.text, "Original page note was changed");
@@ -912,7 +913,7 @@ async function run() {
         "A visit was logged after site removal");
     });
 
-    const cursor = await ask("\nDid a spinning busy cursor stay on screen after any Rauser dialog closed? Type no or yes: ");
+    const cursor = await ask(`\nDid a spinning busy cursor stay on screen after any ${APP_NAME} dialog closed? Type no or yes: `);
     requireCondition(cursor.toLowerCase() === "no", "A busy cursor persisted after a native dialog");
 
     console.log("\nPASS: guided macOS Chrome M1 smoke run completed.");

@@ -14,8 +14,9 @@ import {
 } from "./model.js";
 import { finishHostPause, withLatestHostState } from "./coordination.js";
 import { HostClient, HostError, PROTOCOL_VERSION, newRequestId } from "./native.js";
+import { BINARY_NAME } from "./brand.js";
 
-const CONFIG_MUTATION_LOCK = "rauser-config-permissions";
+const CONFIG_MUTATION_LOCK = `${BINARY_NAME}-config-permissions`;
 
 export function element<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);

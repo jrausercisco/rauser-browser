@@ -1,11 +1,12 @@
 //! Create-only page notes. Existing files are read for identity, never edited.
 
 use anyhow::{Result, bail};
-use rauser_protocol::PageNoteOutcome;
+use brauser_protocol::PageNoteOutcome;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::brand::{APP_NAME, BLOCK_END, BLOCK_START, FRONTMATTER_KEY};
 use crate::vault::Vault;
 
 const MAX_TITLE_BYTES: usize = 2048;
@@ -26,8 +27,8 @@ pub fn create_page_note(
     if title.len() > MAX_TITLE_BYTES || body.len() > MAX_BODY_BYTES {
         bail!("page title or note body exceeds its size limit");
     }
-    if body.contains("<!-- rauser:start -->") || body.contains("<!-- rauser:end -->") {
-        bail!("note body contains a reserved Rauser marker");
+    if body.contains(BLOCK_START) || body.contains(BLOCK_END) {
+        bail!("note body contains a reserved {APP_NAME} marker");
     }
 
     if let Some(existing) = vault.read_page(canonical_url)? {
@@ -182,7 +183,7 @@ fn normalized_body(body: &str) -> &str {
 
 fn proposal_id(canonical_url: &str, title: &str, body: &str) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"rauser-page-note-proposal-v1\0");
+    digest.update(concat!(crate::namespace!(), "-page-note-proposal-v1\0").as_bytes());
     for value in [
         canonical_url,
         normalized_title(canonical_url, title),
@@ -238,7 +239,8 @@ fn matches_proposal(
     } else if key_count("  review_of:") != 0 || key_count("  proposal_id:") != 0 {
         return Ok(false);
     }
-    let Some((_, existing_body)) = rendered_body.split_once("<!-- rauser:end -->\n\n## My notes\n")
+    let Some((_, existing_body)) =
+        rendered_body.split_once(&format!("{BLOCK_END}\n\n## My notes\n"))
     else {
         return Ok(false);
     };
@@ -273,7 +275,7 @@ fn render_page_note(
     };
     let body = normalized_body(body);
     Ok(format!(
-        "---\ntitle: {title}\nurl: {url}\nrauser:\n  canonical_url: {url}\n  url_id: {digest}\n{review_keys}  created: {now}\n---\n\n{review_notice}<!-- rauser:start -->\n<!-- rauser:end -->\n\n## My notes\n{body}\n"
+        "---\ntitle: {title}\nurl: {url}\n{FRONTMATTER_KEY}\n  canonical_url: {url}\n  url_id: {digest}\n{review_keys}  created: {now}\n---\n\n{review_notice}{BLOCK_START}\n{BLOCK_END}\n\n## My notes\n{body}\n"
     ))
 }
 
@@ -314,8 +316,8 @@ fn matches_owned_identity(canonical_url: &str, contents: &str) -> bool {
         let first = positions.next()?;
         positions.next().is_none().then_some(first)
     };
-    exactly_one("rauser:")
-        && key_count("rauser:") == 1
+    exactly_one(FRONTMATTER_KEY)
+        && key_count(FRONTMATTER_KEY) == 1
         && exactly_one(&format!("url: {url}"))
         && key_count("url:") == 1
         && exactly_one(&format!("  canonical_url: {url}"))
@@ -323,7 +325,7 @@ fn matches_owned_identity(canonical_url: &str, contents: &str) -> bool {
         && exactly_one(&format!("  url_id: {digest}"))
         && key_count("  url_id:") == 1
         && matches!(
-            (marker_index("<!-- rauser:start -->"), marker_index("<!-- rauser:end -->")),
+            (marker_index(BLOCK_START), marker_index(BLOCK_END)),
             (Some(start), Some(end)) if start < end
         )
 }

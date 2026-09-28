@@ -4,7 +4,7 @@
 use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result, bail};
-use rauser_protocol::{
+use brauser_protocol::{
     ConfigConfirmed, ConfigResult, ConfigUpdated, ErrorCode, ErrorResponse, FolderChosen,
     HelloResult, PROTOCOL_VERSION, PageNoteResult, Request, Response, VisitOutcome, VisitRecorded,
 };
@@ -327,7 +327,7 @@ fn dispatch(
     }
 }
 
-fn record_visit(value: rauser_protocol::RecordVisitRequest, config: &mut ConfigStore) -> Response {
+fn record_visit(value: brauser_protocol::RecordVisitRequest, config: &mut ConfigStore) -> Response {
     let event_id = value.event.event_id.clone();
     if event_id.len() > 64 {
         return error(
@@ -399,7 +399,7 @@ fn record_visit(value: rauser_protocol::RecordVisitRequest, config: &mut ConfigS
 }
 
 fn create_page_note(
-    value: rauser_protocol::CreatePageNoteRequest,
+    value: brauser_protocol::CreatePageNoteRequest,
     config: &mut ConfigStore,
 ) -> Response {
     let _config_lock = match config.lock_current() {
@@ -530,7 +530,7 @@ fn write_frame<W: Write>(output: &mut W, response: &Response) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rauser_protocol::{ConfigSnapshot, GetConfigRequest, HelloRequest, UpdateConfigRequest};
+    use brauser_protocol::{ConfigSnapshot, GetConfigRequest, HelloRequest, UpdateConfigRequest};
     use std::io::Cursor;
 
     fn encoded_request(request: Request) -> Vec<u8> {

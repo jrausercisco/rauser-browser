@@ -6,10 +6,11 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+use crate::brand::NAMESPACE;
 use anyhow::{Context, Result, bail};
+use brauser_protocol::StorageConfig;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
-use rauser_protocol::StorageConfig;
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
@@ -186,7 +187,7 @@ impl Vault {
             .open_dir(&self.pages_dir)
             .context("opening page notes directory")?;
 
-        let temporary = format!(".rauser-{}.tmp", Uuid::new_v4());
+        let temporary = format!(".{NAMESPACE}-{}.tmp", Uuid::new_v4());
         let mut file = pages
             .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
             .context("creating page note temporary file")?;
@@ -305,7 +306,7 @@ fn review_filename(page_url: &str, proposal_id: &str) -> Result<String> {
     let stem = filename
         .strip_suffix(".md")
         .context("page filename has no Markdown suffix")?;
-    Ok(format!("{stem}.rauser-review-{proposal_id}.md"))
+    Ok(format!("{stem}.{NAMESPACE}-review-{proposal_id}.md"))
 }
 
 pub(crate) fn checked_relative_dir(value: &str) -> Result<PathBuf> {

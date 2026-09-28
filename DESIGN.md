@@ -1,10 +1,10 @@
 # Rauser Browser Browsing Assistant — Design Specification
 
-> Status: Draft v0.5 · M0 merged, M1 development implementation in progress, no public package yet · Short name "Rauser"; CLI and binary `rauser` · License: Apache-2.0 · Platforms: Google Chrome on macOS and Windows
+> Status: Draft v0.5 · M0 merged, M1 development implementation in progress, no public package yet · Short name "Brauser"; CLI and binary `brauser` · License: Apache-2.0 · Platforms: Google Chrome on macOS and Windows
 
 ## 1. Purpose
 
-Rauser turns the browser into a place where context accumulates instead of disappearing. It runs as an always-on sidebar that:
+Brauser turns the browser into a place where context accumulates instead of disappearing. It runs as an always-on sidebar that:
 
 - **Logs** important sites the user visits
 - **Summarizes** pages into notes using the user's own local AI agent
@@ -20,10 +20,10 @@ Captured notes, browse logs, and read-later items are plain Markdown in a folder
 1. **The user owns the data.** Markdown files are the source of truth. Everything else, such as the search index, is a rebuildable cache.
 2. **Least privilege everywhere.** The extension cannot touch the filesystem. The host cannot do anything it isn't configured to do. Sites are opt-in.
 3. **Page content is untrusted.** Any page the user visits may contain hostile content, including prompt injection aimed at the agent.
-4. **Never clobber user edits.** Rauser only modifies what it owns.
+4. **Never clobber user edits.** Brauser only modifies what it owns.
 5. **Format-neutral, convention-friendly.** Output works in any markdown tool. Obsidian is a first-class preset, not a dependency.
 6. **Configuration over code.** Agent harnesses, site adapters, and omnibar commands are defined in config, not hardcoded.
-7. **Assume nothing about the user's setup.** No default vault location, agent, folder structure, or site list. Rauser ships with examples, and the user makes every choice explicitly at setup. It never writes into a folder the user hasn't chosen.
+7. **Assume nothing about the user's setup.** No default vault location, agent, folder structure, or site list. Brauser ships with examples, and the user makes every choice explicitly at setup. It never writes into a folder the user hasn't chosen.
 8. **No always-running native service.** The host runs only while the side panel or settings page is open. If the user enables site logging, the browser's event-driven extension service worker may wake on navigation while the browser is open to buffer allowlisted visits; nothing runs when the browser is closed.
 
 ## 3. Architecture
@@ -78,7 +78,7 @@ The extension runs in a hostile environment (arbitrary web pages), and the host 
 | Malicious page influences extension messages | Host validates and authorizes every request; extension is not trusted |
 | Path traversal / symlink escape out of the vault | Host builds all paths from its own slugs; canonical-root confinement; capability-based FS access (e.g. `cap-std`) |
 | Command injection via agent invocation | Harnesses run via argv with no shell; page content passed on stdin, never interpolated into argv |
-| Prompt injection from page content | Content delimited and labelled untrusted; agent run in its most restricted mode for read-only tasks; outputs written only to Rauser-owned locations |
+| Prompt injection from page content | Content delimited and labelled untrusted; agent run in its most restricted mode for read-only tasks; outputs written only to Brauser-owned locations |
 | Sensitive pages sent to an agent | Agent denylist enforced in the host, overriding explicit user requests with a warning |
 | Unwanted browsing surveillance | Logging is opt-in per domain; incognito never logged |
 | Other local extensions talking to the host | `allowed_origins` restricted to official extension IDs |
@@ -146,8 +146,8 @@ The extension runs in a hostile environment (arbitrary web pages), and the host 
 - The host maintains a SQLite FTS5 index over titles, summaries, notes, and tags.
 - When the active tab changes, the sidebar shows related pages ranked by text relevance, shared tags, and shared domain.
 - v1 is keyword search. Embedding-based similarity is a later, optional stage.
-- The index lives in the OS cache directory, not in the user's notes folder, and can be deleted and rebuilt at any time with `rauser reindex`.
-- On each connect, the host does an incremental scan (by modification time) to pick up files edited outside Rauser. While connected, it watches the notes folder for changes. There is no scheduled reindexing.
+- The index lives in the OS cache directory, not in the user's notes folder, and can be deleted and rebuilt at any time with `brauser reindex`.
+- On each connect, the host does an incremental scan (by modification time) to pick up files edited outside Brauser. While connected, it watches the notes folder for changes. There is no scheduled reindexing.
 
 ### 5.6 Omnibar
 
@@ -190,15 +190,15 @@ The user chooses the notes folder at setup. It can be empty, or a subfolder of a
   later/<slug>.md                read-later items
 ```
 
-Rauser's own files live outside the notes folder, in standard OS locations, so it never adds hidden folders to someone's knowledge base:
+Brauser's own files live outside the notes folder, in standard OS locations, so it never adds hidden folders to someone's knowledge base:
 
 | File | Location |
 |---|---|
-| `config.toml` | OS config directory (e.g. `~/Library/Application Support/Rauser` on macOS, `%APPDATA%\Rauser` on Windows) |
+| `config.toml` | OS config directory (e.g. `~/Library/Application Support/Brauser` on macOS, `%APPDATA%\Brauser` on Windows) |
 | `visit-ids/` | OS config directory; M1 keeps one synced intent file per persisted visit |
 | `index.db` | OS cache directory |
 
-If Rauser finds an existing folder with files it didn't create, it leaves them alone. It only indexes files under its configured content locations.
+If Brauser finds an existing folder with files it didn't create, it leaves them alone. It only indexes files under its configured content locations.
 
 ### 6.2 Internal model
 
@@ -233,18 +233,18 @@ extends = "neutral"
 frontmatter = "toml"
 ```
 
-**Reading is lenient, writing follows the profile.** The indexer parses both link styles and any frontmatter format. Switching profiles never rewrites existing files; `rauser migrate --profile <name>` converts them and defaults to a dry run.
+**Reading is lenient, writing follows the profile.** The indexer parses both link styles and any frontmatter format. Switching profiles never rewrites existing files; `brauser migrate --profile <name>` converts them and defaults to a dry run.
 
 ### 6.4 Managed blocks
 
-Rauser owns only:
+Brauser owns only:
 
-- Its own frontmatter keys, namespaced under `rauser:`
-- Content between `<!-- rauser:start -->` and `<!-- rauser:end -->`
+- Its own frontmatter keys, namespaced under `brauser:`
+- Content between `<!-- brauser:start -->` and `<!-- brauser:end -->`
 
 Everything else, including unknown frontmatter keys and anything the user writes, is preserved byte for byte. In M1, the host creates new notes with a managed block and never replaces an existing note. A proposed change to an existing note, including one with absent markers, is written as a no-clobber sibling artifact for user review. Malformed or duplicate markers produce a conflict. Automatic managed-block replacement is deferred until a cross-platform atomic displaced-byte backup and conflict procedure is proven with an external-editor race test.
 
-Page-note filenames include a stable identifier derived from the normalized canonical URL, even when a profile uses a title slug. Before updating a file, the host verifies the recorded canonical URL and Rauser ownership match the requested page. An absent or different identity is a conflict, never an opportunity to adopt or overwrite an unrelated file.
+Page-note filenames include a stable identifier derived from the normalized canonical URL, even when a profile uses a title slug. Before updating a file, the host verifies the recorded canonical URL and Brauser ownership match the requested page. An absent or different identity is a conflict, never an opportunity to adopt or overwrite an unrelated file.
 
 ### 6.5 Example page note (neutral profile)
 
@@ -253,7 +253,7 @@ Page-note filenames include a stable identifier derived from the normalized cano
 title: Designing Data-Intensive Applications — Chapter 5
 url: https://example.com/ddia/ch5
 tags: [replication, databases]
-rauser:
+brauser:
   canonical_url: https://example.com/ddia/ch5
   url_id: 65fc5f8734006f2e6ac748dc5daadc458ac24dc3fc98c2233160c601c42389a7
   created: 2026-09-27T10:14:00Z
@@ -261,10 +261,10 @@ rauser:
   visits: 3
 ---
 
-<!-- rauser:start -->
+<!-- brauser:start -->
 ## Summary
 Leader-based replication trades write availability for consistency...
-<!-- rauser:end -->
+<!-- brauser:end -->
 
 ## My notes
 Compare this with how our event pipeline handles failover.
@@ -280,7 +280,7 @@ The config starts nearly empty. Setup writes only what the user chooses; everyth
 
 An agent is optional. Without one, logging, notes, read later, and related pages all still work; only AI commands are disabled.
 
-Rauser ships adapter templates for Claude Code, Codex, and a generic CLI, but configures none of them automatically. At setup, the host may look for known harnesses on `PATH` and offer what it finds; the user confirms the binary path and chooses one. Nothing is enabled without that confirmation.
+Brauser ships adapter templates for Claude Code, Codex, and a generic CLI, but configures none of them automatically. At setup, the host may look for known harnesses on `PATH` and offer what it finds; the user confirms the binary path and chooses one. Nothing is enabled without that confirmation.
 
 ```toml
 [agent]
@@ -371,12 +371,12 @@ The layout above is the planned release layout. M0 currently contains `protocol/
 
 ## 11. Distribution
 
-- **Download experience:** provide one public Rauser download page with two clearly labeled steps: install the browser extension from the Chrome Web Store, then download and run the signed native-host installer for the user's OS. The page explains why both parts are needed, links to supported-browser instructions, and offers a short troubleshooting path. The native host is a companion installer; do not ask users to build from source, use a terminal, or install Homebrew to get started.
+- **Download experience:** provide one public Brauser download page with two clearly labeled steps: install the browser extension from the Chrome Web Store, then download and run the signed native-host installer for the user's OS. The page explains why both parts are needed, links to supported-browser instructions, and offers a short troubleshooting path. The native host is a companion installer; do not ask users to build from source, use a terminal, or install Homebrew to get started.
 - **Extension:** publish the stable release through the Chrome Web Store. Keep the published extension ID stable because the native-host manifest authorizes that exact ID. Chrome Web Store installation is the supported path on Windows and macOS; do not instruct users to install a local CRX.
 - **Supported browser:** Google Chrome Stable only, on macOS and Windows. Test the current and previous two stable major versions and publish the tested range on the download page. Edge, Brave, Arc, other Chromium browsers, Firefox, and Safari are unsupported in the first release. Chrome's Side Panel API requires Chrome 114 or later; the release floor must also satisfy the current three-version support window.
 - **macOS package:** offer a signed and notarized per-user `.pkg` for macOS 15 Sequoia and later, with a universal Intel and Apple silicon host binary and a Chrome user-level native-messaging manifest. Sign the app with the publisher's Developer ID Application identity and the installer package with its Developer ID Installer identity. Homebrew may be offered as an additional channel for technical users, not as the primary consumer install path.
 - **Windows package:** offer a signed per-user x64 installer for Windows 11 version 25H2 and later supported releases. Register the native host under `HKEY_CURRENT_USER` for Google Chrome only, without administrator rights. Sign the installer and binaries with a trusted Authenticode code-signing certificate and timestamp the signatures. Windows 10 and Windows on ARM are unsupported in the first release. Document what happens when organizational policy blocks per-user installation.
-- **Native-host registration:** register only Google Chrome, using its documented user-level manifest location on macOS and registry entry on Windows. The installer must use the stable Chrome Web Store extension ID in `allowed_origins`; it must never use wildcard origins. `rauser register` may repair the Chrome registration after installation, with a clear confirmation and status report. Uninstallation removes only Rauser's host registration and installed binaries.
+- **Native-host registration:** register only Google Chrome, using its documented user-level manifest location on macOS and registry entry on Windows. The installer must use the stable Chrome Web Store extension ID in `allowed_origins`; it must never use wildcard origins. `brauser register` may repair the Chrome registration after installation, with a clear confirmation and status report. Uninstallation removes only Brauser's host registration and installed binaries.
 - **First-run flow:** after the extension is installed, opening the side panel checks for the host and gives a direct OS-specific download link if it is missing. After host installation, the panel verifies host/protocol compatibility, warns that setup is incomplete, and links to the settings page, which guides the user through choosing a notes folder, profile, optional agent, optional sites, and privacy exclusions. Explain permissions at the point they are requested. Show a final review of what will be captured and where it will be written; capture stays off until the user finishes setup. Include a no-agent setup path that reaches a usable capture experience.
 - **Upgrade and removal:** browser-store updates apply to the extension; host updates use the signed OS installer and preserve the configured notes folder. Show a clear incompatibility error if extension and host protocol versions do not match. Uninstall leaves the user's notes and config untouched by default, and the documentation explains how to remove them manually.
 - **Release page and support:** use the public GitHub repository's Releases page as the canonical download page. Each release links to the Chrome Web Store listing, the macOS `.pkg`, Windows x64 installer, checksums, install/upgrade/rollback/uninstall instructions, troubleshooting, and the GitHub Issues support channel. Do not publish a release until both OS installers and the extension have passed the install and uninstall checks.
@@ -411,11 +411,11 @@ The plan follows Chrome's current [optional-permission rules](https://developer.
 
 **M1 validation remaining:** The macOS guided run loaded the unpacked extension, completed a Chrome-to-host `hello`, and exercised picker cancellation with config unchanged. The full permission, consent, visit, page-note, and removal flow was stopped before completion after a persistent macOS spinning cursor appeared; it is not a smoke-test pass. Native dialogs now run in a short-lived child process to remove that cause, which still needs confirming in a repeat macOS run; then run the flow on Windows. macOS and Windows CI build and test the branch. A failed append now rolls back its own bytes, and replay tolerates complete visits appended after an intent, so only a crash mid-append followed by further visits still requires manual repair. Confirm the Chrome permission request accepts explicit default and nondefault ports on both operating systems. Automated tests cover host identity/replay recovery and extension repair, pause, policy refresh, re-enable races, title capture, and notice retention. The M1 per-event intent journal grows indefinitely and needs a compact durable replacement before general distribution. Windows currently syncs file content but has no separately validated directory-entry flush, so power-loss durability of a newly created daily log or page-note name remains unverified. Resolve these gaps before the public package is released.
 
-**macOS smoke pass (2026-09-28):** `npm run smoke:macos` completed the full flow on macOS with Chrome 154: first-run warning, picker cancellation, declined consent (with the new Chrome grants rolled back), confirmed setup, allowed and blocked visit replay, panel reopen without duplication, page note creation, identical retry, one review draft and its retry, site removal with Chrome grants removed, and no capture after removal. No busy cursor persisted after any native dialog, which confirms the child-process dialog fix. The fixture's nondefault port was accepted by Chrome's permission request. Re-requesting access that Rauser had just removed did not show a second Chrome prompt, so the host's native confirmation, not Chrome's prompt, is the gate for that re-enable; the host still required it. The runner now drives the extension pages itself through the DevTools pipe and stops only for the picker, Chrome's prompt, and the host dialog.
+**macOS smoke pass (2026-09-28):** `npm run smoke:macos` completed the full flow on macOS with Chrome 154: first-run warning, picker cancellation, declined consent (with the new Chrome grants rolled back), confirmed setup, allowed and blocked visit replay, panel reopen without duplication, page note creation, identical retry, one review draft and its retry, site removal with Chrome grants removed, and no capture after removal. No busy cursor persisted after any native dialog, which confirms the child-process dialog fix. The fixture's nondefault port was accepted by Chrome's permission request. Re-requesting access that Brauser had just removed did not show a second Chrome prompt, so the host's native confirmation, not Chrome's prompt, is the gate for that re-enable; the host still required it. The runner now drives the extension pages itself through the DevTools pipe and stops only for the picker, Chrome's prompt, and the host dialog.
 
 **Page note title (2026-09-28):** The panel's page-note form no longer has a title field. The host receives the tab's title, or the host name when the page has none; a change in that title still produces a review draft.
 
-**Settings page (2026-09-28):** Configuration moved from the side panel to a dedicated `options_ui` page. The panel shows a gear button and a setup warning until a folder, a site, and capture are all in place. The page opened from the panel on macOS once Rauser was reloaded in `chrome://extensions`. Chrome keeps an unpacked extension's manifest and service worker from load time but serves rebuilt pages from disk, so a build that changes `manifest.json` or `worker.ts` needs that reload; the panel now says so when the settings page cannot open. `npm run smoke:macos` starts a fresh profile and is unaffected. This is not a smoke-test pass for the flow above.
+**Settings page (2026-09-28):** Configuration moved from the side panel to a dedicated `options_ui` page. The panel shows a gear button and a setup warning until a folder, a site, and capture are all in place. The page opened from the panel on macOS once Brauser was reloaded in `chrome://extensions`. Chrome keeps an unpacked extension's manifest and service worker from load time but serves rebuilt pages from disk, so a build that changes `manifest.json` or `worker.ts` needs that reload; the panel now says so when the settings page cannot open. `npm run smoke:macos` starts a fresh profile and is unaffected. This is not a smoke-test pass for the flow above.
 
 ### 12.2 Next steps
 

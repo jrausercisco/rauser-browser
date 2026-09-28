@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/rausified/rauser-browser/blob/main/protocol/schema.json",
-  "title": "Rauser native messaging protocol",
+  "title": "Brauser native messaging protocol",
   "description": "Version 2 messages exchanged by the Chrome extension and native host. Host-owned configuration and consent tokens gate capture and writes.",
   "oneOf": [
     {
