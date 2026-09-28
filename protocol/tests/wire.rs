@@ -1,4 +1,4 @@
-use rauser_protocol::{Request, Response};
+use brauser_protocol::{Request, Response};
 
 #[test]
 fn omitted_storage_is_not_interpreted_as_explicit_null() {

@@ -3,6 +3,7 @@ import test from "node:test";
 
 const { finishHostPause, withLatestHostState } = await import("../dist/coordination.js");
 const { localTimestamp } = await import("../dist/model.js");
+const { storageKey } = await import("../dist/brand.js");
 
 // Run after build:extension. The mock copies storage values as Chrome does,
 // which catches accidental reliance on mutating an object returned by get().
@@ -115,14 +116,14 @@ test("config repair suspends capture without losing visits, while confirmed revo
   const secondOrigin = "https://second.example";
   grants.set("https://first.example:443/*", true);
   grants.set("https://second.example:443/*", true);
-  values.set("rauser_queue_v1", {
+  values.set(storageKey("queue_v1"), {
     version: 1,
     items: [visit("first", `${firstOrigin}/a`), visit("second", `${secondOrigin}/b`)],
     overflow_count: 3,
     rejected_count: 2,
     last_error: null,
   });
-  values.set("rauser_policy_v1", {
+  values.set(storageKey("policy_v1"), {
     revision: "host-revision",
     expires_at: Date.now() + 60_000,
     capture_enabled: true,
@@ -135,31 +136,31 @@ test("config repair suspends capture without losing visits, while confirmed revo
   const suspended = await send({ kind: "suspend_policy" });
   assert.equal(suspended.queued, 2);
   assert.equal(suspended.policy_expires_at, null);
-  assert.equal(values.get("rauser_policy_v1"), null);
+  assert.equal(values.get(storageKey("policy_v1")), null);
   assert.deepEqual(await send({ kind: "get_pending" }), []);
 
   permissionCheckError = true;
   const uncertain = await send({ kind: "get_status" });
   assert.equal(uncertain.queued, 2);
-  assert.equal(values.get("rauser_queue_v1").items.length, 2);
+  assert.equal(values.get(storageKey("queue_v1")).items.length, 2);
 
   permissionCheckError = false;
   grants.set("https://first.example:443/*", false);
   const revoked = await send({ kind: "get_status" });
   assert.equal(revoked.queued, 1);
   assert.deepEqual(revoked.revoked_origins, [firstOrigin]);
-  assert.equal(values.get("rauser_queue_v1").items[0].event.event_id, "second");
+  assert.equal(values.get(storageKey("queue_v1")).items[0].event.event_id, "second");
 
   const ids = await send({ kind: "get_pending_ids" });
   assert.deepEqual(ids, ["second"]);
-  const nextQueue = values.get("rauser_queue_v1");
+  const nextQueue = values.get(storageKey("queue_v1"));
   nextQueue.items.push(visit("later", `${secondOrigin}/later`));
-  values.set("rauser_queue_v1", nextQueue);
+  values.set(storageKey("queue_v1"), nextQueue);
   const discarded = await send({ kind: "discard_pending", event_ids: ids });
   assert.equal(discarded.queued, 1);
   assert.equal(discarded.overflow_count, 3);
   assert.equal(discarded.rejected_count, 2);
-  assert.equal(values.get("rauser_queue_v1").items[0].event.event_id, "later");
+  assert.equal(values.get(storageKey("queue_v1")).items[0].event.event_id, "later");
 });
 
 test("a newer local pause cannot be resumed by an older enable confirmation", async () => {
@@ -260,13 +261,13 @@ test("a re-enabled origin clears only its old revocation after a matching lease 
   grants.clear();
   const origin = "https://again.example";
   const pattern = "https://again.example:443/*";
-  values.set("rauser_policy_v1", {
+  values.set(storageKey("policy_v1"), {
     revision: "r2",
     expires_at: Date.now() + 60_000,
     capture_enabled: true,
     sites: [{ origin, path_prefix: "/" }],
   });
-  values.set("rauser_revocations_v1", [origin]);
+  values.set(storageKey("revocations_v1"), [origin]);
   grants.set(pattern, true);
 
   const stale = await send({ kind: "ack_reenabled_origin", origin, revision: "r1" });
@@ -287,7 +288,7 @@ test("a committed page takes its title only until the panel receives the visit",
   tabs.clear();
   const origin = "https://title.example";
   grants.set("https://title.example:443/*", true);
-  values.set("rauser_policy_v1", lease(origin));
+  values.set(storageKey("policy_v1"), lease(origin));
   tabs.set(7, { id: 7, url: `${origin}/a`, title: "Previous page", incognito: false });
 
   onCommitted({
@@ -295,7 +296,7 @@ test("a committed page takes its title only until the panel receives the visit",
     url: `${origin}/a`, timeStamp: Date.now(),
   });
   await flush();
-  const [queued] = values.get("rauser_queue_v1").items;
+  const [queued] = values.get(storageKey("queue_v1")).items;
   assert.equal(queued.event.title, null);
   assert.equal(queued.tab_id, 7);
   assert.equal(queued.dispatched, false);
@@ -304,24 +305,24 @@ test("a committed page takes its title only until the panel receives the visit",
 
   onTabUpdated(7, { title: "x".repeat(400) }, { id: 7, url: `${origin}/a#part`, incognito: false });
   await flush();
-  assert.equal(values.get("rauser_queue_v1").items[0].event.title, "x".repeat(300));
+  assert.equal(values.get(storageKey("queue_v1")).items[0].event.title, "x".repeat(300));
 
   onTabUpdated(7, { title: "Other tab" }, { id: 8, url: `${origin}/b`, incognito: false });
   onTabUpdated(8, { title: "Other tab" }, { id: 8, url: `${origin}/a`, incognito: false });
   await flush();
-  assert.equal(values.get("rauser_queue_v1").items[0].event.title, "x".repeat(300));
+  assert.equal(values.get(storageKey("queue_v1")).items[0].event.title, "x".repeat(300));
 
   assert.deepEqual(await send({ kind: "get_pending" }), []);
-  const graceElapsed = values.get("rauser_queue_v1");
+  const graceElapsed = values.get(storageKey("queue_v1"));
   graceElapsed.items[0].retry_after = 0;
-  values.set("rauser_queue_v1", graceElapsed);
+  values.set(storageKey("queue_v1"), graceElapsed);
   const pending = await send({ kind: "get_pending" });
   assert.equal(pending.length, 1);
-  assert.equal(values.get("rauser_queue_v1").items[0].dispatched, true);
+  assert.equal(values.get(storageKey("queue_v1")).items[0].dispatched, true);
 
   onTabUpdated(7, { title: "Too late" }, { id: 7, url: `${origin}/a`, incognito: false });
   await flush();
-  assert.equal(values.get("rauser_queue_v1").items[0].event.title, "x".repeat(300));
+  assert.equal(values.get(storageKey("queue_v1")).items[0].event.title, "x".repeat(300));
 });
 
 test("a stored visit without a dispatch flag is never patched", async () => {
@@ -329,8 +330,8 @@ test("a stored visit without a dispatch flag is never patched", async () => {
   grants.clear();
   const origin = "https://legacy.example";
   grants.set("https://legacy.example:443/*", true);
-  values.set("rauser_policy_v1", lease(origin));
-  values.set("rauser_queue_v1", {
+  values.set(storageKey("policy_v1"), lease(origin));
+  values.set(storageKey("queue_v1"), {
     version: 1,
     items: [{ ...visit("legacy", `${origin}/a`), tab_id: 3 }],
     overflow_count: 0,
@@ -339,7 +340,7 @@ test("a stored visit without a dispatch flag is never patched", async () => {
   });
   onTabUpdated(3, { title: "Late title" }, { id: 3, url: `${origin}/a`, incognito: false });
   await flush();
-  assert.equal(values.get("rauser_queue_v1").items[0].event.title, null);
+  assert.equal(values.get(storageKey("queue_v1")).items[0].event.title, null);
   const status = await send({ kind: "get_status" });
   assert.equal(status.retry_error, null);
 });
@@ -349,7 +350,7 @@ test("a navigation outside every enabled site skips grant checks and tab reads",
   grants.clear();
   tabs.clear();
   grants.set("https://enabled.example:443/*", true);
-  values.set("rauser_policy_v1", lease("https://enabled.example"));
+  values.set(storageKey("policy_v1"), lease("https://enabled.example"));
   tabs.set(4, { id: 4, url: "https://other.example/x", title: "Other", incognito: false });
   const checks = permissionChecks;
   const reads = tabReads;
@@ -360,7 +361,7 @@ test("a navigation outside every enabled site skips grant checks and tab reads",
   await flush();
   assert.equal(permissionChecks, checks);
   assert.equal(tabReads, reads);
-  assert.equal(values.get("rauser_queue_v1"), undefined);
+  assert.equal(values.get(storageKey("queue_v1")), undefined);
 
   tabs.set(4, { id: 4, url: "https://enabled.example/y", title: "Old", incognito: false });
   onCommitted({
@@ -369,7 +370,7 @@ test("a navigation outside every enabled site skips grant checks and tab reads",
   });
   await flush();
   assert.ok(permissionChecks > checks);
-  assert.equal(values.get("rauser_queue_v1").items.length, 1);
+  assert.equal(values.get(storageKey("queue_v1")).items.length, 1);
 });
 
 test("a successful ack clears retry state but keeps notices until dismissed", async () => {
@@ -377,8 +378,8 @@ test("a successful ack clears retry state but keeps notices until dismissed", as
   grants.clear();
   const origin = "https://ack.example";
   grants.set("https://ack.example:443/*", true);
-  values.set("rauser_policy_v1", lease(origin));
-  values.set("rauser_queue_v1", {
+  values.set(storageKey("policy_v1"), lease(origin));
+  values.set(storageKey("queue_v1"), {
     version: 1,
     items: [visit("one", `${origin}/1`), visit("two", `${origin}/2`)],
     overflow_count: 2,
@@ -405,7 +406,7 @@ test("a successful ack clears retry state but keeps notices until dismissed", as
   assert.equal(cleared.last_error, null);
   assert.equal(cleared.overflow_count, 0);
   assert.equal(cleared.rejected_count, 0);
-  assert.equal(values.get("rauser_queue_v1").last_error, null);
+  assert.equal(values.get(storageKey("queue_v1")).last_error, null);
 });
 
 test("visit timestamps use local time with a numeric UTC offset", () => {

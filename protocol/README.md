@@ -1,4 +1,4 @@
-# Rauser native messaging protocol
+# Brauser native messaging protocol
 
 `schema.json` is the source of truth for native messages. Regenerate the Rust and
 TypeScript types after changing it:

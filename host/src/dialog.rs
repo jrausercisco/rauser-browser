@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use crate::brand::APP_NAME;
 use anyhow::{Context, Result, bail};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
@@ -85,7 +86,8 @@ pub fn run_child_command(command: &str) -> Result<()> {
 }
 
 fn run_child(command: &str, input: &str) -> Result<String> {
-    let exe = std::env::current_exe().context("locating the Rauser host binary")?;
+    let exe =
+        std::env::current_exe().with_context(|| format!("locating the {APP_NAME} host binary"))?;
     let mut child = Command::new(exe)
         .arg(command)
         .stdin(Stdio::piped())

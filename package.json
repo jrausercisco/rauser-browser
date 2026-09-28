@@ -1,8 +1,8 @@
 {
-  "name": "rauser-browser",
+  "name": "brauser",
   "private": true,
   "version": "0.0.0",
-  "description": "Development tooling for the Rauser browser extension and shared protocol",
+  "description": "Development tooling for the Brauser browser extension and shared protocol",
   "scripts": {
     "build:extension": "node extension/build.mjs",
     "test:extension": "node --test extension/tests/worker.test.mjs",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the Rust and TypeScript wire types from schema.json.
 
-This intentionally supports only the small JSON Schema subset used by Rauser.
+This intentionally supports only the small JSON Schema subset used by this protocol.
 An unsupported schema feature fails generation instead of silently producing an
 incomplete type. No package installation is needed to regenerate the files.
 """

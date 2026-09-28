@@ -18,13 +18,14 @@ import {
   type WorkerRequest,
   type WorkerStatus,
 } from "./model.js";
+import { APP_NAME, storageKey } from "./brand.js";
 
-const QUEUE_KEY = "rauser_queue_v1";
+const QUEUE_KEY = storageKey("queue_v1");
 const POLICY_KEY = POLICY_STORAGE_KEY;
-const REVOCATIONS_KEY = "rauser_revocations_v1";
-const PAUSE_KEY = "rauser_pause_pending_v1";
-const PAUSE_TOKEN_KEY = "rauser_pause_token_v1";
-const REMOVED_SITES_KEY = "rauser_locally_removed_sites_v1";
+const REVOCATIONS_KEY = storageKey("revocations_v1");
+const PAUSE_KEY = storageKey("pause_pending_v1");
+const PAUSE_TOKEN_KEY = storageKey("pause_token_v1");
+const REMOVED_SITES_KEY = storageKey("locally_removed_sites_v1");
 // Matches MAX_URL_BYTES in host/src/capture.rs, so the host never rejects a
 // visit the worker chose to buffer.
 const MAX_VISIT_URL_BYTES = 8_192;
@@ -575,13 +576,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 const onCommitted = (details: ChromeNavigationDetails): void => {
   void serialize(() => captureNavigation(details, false)).catch((error: unknown) => {
-    console.warn("Rauser navigation capture paused:", describe(error));
+    console.warn(`${APP_NAME} navigation capture paused:`, describe(error));
   });
 };
 
 const onHistoryStateUpdated = (details: ChromeNavigationDetails): void => {
   void serialize(() => captureNavigation(details, true)).catch((error: unknown) => {
-    console.warn("Rauser SPA capture paused:", describe(error));
+    console.warn(`${APP_NAME} SPA capture paused:`, describe(error));
   });
 };
 
@@ -592,7 +593,7 @@ function registerNavigationListeners(): void {
     chrome.webNavigation.onHistoryStateUpdated.addListener(onHistoryStateUpdated);
     navigationReady = true;
   } catch (error) {
-    console.warn("Rauser navigation listeners unavailable:", describe(error));
+    console.warn(`${APP_NAME} navigation listeners unavailable:`, describe(error));
   }
 }
 
@@ -605,7 +606,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const title = changeInfo.title;
   if (title === undefined) return;
   void serialize(() => patchTitle(tabId, title, tab)).catch((error: unknown) => {
-    console.warn("Rauser title update skipped:", describe(error));
+    console.warn(`${APP_NAME} title update skipped:`, describe(error));
   });
 });
 
@@ -618,10 +619,10 @@ chrome.permissions.onRemoved.addListener(() => {
     await ensureTrustedStorage();
     await reconcileGrants();
   }).catch((error: unknown) => {
-    console.warn("Rauser permission reconciliation failed:", describe(error));
+    console.warn(`${APP_NAME} permission reconciliation failed:`, describe(error));
   });
 });
 
 void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch((error: unknown) => {
-  console.warn("Rauser side panel setup failed:", describe(error));
+  console.warn(`${APP_NAME} side panel setup failed:`, describe(error));
 });

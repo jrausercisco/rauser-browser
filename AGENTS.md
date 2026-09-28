@@ -1,4 +1,4 @@
-# Rauser Browser contributor instructions
+# Rauser Browser Browsing Assistant contributor instructions
 
 ## Current state
 
@@ -9,6 +9,7 @@ M0 is merged. M1 development code adds a Chrome side panel and settings page, op
 - `protocol/schema.json` defines native messages. Run `python3 protocol/generate.py` after changing it and commit the generated Rust and TypeScript files together.
 - `host/` contains the native host. Keep host policy checks on the privileged side of the messaging boundary.
 - `extension/` contains the MV3 Chrome development build. `npm run build:extension` emits `extension/dist/` for unpacked loading.
+- Product naming (app name, native host ID, storage key, marker, and temp-file prefixes) lives in `extension/brand.ts` (also used by the build and dev scripts) and `host/src/brand.rs`. Page and manifest text use `{{APP_NAME}}`/`{{FULL_NAME}}`, filled in by `extension/build.mjs`. Crate, package, and binary names in `Cargo.toml` and `package.json` still change separately.
 - `scripts/register-dev-host.mjs` registers a per-user development native host for one unpacked extension ID; installers own release registration.
 - `.github/workflows/ci.yml` runs build and quality checks on macOS and Windows.
 

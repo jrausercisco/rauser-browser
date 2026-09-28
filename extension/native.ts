@@ -1,6 +1,6 @@
 import type { ErrorCode, Request, Response } from "../protocol/ts/generated.js";
+import { NATIVE_HOST_NAME } from "./brand.js";
 
-export const NATIVE_HOST_NAME = "com.rauser.browser";
 export const PROTOCOL_VERSION: Request["protocol_version"] = 2;
 
 export function newRequestId(): string {

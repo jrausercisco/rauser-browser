@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { copyFile, mkdir, rm } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { APP_NAME, FULL_NAME } from "./brand.ts";
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
 const repoDir = dirname(extensionDir);
@@ -18,11 +19,15 @@ if (result.error) throw result.error;
 if (result.status !== 0) process.exit(result.status ?? 1);
 
 await mkdir(outputDir, { recursive: true });
-for (const name of ["manifest.json", "options.html", "panel.html", "panel.css"]) {
-  await copyFile(join(extensionDir, name), join(outputDir, name));
+for (const name of ["manifest.json", "options.html", "panel.html"]) {
+  const source = await readFile(join(extensionDir, name), "utf8");
+  const branded = source.replaceAll("{{FULL_NAME}}", FULL_NAME).replaceAll("{{APP_NAME}}", APP_NAME);
+  if (branded.includes("{{")) throw new Error(`Unknown placeholder in extension/${name}`);
+  await writeFile(join(outputDir, name), branded);
 }
+await copyFile(join(extensionDir, "panel.css"), join(outputDir, "panel.css"));
 for (const name of [
-  "coordination.js", "model.js", "native.js", "options.js", "panel.js", "settings.js", "worker.js",
+  "brand.js", "coordination.js", "model.js", "native.js", "options.js", "panel.js", "settings.js", "worker.js",
 ]) {
   await copyFile(join(intermediateDir, "extension", name), join(outputDir, name));
 }

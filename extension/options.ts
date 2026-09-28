@@ -10,6 +10,7 @@ import {
   worker,
 } from "./settings.js";
 import { HostError, PROTOCOL_VERSION, newRequestId } from "./native.js";
+import { APP_NAME } from "./brand.js";
 
 const status = element<HTMLDivElement>("status");
 const folderPath = element<HTMLOutputElement>("folder-path");
@@ -293,7 +294,7 @@ function enableSite(): void {
         return;
       }
       if (!workerState.navigation_ready) {
-        show("Chrome is restarting the extension to activate the new navigation permission. Reopen Rauser settings and the side panel.", true);
+        show(`Chrome is restarting the extension to activate the new navigation permission. Reopen ${APP_NAME} settings and the side panel.`, true);
         setTimeout(() => chrome.runtime.reload(), 1_000);
         return;
       }

@@ -1,6 +1,6 @@
-# Rauser Browser
+# Rauser Browser Browsing Assistant
 
-Rauser is a local-first browser assistant designed to help people keep useful context from the pages they visit. It uses a browser sidebar, Markdown notes, an optional native host,  and local Agent Harness integrations.
+The Rauser Browser Browsing Assistant (Brauser) is a local-first browser assistant designed to help people keep useful context from the pages they visit. It uses a browser sidebar, Markdown notes, an optional native host,  and local Agent Harness integrations.
 
 ## Status
 
@@ -35,10 +35,10 @@ npm run test:extension
 
 ### Try the M1 development build
 
-1. Build the native host with `cargo build --locked -p rauser` and the extension with `npm ci --ignore-scripts && npm run build:extension`.
+1. Build the native host with `cargo build --locked -p brauser` and the extension with `npm ci --ignore-scripts && npm run build:extension`.
 2. In Google Chrome, open `chrome://extensions`, enable Developer mode, and load `extension/dist/` as an unpacked extension. Copy the extension ID shown there.
-3. Register the development host for that ID. On macOS, run `node scripts/register-dev-host.mjs YOUR_EXTENSION_ID "$(pwd)/target/debug/rauser"` after replacing `YOUR_EXTENSION_ID`. On Windows, run the same script from PowerShell with your extension ID and the absolute path to `target\debug\rauser.exe`.
-4. Open the Rauser side panel. Until setup is complete it warns that Rauser isn't set up; click the gear icon or **Open settings** to open the settings page in a tab. There, choose a notes folder, enter a site URL and path prefix, then enable the site. Chrome requests the site permission and the native host confirms the capture policy. The panel updates when settings change; it sends buffered visits, pauses capture, and creates a page note for the current permitted tab.
+3. Register the development host for that ID. On macOS, run `node scripts/register-dev-host.mjs YOUR_EXTENSION_ID "$(pwd)/target/debug/brauser"` after replacing `YOUR_EXTENSION_ID`. On Windows, run the same script from PowerShell with your extension ID and the absolute path to `target\debug\brauser.exe`.
+4. Open the Brauser side panel. Until setup is complete it warns that Brauser isn't set up; click the gear icon or **Open settings** to open the settings page in a tab. There, choose a notes folder, enter a site URL and path prefix, then enable the site. Chrome requests the site permission and the native host confirms the capture policy. The panel updates when settings change; it sends buffered visits, pauses capture, and creates a page note for the current permitted tab.
 
 If **Choose folder** is disabled and the settings page says "Native host unavailable," check that the extension ID in the native-host registration matches the ID shown on `chrome://extensions`, rebuild the host at the registered path, then reload the settings page and reopen the panel. The development host registration is per user; the guided macOS smoke run below sets up its own isolated profile automatically.
 
@@ -48,7 +48,7 @@ For a guided macOS Chrome smoke run, build both components as above, then run:
 npm run smoke:macos
 ```
 
-The runner opens an isolated Chrome profile and a localhost fixture, loads `extension/dist/` through a local Chrome DevTools pipe, and verifies Chrome can exchange a `hello` with the native host. It then drives the side panel, the settings page, and the fixture tab itself, and stops only for the steps that need a person: the macOS folder picker, Chrome's permission prompt, and Rauser's confirmation dialog. Each prompt is named in the terminal, and the runner continues on its own once it sees the answer. Choose any empty folder when asked. At the end it asks whether a busy cursor stayed on screen after a dialog. The debugging flag and pipe apply only to the disposable profile; no remote debugging port is opened. It checks the host configuration, Chrome grants, visit log, page notes, review draft, and site removal after each step. The native host uses a temporary `HOME`, and its registration lives only in the isolated Chrome profile; the runner does not change the normal Chrome host registration. It preserves its profile and notes under the printed temporary directory for inspection. Run `node scripts/smoke-macos.mjs --help` for an alternate host or Chrome binary path.
+The runner opens an isolated Chrome profile and a localhost fixture, loads `extension/dist/` through a local Chrome DevTools pipe, and verifies Chrome can exchange a `hello` with the native host. It then drives the side panel, the settings page, and the fixture tab itself, and stops only for the steps that need a person: the macOS folder picker, Chrome's permission prompt, and Brauser's confirmation dialog. Each prompt is named in the terminal, and the runner continues on its own once it sees the answer. Choose any empty folder when asked. At the end it asks whether a busy cursor stayed on screen after a dialog. The debugging flag and pipe apply only to the disposable profile; no remote debugging port is opened. It checks the host configuration, Chrome grants, visit log, page notes, review draft, and site removal after each step. The native host uses a temporary `HOME`, and its registration lives only in the isolated Chrome profile; the runner does not change the normal Chrome host registration. It preserves its profile and notes under the printed temporary directory for inspection. Run `node scripts/smoke-macos.mjs --help` for an alternate host or Chrome binary path.
 
 The development registration in step 3 changes only the current user's Chrome native-host entry. It is for development; the signed installers planned for M5 will own installation and uninstallation. A folder path previously entered directly in an M0 config must be selected again through the native picker before M1 can use it. The host backs up malformed or incompatible config files during a revision-checked repair.
 

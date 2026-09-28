@@ -9,6 +9,7 @@ import {
 } from "./model.js";
 import { ConfigSession, describe, element, leaseFor, setupProblem, worker } from "./settings.js";
 import { PROTOCOL_VERSION, newRequestId } from "./native.js";
+import { APP_NAME } from "./brand.js";
 
 const status = element<HTMLDivElement>("status");
 const settingsButton = element<HTMLButtonElement>("open-settings");
@@ -111,7 +112,7 @@ function openSettings(): void {
     // extension, but serves rebuilt pages from disk. A panel from a newer build
     // can therefore run against a manifest with no settings page.
     if (!chrome.runtime.getManifest().options_ui) {
-      show("Chrome is still running an older Rauser build. Click Reload on Rauser in chrome://extensions, then reopen this panel.", true);
+      show(`Chrome is still running an older ${APP_NAME} build. Click Reload on ${APP_NAME} in chrome://extensions, then reopen this panel.`, true);
     } else {
       show(`Could not open settings: ${describe(error)}`, true);
     }

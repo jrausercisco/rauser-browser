@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod brand;
 pub mod capture;
 pub mod config;
 pub mod consent;

@@ -8,9 +8,10 @@ import { constants } from "node:fs";
 import { access, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { APP_NAME, NATIVE_HOST_NAME } from "../extension/brand.ts";
 
-const HOST_NAME = "com.rauser.browser";
-const DESCRIPTION = "Rauser development native host";
+const HOST_NAME = NATIVE_HOST_NAME;
+const DESCRIPTION = `${APP_NAME} development native host`;
 const EXTENSION_ID = /^[a-p]{32}$/;
 
 function usage() {
@@ -34,7 +35,7 @@ await access(binary, process.platform === "darwin" ? constants.X_OK : constants.
 
 const directory = process.platform === "darwin"
   ? path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts")
-  : path.join(process.env.APPDATA ?? "", "Rauser");
+  : path.join(process.env.APPDATA ?? "", APP_NAME);
 if (!path.isAbsolute(directory)) {
   throw new Error("cannot determine the per-user application data directory");
 }
