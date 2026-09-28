@@ -4,7 +4,7 @@ Rauser is a local-first browser assistant designed to help people keep useful co
 
 ## Status
 
-M0 foundation work is underway. The repository contains a versioned native-messaging protocol, a Rust host foundation, and CI. There is no browser extension or installable release yet.
+The M0 foundation is implemented: the repository contains a versioned native-messaging protocol, a Rust host foundation, and CI for macOS and Windows. There is no browser extension or installable release yet.
 
 Read the [design specification](DESIGN.md) for the architecture, security model, planned features, and release plan.
 
