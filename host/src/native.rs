@@ -705,6 +705,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unauthorized_roots_are_refused_before_any_filesystem_probe() {
+        // An extension-supplied root is untrusted. Whether it exists must not
+        // change the answer, or the host becomes a directory-existence oracle.
+        let folder = tempfile::tempdir().unwrap();
+        let existing = folder.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let mut config = ConfigStore::for_test(folder.path().join("config.toml"));
+        let mut consent = ConsentAuthority::new();
+        for root in [existing.clone(), folder.path().join("absent")] {
+            let snapshot = ConfigSnapshot {
+                storage: Some(brauser_protocol::StorageConfig {
+                    root: root.to_string_lossy().into_owned(),
+                    profile: "neutral".into(),
+                    log_dir: "log".into(),
+                    pages_dir: "pages".into(),
+                    later_dir: "later".into(),
+                }),
+                capture_enabled: false,
+                sites: Vec::new(),
+                strip_params: Vec::new(),
+                near_repeat_secs: 300,
+            };
+            let update = dispatch(
+                Request::UpdateConfig(UpdateConfigRequest {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: "probe-update".into(),
+                    expected_revision: "missing".into(),
+                    config: snapshot.clone(),
+                    picker_token: None,
+                    consent_token: None,
+                }),
+                &mut config,
+                &mut consent,
+            );
+            let confirm = dispatch(
+                Request::ConfirmConfig(brauser_protocol::ConfirmConfigRequest {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: "probe-confirm".into(),
+                    expected_revision: "missing".into(),
+                    config: snapshot,
+                    picker_token: None,
+                }),
+                &mut config,
+                &mut consent,
+            );
+            for response in [update, confirm] {
+                match response {
+                    Response::Error(value) => assert_eq!(
+                        value.code,
+                        ErrorCode::Unauthorized,
+                        "{} for {}",
+                        value.message,
+                        root.display()
+                    ),
+                    other => panic!("expected an authorization error, got {other:?}"),
+                }
+            }
+        }
+    }
+
     fn configured_store(root: &std::path::Path) -> ConfigStore {
         let mut store = ConfigStore::for_test(root.join("config.toml"));
         let snapshot = brauser_protocol::ConfigSnapshot {

@@ -118,7 +118,9 @@ impl ConfigStore {
     }
 
     pub fn configured(&self) -> bool {
-        self.issue.is_none() && self.config.storage.is_some() && validate(&self.config).is_ok()
+        self.issue.is_none()
+            && self.config.storage.is_some()
+            && validate_persisted(&self.config).is_ok()
     }
 
     /// Replace config only when the caller's revision still matches the file.
@@ -355,7 +357,7 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
             let config: ConfigSnapshot = stored.into();
             let issue = if root_unconfirmed {
                 Some("This notes folder predates native picker confirmation. Choose it again to activate capture; the original config will be backed up.".to_owned())
-            } else if validate(&config).is_err() {
+            } else if validate_persisted(&config).is_err() {
                 Some("Configuration settings or notes folder are invalid or unavailable. Choose a notes folder and save a repair; the original config will be backed up.".to_owned())
             } else if config.storage.as_ref().is_some_and(|storage| {
                 match selected_root_identity(Path::new(&storage.root)) {
@@ -444,6 +446,11 @@ fn empty_config() -> ConfigSnapshot {
     }
 }
 
+/// Check a proposed config's shape and limits. This never touches the
+/// filesystem: an extension-supplied root is untrusted until a picker grant or
+/// the persisted identity authorizes it, so probing it here would answer
+/// whether arbitrary paths exist (and, on Windows, reach out to UNC shares).
+/// Callers open the root only after authorization; see `validate_persisted`.
 pub fn validate(config: &ConfigSnapshot) -> Result<()> {
     if config.sites.len() > MAX_SITES {
         bail!("site allowlist exceeds the 128-entry limit");
@@ -475,6 +482,15 @@ pub fn validate(config: &ConfigSnapshot) -> Result<()> {
     }
     if let Some(storage) = &config.storage {
         validate_storage(storage)?;
+    }
+    Ok(())
+}
+
+/// Validate a config the host itself persisted, including that its notes
+/// folder can be opened. Only call this for a root that is already trusted.
+fn validate_persisted(config: &ConfigSnapshot) -> Result<()> {
+    validate(config)?;
+    if let Some(storage) = &config.storage {
         Vault::open(storage).context("notes folder is unavailable")?;
     }
     Ok(())
