@@ -18,7 +18,7 @@ M0 is merged. M1 development code adds a Chrome side panel and settings page, op
 
 Run the commands in [README.md](README.md#development) before proposing a code change. The Rust version is pinned in `rust-toolchain.toml`.
 
-For end-to-end checks, use `npm run smoke:macos:headless`. It never shows a window or takes focus. Run `--auto` (real dialogs, UI scripting) only in a VM or separate session, never on the user's desktop. The general strategy, including what headless cannot prove, is in the ENDURANCE workspace's `TESTING.md` (`/Users/jrauser/ENDURANCE/TESTING.md`); update it with anything you learn here.
+For end-to-end checks, use `npm run smoke:macos:headless`. It never shows a window or takes focus. Run `--auto` (real dialogs, UI scripting) only in a VM or separate session, never on the user's desktop. The same applies to `npm run check:macos-alert` (the real alert's cancel and timeout paths), which refuses to run outside a VM without `--on-desktop`. The general strategy, including what headless cannot prove, is in the ENDURANCE workspace's `TESTING.md` (`/Users/jrauser/ENDURANCE/TESTING.md`); update it with anything you learn here.
 
 ## Security rules
 

@@ -8,6 +8,7 @@
     "test:extension": "node --test extension/tests/worker.test.mjs extension/tests/options.test.mjs extension/tests/note-editor.test.mjs",
     "smoke:macos": "node scripts/smoke-macos.mjs",
     "smoke:macos:headless": "node scripts/smoke-macos.mjs --headless",
+    "check:macos-alert": "node scripts/check-macos-alert.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0"
   },
