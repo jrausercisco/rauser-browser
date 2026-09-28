@@ -3,7 +3,7 @@
 //! block ownership and conflict detection before replacing an existing file.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -72,6 +72,87 @@ impl Vault {
         )
     }
 
+    /// Preserve a proposed change beside an existing note for manual review.
+    /// The sibling name is stable for the normalized proposal, so retrying a
+    /// lost acknowledgement cannot create an unbounded series of drafts.
+    pub fn create_review_artifact(
+        &self,
+        page_url: &str,
+        proposal_id: &str,
+        markdown: &str,
+    ) -> Result<CreatedPage> {
+        let review_name = review_filename(page_url, proposal_id)?;
+        self.create_named_with_post_publish_ops(
+            &review_name,
+            markdown,
+            |pages, name| pages.remove_file(name),
+            sync_directory,
+        )
+    }
+
+    pub fn page_relative_path(&self, page_url: &str) -> Result<PathBuf> {
+        Ok(self.pages_dir.join(page_filename(page_url)?))
+    }
+
+    pub fn review_relative_path(&self, page_url: &str, proposal_id: &str) -> Result<PathBuf> {
+        Ok(self.pages_dir.join(review_filename(page_url, proposal_id)?))
+    }
+
+    /// Read a page generated from the same canonical URL. This is used only
+    /// to distinguish an owned existing note from a filename conflict; M1
+    /// never replaces or adopts the file.
+    pub fn read_page(&self, page_url: &str) -> Result<Option<String>> {
+        let filename = page_filename(page_url)?;
+        self.read_named(&filename)
+    }
+
+    pub fn read_review_artifact(
+        &self,
+        page_url: &str,
+        proposal_id: &str,
+    ) -> Result<Option<String>> {
+        let filename = review_filename(page_url, proposal_id)?;
+        self.read_named(&filename)
+    }
+
+    fn read_named(&self, filename: &str) -> Result<Option<String>> {
+        let pages = match self.root.open_dir(&self.pages_dir) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("opening page notes directory"),
+        };
+        let metadata = match pages.symlink_metadata(filename) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("checking page note"),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("page-note name is occupied by a non-regular file");
+        }
+        if metadata.len() > MAX_NOTE_BYTES as u64 {
+            bail!("existing page note exceeds the 4 MiB read limit");
+        }
+        let mut file = pages.open(filename).context("opening page note")?;
+        let opened = file.metadata().context("checking opened page note")?;
+        if !opened.is_file() {
+            bail!("opened page note is not a regular file");
+        }
+        if opened.len() > MAX_NOTE_BYTES as u64 {
+            bail!("opened page note exceeds the 4 MiB read limit");
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((MAX_NOTE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .context("reading page note")?;
+        if bytes.len() > MAX_NOTE_BYTES {
+            bail!("existing page note exceeds the 4 MiB read limit");
+        }
+        Ok(Some(
+            String::from_utf8(bytes).context("existing page note is not UTF-8")?,
+        ))
+    }
+
     fn create_page_with_post_publish_ops<F, G>(
         &self,
         page_url: &str,
@@ -83,13 +164,29 @@ impl Vault {
         F: FnOnce(&Dir, &str) -> io::Result<()>,
         G: FnOnce(&Dir) -> io::Result<()>,
     {
+        let filename = page_filename(page_url)?;
+        self.create_named_with_post_publish_ops(&filename, markdown, remove_temporary, sync_parent)
+    }
+
+    fn create_named_with_post_publish_ops<F, G>(
+        &self,
+        filename: &str,
+        markdown: &str,
+        remove_temporary: F,
+        sync_parent: G,
+    ) -> Result<CreatedPage>
+    where
+        F: FnOnce(&Dir, &str) -> io::Result<()>,
+        G: FnOnce(&Dir) -> io::Result<()>,
+    {
         if markdown.len() > MAX_NOTE_BYTES {
             bail!("page note exceeds the 4 MiB write limit");
         }
-        let filename = page_filename(page_url)?;
         self.root
             .create_dir_all(&self.pages_dir)
             .context("creating page notes directory")?;
+        sync_directory_chain(&self.root, &self.pages_dir)
+            .context("syncing page notes parent directories")?;
         let pages = self
             .root
             .open_dir(&self.pages_dir)
@@ -113,7 +210,7 @@ impl Vault {
         // A hard link is an atomic no-clobber publication on the same volume.
         // rename() would silently replace a user file with this name.
         pages
-            .hard_link(&temporary, &pages, &filename)
+            .hard_link(&temporary, &pages, filename)
             .with_context(|| {
                 format!("page note already exists or cannot be created: {filename}")
             })?;
@@ -137,6 +234,21 @@ impl Vault {
             warnings,
         })
     }
+}
+
+fn review_filename(page_url: &str, proposal_id: &str) -> Result<String> {
+    if proposal_id.len() != 64
+        || !proposal_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("review proposal ID must be a lowercase SHA-256 digest");
+    }
+    let filename = page_filename(page_url)?;
+    let stem = filename
+        .strip_suffix(".md")
+        .context("page filename has no Markdown suffix")?;
+    Ok(format!("{stem}.rauser-review-{proposal_id}.md"))
 }
 
 fn checked_relative_dir(value: &str) -> Result<PathBuf> {
@@ -221,6 +333,16 @@ fn sync_directory(dir: &Dir) -> io::Result<()> {
 #[cfg(windows)]
 fn sync_directory(_dir: &Dir) -> io::Result<()> {
     // std does not expose a portable way to fsync a Windows directory handle.
+    Ok(())
+}
+
+fn sync_directory_chain(root: &Dir, relative: &Path) -> io::Result<()> {
+    let mut current = root.try_clone()?;
+    sync_directory(&current)?;
+    for part in relative.components() {
+        current = current.open_dir(part.as_os_str())?;
+        sync_directory(&current)?;
+    }
     Ok(())
 }
 

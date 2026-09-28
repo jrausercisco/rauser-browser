@@ -1,107 +1,323 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/jrausercisco/rauser-browser/blob/main/protocol/schema.json",
+  "$id": "https://github.com/rausified/rauser-browser/blob/main/protocol/schema.json",
   "title": "Rauser native messaging protocol",
-  "description": "Version 1 messages exchanged by the Chrome extension and native host. The host checks the version before deserializing a request so it can return an error for incompatible versions.",
+  "description": "Version 2 messages exchanged by the Chrome extension and native host. Host-owned configuration and consent tokens gate capture and writes.",
   "oneOf": [
-    { "$ref": "#/$defs/Request" },
-    { "$ref": "#/$defs/Response" }
+    {
+      "$ref": "#/$defs/Request"
+    },
+    {
+      "$ref": "#/$defs/Response"
+    }
   ],
   "$defs": {
     "Request": {
       "oneOf": [
-        { "$ref": "#/$defs/HelloRequest" },
-        { "$ref": "#/$defs/GetConfigRequest" },
-        { "$ref": "#/$defs/UpdateConfigRequest" }
+        {
+          "$ref": "#/$defs/HelloRequest"
+        },
+        {
+          "$ref": "#/$defs/GetConfigRequest"
+        },
+        {
+          "$ref": "#/$defs/UpdateConfigRequest"
+        },
+        {
+          "$ref": "#/$defs/ChooseFolderRequest"
+        },
+        {
+          "$ref": "#/$defs/ConfirmConfigRequest"
+        },
+        {
+          "$ref": "#/$defs/RecordVisitRequest"
+        },
+        {
+          "$ref": "#/$defs/CreatePageNoteRequest"
+        }
       ]
     },
     "Response": {
       "oneOf": [
-        { "$ref": "#/$defs/HelloResult" },
-        { "$ref": "#/$defs/ConfigResult" },
-        { "$ref": "#/$defs/ConfigUpdated" },
-        { "$ref": "#/$defs/ErrorResponse" }
+        {
+          "$ref": "#/$defs/HelloResult"
+        },
+        {
+          "$ref": "#/$defs/ConfigResult"
+        },
+        {
+          "$ref": "#/$defs/ConfigUpdated"
+        },
+        {
+          "$ref": "#/$defs/FolderChosen"
+        },
+        {
+          "$ref": "#/$defs/ConfigConfirmed"
+        },
+        {
+          "$ref": "#/$defs/VisitRecorded"
+        },
+        {
+          "$ref": "#/$defs/PageNoteResult"
+        },
+        {
+          "$ref": "#/$defs/ErrorResponse"
+        }
       ]
     },
     "HelloRequest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "protocol_version", "request_id"],
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id"
+      ],
       "properties": {
-        "type": { "const": "hello" },
-        "protocol_version": { "type": "integer", "const": 1 },
-        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+        "type": {
+          "const": "hello"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
       }
     },
     "GetConfigRequest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "protocol_version", "request_id"],
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id"
+      ],
       "properties": {
-        "type": { "const": "get_config" },
-        "protocol_version": { "type": "integer", "const": 1 },
-        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+        "type": {
+          "const": "get_config"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
       }
     },
     "UpdateConfigRequest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "protocol_version", "request_id", "expected_revision", "config"],
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "expected_revision",
+        "config",
+        "picker_token",
+        "consent_token"
+      ],
       "properties": {
-        "type": { "const": "update_config" },
-        "protocol_version": { "type": "integer", "const": 1 },
-        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "expected_revision": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "config": { "$ref": "#/$defs/ConfigSnapshot" }
+        "type": {
+          "const": "update_config"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expected_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "config": {
+          "$ref": "#/$defs/ConfigSnapshot"
+        },
+        "picker_token": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consent_token": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
       }
     },
     "HelloResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "protocol_version", "request_id", "host_version", "configured"],
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "host_version",
+        "configured",
+        "config_issue"
+      ],
       "properties": {
-        "type": { "const": "hello_result" },
-        "protocol_version": { "type": "integer", "const": 1 },
-        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "host_version": { "type": "string" },
-        "configured": { "type": "boolean" }
+        "type": {
+          "const": "hello_result"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "host_version": {
+          "type": "string"
+        },
+        "configured": {
+          "type": "boolean"
+        },
+        "config_issue": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
       }
     },
     "ConfigResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "protocol_version", "request_id", "revision", "config"],
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "revision",
+        "config",
+        "config_issue"
+      ],
       "properties": {
-        "type": { "const": "config_result" },
-        "protocol_version": { "type": "integer", "const": 1 },
-        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "revision": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "config": { "$ref": "#/$defs/ConfigSnapshot" }
+        "type": {
+          "const": "config_result"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "config": {
+          "$ref": "#/$defs/ConfigSnapshot"
+        },
+        "config_issue": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
       }
     },
     "ConfigUpdated": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "protocol_version", "request_id", "revision", "config"],
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "revision",
+        "config"
+      ],
       "properties": {
-        "type": { "const": "config_updated" },
-        "protocol_version": { "type": "integer", "const": 1 },
-        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "revision": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "config": { "$ref": "#/$defs/ConfigSnapshot" }
+        "type": {
+          "const": "config_updated"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "config": {
+          "$ref": "#/$defs/ConfigSnapshot"
+        }
       }
     },
     "ErrorResponse": {
       "type": "object",
       "additionalProperties": false,
       "description": "An empty request_id is allowed only when the host could not recover an ID from a malformed request.",
-      "required": ["type", "protocol_version", "request_id", "code", "message"],
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "code",
+        "message"
+      ],
       "properties": {
-        "type": { "const": "error" },
-        "protocol_version": { "type": "integer", "const": 1 },
-        "request_id": { "type": "string", "maxLength": 128 },
-        "code": { "$ref": "#/$defs/ErrorCode" },
-        "message": { "type": "string" }
+        "type": {
+          "const": "error"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string"
+        }
       }
     },
     "ErrorCode": {
@@ -114,34 +330,475 @@
         "unauthorized",
         "conflict",
         "message_too_large",
-        "internal"
+        "internal",
+        "cancelled"
       ]
     },
     "ConfigSnapshot": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["storage", "capture_enabled"],
+      "required": [
+        "storage",
+        "capture_enabled",
+        "sites",
+        "strip_params",
+        "near_repeat_secs"
+      ],
       "properties": {
         "storage": {
           "oneOf": [
-            { "$ref": "#/$defs/StorageConfig" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/StorageConfig"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
-        "capture_enabled": { "type": "boolean" }
+        "capture_enabled": {
+          "type": "boolean"
+        },
+        "sites": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/SiteConfig"
+          }
+        },
+        "strip_params": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "near_repeat_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400
+        }
       }
     },
     "StorageConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["root", "profile", "log_dir", "pages_dir", "later_dir"],
+      "required": [
+        "root",
+        "profile",
+        "log_dir",
+        "pages_dir",
+        "later_dir"
+      ],
       "properties": {
-        "root": { "type": "string", "minLength": 1 },
-        "profile": { "type": "string", "minLength": 1 },
-        "log_dir": { "type": "string", "minLength": 1 },
-        "pages_dir": { "type": "string", "minLength": 1 },
-        "later_dir": { "type": "string", "minLength": 1 }
+        "root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "log_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pages_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "later_dir": {
+          "type": "string",
+          "minLength": 1
+        }
       }
+    },
+    "ChooseFolderRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "choose_folder"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "ConfirmConfigRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "expected_revision",
+        "config",
+        "picker_token"
+      ],
+      "properties": {
+        "type": {
+          "const": "confirm_config"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expected_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "config": {
+          "$ref": "#/$defs/ConfigSnapshot"
+        },
+        "picker_token": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "RecordVisitRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "event"
+      ],
+      "properties": {
+        "type": {
+          "const": "record_visit"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "event": {
+          "$ref": "#/$defs/VisitEvent"
+        }
+      }
+    },
+    "CreatePageNoteRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "url",
+        "title",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "create_page_note"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 262144
+        }
+      }
+    },
+    "FolderChosen": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "path",
+        "picker_token"
+      ],
+      "properties": {
+        "type": {
+          "const": "folder_chosen"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "picker_token": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "ConfigConfirmed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "consent_token",
+        "summary"
+      ],
+      "properties": {
+        "type": {
+          "const": "config_confirmed"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "consent_token": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "summary": {
+          "type": "string"
+        }
+      }
+    },
+    "VisitRecorded": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "event_id",
+        "outcome",
+        "reason",
+        "relative_path"
+      ],
+      "properties": {
+        "type": {
+          "const": "visit_recorded"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "outcome": {
+          "$ref": "#/$defs/VisitOutcome"
+        },
+        "reason": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "relative_path": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "PageNoteResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "outcome",
+        "relative_path",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "page_note_result"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "outcome": {
+          "$ref": "#/$defs/PageNoteOutcome"
+        },
+        "relative_path": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "SiteConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin",
+        "path_prefix"
+      ],
+      "properties": {
+        "origin": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "path_prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
+      }
+    },
+    "VisitEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "url",
+        "title",
+        "occurred_at",
+        "incognito"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "title": {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 2048
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "occurred_at": {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 20
+        },
+        "incognito": {
+          "type": "boolean"
+        }
+      }
+    },
+    "VisitOutcome": {
+      "type": "string",
+      "enum": [
+        "persisted",
+        "suppressed",
+        "rejected",
+        "retryable"
+      ]
+    },
+    "PageNoteOutcome": {
+      "type": "string",
+      "enum": [
+        "created",
+        "already_present",
+        "conflict",
+        "created_with_warning"
+      ]
     }
   }
 }

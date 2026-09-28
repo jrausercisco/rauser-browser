@@ -5,11 +5,15 @@ use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result, bail};
 use rauser_protocol::{
-    ConfigResult, ConfigUpdated, ErrorCode, ErrorResponse, HelloResult, PROTOCOL_VERSION, Request,
-    Response,
+    ConfigConfirmed, ConfigResult, ConfigUpdated, ErrorCode, ErrorResponse, FolderChosen,
+    HelloResult, PROTOCOL_VERSION, PageNoteResult, Request, Response, VisitOutcome, VisitRecorded,
 };
 
+use crate::capture::{CaptureOutcome, CapturePolicy, CaptureStore};
 use crate::config::{self, ConfigStore};
+use crate::consent::ConsentAuthority;
+use crate::page_note;
+use crate::vault::Vault;
 
 const MAX_INBOUND_BYTES: usize = 4 * 1024 * 1024;
 // Chrome limits host-to-extension messages to 1 MiB. Leave room for the
@@ -29,6 +33,7 @@ pub fn serve_with_io<R: Read, W: Write>(
     mut output: W,
     mut config: ConfigStore,
 ) -> Result<()> {
+    let mut consent = ConsentAuthority::new();
     loop {
         let body = match read_frame(&mut input) {
             Ok(Some(body)) => body,
@@ -57,14 +62,18 @@ pub fn serve_with_io<R: Read, W: Write>(
             }
             Err(FrameError::Io(error)) => return Err(error).context("reading native message"),
         };
-        let response = dispatch_json(&body, &mut config);
+        let response = dispatch_json(&body, &mut config, &mut consent);
         write_frame(&mut output, &response)?;
     }
 }
 
 /// Read the common envelope before the version-specific request. A newer
 /// extension may add fields or message types this host cannot deserialize.
-fn dispatch_json(body: &[u8], config: &mut ConfigStore) -> Response {
+fn dispatch_json(
+    body: &[u8],
+    config: &mut ConfigStore,
+    consent: &mut ConsentAuthority,
+) -> Response {
     let envelope: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(_) => return error("", ErrorCode::InvalidRequest, "invalid request JSON"),
@@ -104,7 +113,7 @@ fn dispatch_json(body: &[u8], config: &mut ConfigStore) -> Response {
         );
     }
     match serde_json::from_slice::<Request>(body) {
-        Ok(request) => dispatch(request, config),
+        Ok(request) => dispatch(request, config, consent),
         Err(_) => error(
             id,
             ErrorCode::InvalidRequest,
@@ -119,7 +128,11 @@ fn valid_request_id(id: &str) -> bool {
         && !id.chars().any(char::is_control)
 }
 
-fn dispatch(request: Request, config: &mut ConfigStore) -> Response {
+fn dispatch(
+    request: Request,
+    config: &mut ConfigStore,
+    consent: &mut ConsentAuthority,
+) -> Response {
     let id = request.request_id();
     if !valid_request_id(id) {
         return error(
@@ -142,6 +155,7 @@ fn dispatch(request: Request, config: &mut ConfigStore) -> Response {
                 request_id: value.request_id,
                 host_version: env!("CARGO_PKG_VERSION").to_owned(),
                 configured: config.configured(),
+                config_issue: config.config_issue().map(str::to_owned),
             }),
             Err(_) => error(
                 &value.request_id,
@@ -155,6 +169,7 @@ fn dispatch(request: Request, config: &mut ConfigStore) -> Response {
                 request_id: value.request_id,
                 config: config.snapshot().clone(),
                 revision: config.revision().to_owned(),
+                config_issue: config.config_issue().map(str::to_owned),
             }),
             Err(_) => error(
                 &value.request_id,
@@ -163,6 +178,20 @@ fn dispatch(request: Request, config: &mut ConfigStore) -> Response {
             ),
         },
         Request::UpdateConfig(value) => {
+            if config.refresh().is_err() {
+                return error(
+                    &value.request_id,
+                    ErrorCode::InvalidConfig,
+                    "configuration file is unavailable",
+                );
+            }
+            if value.expected_revision != config.revision() {
+                return error(
+                    &value.request_id,
+                    ErrorCode::Conflict,
+                    "configuration changed; read it again before updating",
+                );
+            }
             if let Err(validation_error) = config::validate(&value.config) {
                 return error(
                     &value.request_id,
@@ -170,13 +199,37 @@ fn dispatch(request: Request, config: &mut ConfigStore) -> Response {
                     &validation_error.to_string(),
                 );
             }
+            let previous = config.snapshot().clone();
+            let previous_revision = config.revision().to_owned();
+            if let Err(authority_error) = consent.authorize_update(
+                &previous,
+                &previous_revision,
+                &value.config,
+                value.picker_token.as_deref(),
+                value.consent_token.as_deref(),
+            ) {
+                return error(
+                    &value.request_id,
+                    ErrorCode::Unauthorized,
+                    &authority_error.to_string(),
+                );
+            }
             match config.update(value.config.clone(), &value.expected_revision) {
-                Ok(Some(revision)) => Response::ConfigUpdated(ConfigUpdated {
-                    protocol_version: PROTOCOL_VERSION,
-                    request_id: value.request_id,
-                    config: value.config,
-                    revision,
-                }),
+                Ok(Some(revision)) => {
+                    consent.consume_update(
+                        &previous,
+                        &previous_revision,
+                        &value.config,
+                        value.picker_token.as_deref(),
+                        value.consent_token.as_deref(),
+                    );
+                    Response::ConfigUpdated(ConfigUpdated {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id: value.request_id,
+                        config: value.config,
+                        revision,
+                    })
+                }
                 Ok(None) => error(
                     &value.request_id,
                     ErrorCode::Conflict,
@@ -189,6 +242,218 @@ fn dispatch(request: Request, config: &mut ConfigStore) -> Response {
                 ),
             }
         }
+        Request::ChooseFolder(value) => {
+            if config.refresh().is_err() {
+                return error(
+                    &value.request_id,
+                    ErrorCode::InvalidConfig,
+                    "configuration file is unavailable",
+                );
+            }
+            match consent.choose_folder(config.revision()) {
+                Ok(Some(chosen)) => Response::FolderChosen(FolderChosen {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: value.request_id,
+                    path: chosen.path,
+                    picker_token: chosen.picker_token,
+                }),
+                Ok(None) => error(
+                    &value.request_id,
+                    ErrorCode::Cancelled,
+                    "folder selection was canceled",
+                ),
+                Err(_) => error(
+                    &value.request_id,
+                    ErrorCode::Internal,
+                    "could not open the folder picker",
+                ),
+            }
+        }
+        Request::ConfirmConfig(value) => {
+            if config.refresh().is_err() {
+                return error(
+                    &value.request_id,
+                    ErrorCode::InvalidConfig,
+                    "configuration file is unavailable",
+                );
+            }
+            if value.expected_revision != config.revision() {
+                return error(
+                    &value.request_id,
+                    ErrorCode::Conflict,
+                    "configuration changed; read it again before confirming",
+                );
+            }
+            if let Err(validation_error) = config::validate(&value.config) {
+                return error(
+                    &value.request_id,
+                    ErrorCode::InvalidConfig,
+                    &validation_error.to_string(),
+                );
+            }
+            match consent.confirm_config(
+                config.snapshot(),
+                config.revision(),
+                &value.config,
+                value.picker_token.as_deref(),
+            ) {
+                Ok(Some(confirmed)) => Response::ConfigConfirmed(ConfigConfirmed {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: value.request_id,
+                    consent_token: confirmed.consent_token,
+                    summary: confirmed.summary,
+                }),
+                Ok(None) => error(
+                    &value.request_id,
+                    ErrorCode::Cancelled,
+                    "configuration confirmation was canceled",
+                ),
+                Err(authority_error) => error(
+                    &value.request_id,
+                    ErrorCode::Unauthorized,
+                    &authority_error.to_string(),
+                ),
+            }
+        }
+        Request::RecordVisit(value) => record_visit(value, config),
+        Request::CreatePageNote(value) => create_page_note(value, config),
+    }
+}
+
+fn record_visit(value: rauser_protocol::RecordVisitRequest, config: &mut ConfigStore) -> Response {
+    let event_id = value.event.event_id.clone();
+    if event_id.len() > 64 {
+        return error(
+            &value.request_id,
+            ErrorCode::InvalidRequest,
+            "event_id is too long",
+        );
+    }
+    let retryable = |reason: &str| {
+        Response::VisitRecorded(VisitRecorded {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: value.request_id.clone(),
+            event_id: event_id.clone(),
+            outcome: VisitOutcome::Retryable,
+            reason: Some(reason.to_owned()),
+            relative_path: None,
+        })
+    };
+    if config.refresh().is_err() || config.config_issue().is_some() {
+        return retryable("configuration is unavailable or needs repair");
+    }
+    if !config.snapshot().capture_enabled {
+        return Response::VisitRecorded(VisitRecorded {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: value.request_id,
+            event_id,
+            outcome: VisitOutcome::Suppressed,
+            reason: Some("capture_disabled".into()),
+            relative_path: None,
+        });
+    }
+    let Some(storage) = config.snapshot().storage.as_ref() else {
+        return retryable("choose a notes folder before capture");
+    };
+    let store = match CaptureStore::open(storage) {
+        Ok(store) => store,
+        Err(_) => return retryable("notes folder is unavailable"),
+    };
+    let policy = CapturePolicy {
+        enabled: config.snapshot().capture_enabled,
+        sites: &config.snapshot().sites,
+        strip_params: &config.snapshot().strip_params,
+        near_repeat_secs: u64::from(config.snapshot().near_repeat_secs),
+    };
+    let (outcome, reason, relative_path) = match store.record(policy, &value.event) {
+        CaptureOutcome::Persisted { relative_path } => (
+            VisitOutcome::Persisted,
+            None,
+            Some(relative_path.to_string_lossy().into_owned()),
+        ),
+        CaptureOutcome::Suppressed { reason } => (VisitOutcome::Suppressed, Some(reason), None),
+        CaptureOutcome::Rejected { reason } => (VisitOutcome::Rejected, Some(reason), None),
+        CaptureOutcome::Retryable { message } => (VisitOutcome::Retryable, Some(message), None),
+    };
+    Response::VisitRecorded(VisitRecorded {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: value.request_id,
+        event_id,
+        outcome,
+        reason,
+        relative_path,
+    })
+}
+
+fn create_page_note(
+    value: rauser_protocol::CreatePageNoteRequest,
+    config: &mut ConfigStore,
+) -> Response {
+    if config.refresh().is_err() || config.config_issue().is_some() {
+        return error(
+            &value.request_id,
+            ErrorCode::InvalidConfig,
+            "configuration is unavailable or needs repair",
+        );
+    }
+    let Some(storage) = config.snapshot().storage.as_ref() else {
+        return error(
+            &value.request_id,
+            ErrorCode::NotConfigured,
+            "choose a notes folder first",
+        );
+    };
+    match crate::capture::url_allowed(&value.url, &config.snapshot().sites) {
+        Ok(true) => {}
+        Ok(false) => {
+            return error(
+                &value.request_id,
+                ErrorCode::Unauthorized,
+                "site is not enabled",
+            );
+        }
+        Err(_) => {
+            return error(
+                &value.request_id,
+                ErrorCode::InvalidRequest,
+                "page URL is invalid",
+            );
+        }
+    }
+    let canonical = match crate::capture::canonical_url(&value.url, &config.snapshot().strip_params)
+    {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            return error(
+                &value.request_id,
+                ErrorCode::InvalidRequest,
+                "page URL is invalid",
+            );
+        }
+    };
+    let vault = match Vault::open(storage) {
+        Ok(vault) => vault,
+        Err(_) => {
+            return error(
+                &value.request_id,
+                ErrorCode::Internal,
+                "notes folder is unavailable",
+            );
+        }
+    };
+    match page_note::create_page_note(&vault, &canonical, &value.title, &value.body) {
+        Ok(result) => Response::PageNoteResult(PageNoteResult {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: value.request_id,
+            outcome: result.outcome,
+            relative_path: result.relative_path,
+            message: result.message,
+        }),
+        Err(_) => error(
+            &value.request_id,
+            ErrorCode::Internal,
+            "could not create page note",
+        ),
     }
 }
 
@@ -269,6 +534,9 @@ mod tests {
         let snapshot = ConfigSnapshot {
             storage: None,
             capture_enabled: false,
+            sites: Vec::new(),
+            strip_params: vec!["utm_*".into(), "fbclid".into(), "gclid".into()],
+            near_repeat_secs: 300,
         };
         let requests = [
             Request::GetConfig(GetConfigRequest {
@@ -280,6 +548,8 @@ mod tests {
                 request_id: "write-1".into(),
                 expected_revision: "missing".into(),
                 config: snapshot.clone(),
+                picker_token: None,
+                consent_token: None,
             }),
             Request::GetConfig(GetConfigRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -290,6 +560,8 @@ mod tests {
                 request_id: "write-stale".into(),
                 expected_revision: "missing".into(),
                 config: snapshot,
+                picker_token: None,
+                consent_token: None,
             }),
         ];
         let input: Vec<u8> = requests.into_iter().flat_map(encoded_request).collect();

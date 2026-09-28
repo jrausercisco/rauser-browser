@@ -41,6 +41,8 @@ jobs:
         run: npm run typecheck
       - name: Lint TypeScript
         run: npm run lint
+      - name: Build unpacked Chrome extension
+        run: npm run build:extension
       - name: Audit npm lockfile
         run: npm audit --audit-level=high
 

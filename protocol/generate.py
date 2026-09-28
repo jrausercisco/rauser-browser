@@ -41,14 +41,16 @@ def words_to_pascal(value: str) -> str:
 def shape_type(shape: dict, target: str) -> str:
     if "$ref" in shape:
         return ref_name(shape)
+    if shape.get("type") == "array":
+        item = shape.get("items")
+        if not isinstance(item, dict):
+            fail(f"unsupported array item: {shape!r}")
+        inner = shape_type(item, target)
+        return f"Vec<{inner}>" if target == "rust" else f"{inner}[]"
     if "oneOf" in shape:
         alternatives = shape["oneOf"]
-        if (
-            len(alternatives) == 2
-            and "$ref" in alternatives[0]
-            and alternatives[1] == {"type": "null"}
-        ):
-            inner = ref_name(alternatives[0])
+        if len(alternatives) == 2 and alternatives[1] == {"type": "null"}:
+            inner = shape_type(alternatives[0], target)
             return f"Option<{inner}>" if target == "rust" else f"{inner} | null"
         fail(f"unsupported union: {shape!r}")
     if "const" in shape:

@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Rauser Browser (M1 development)",
+  "version": "0.1.0",
+  "description": "Private, local browsing notes. Development build; requires a registered Rauser native host.",
+  "minimum_chrome_version": "114",
+  "incognito": "not_allowed",
+  "permissions": ["sidePanel", "nativeMessaging", "storage"],
+  "optional_permissions": ["webNavigation"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "action": {
+    "default_title": "Open Rauser"
+  },
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "background": {
+    "service_worker": "worker.js",
+    "type": "module"
+  }
+}
