@@ -1,6 +1,6 @@
 # Rauser Browser
 
-Rauser is a local-first browser assistant designed to help people keep useful context from the pages they visit. The design describes an optional native host, a browser sidebar, Markdown notes, and local AI integrations.
+Rauser is a local-first browser assistant designed to help people keep useful context from the pages they visit. It uses a browser sidebar, Markdown notes, an optional native host,  and local Agent Harness integrations.
 
 ## Status
 
