@@ -75,8 +75,11 @@ function updateControls(): void {
   const connected = session.connected;
   const config = session.config;
   const state = session.status;
-  pauseButton.disabled = !connected || changing() || config?.capture_enabled !== true;
-  replayButton.disabled = !connected || changing() || config?.capture_enabled !== true ||
+  // While the host configuration needs repair, the host accepts no save or
+  // visit, so pausing and sending wait for the repair in settings.
+  const repairing = session.configIssue !== null;
+  pauseButton.disabled = !connected || changing() || repairing || config?.capture_enabled !== true;
+  replayButton.disabled = !connected || changing() || repairing || config?.capture_enabled !== true ||
     state?.pause_pending === true || (state?.queued ?? 0) === 0;
   discardButton.disabled = changing() || (state?.queued ?? 0) === 0;
   dismissButton.disabled = changing() || !state || (!state.last_error &&
@@ -91,7 +94,8 @@ function renderSetupWarning(): void {
 
 function renderQueue(state: WorkerStatus): void {
   queueSummary.textContent = `${state.queued} pending visit${state.queued === 1 ? "" : "s"}.`;
-  const captureOn = session.config?.capture_enabled === true && state.pause_pending !== true;
+  const captureOn = session.config?.capture_enabled === true && session.configIssue === null &&
+    state.pause_pending !== true;
   captureStripSummary.textContent =
     `${captureOn ? "●" : "○"} Capture ${captureOn ? "on" : "off"} · ${state.queued} pending`;
   const messages: string[] = [];
@@ -153,7 +157,7 @@ async function reloadConfig(): Promise<void> {
   else show(session.config!.capture_enabled
     ? "Capture is enabled for the listed sites."
     : "Capture is off.");
-  if (session.status?.pause_pending && session.config?.capture_enabled) {
+  if (session.status?.pause_pending && session.config?.capture_enabled && !session.configIssue) {
     show("Capture is paused locally. Use Pause capture to finish saving this setting in the host.", true);
   }
 }
@@ -183,7 +187,7 @@ function scheduleReload(): void {
 }
 
 async function replayVisits(): Promise<void> {
-  if (closed || changing() || !session.config?.capture_enabled) return;
+  if (closed || changing() || !session.config?.capture_enabled || session.configIssue) return;
   replaying = true;
   updateControls();
   try {
@@ -265,7 +269,7 @@ async function panelTick(): Promise<void> {
 }
 
 async function pauseCapture(): Promise<void> {
-  if (!session.config) return;
+  if (!session.config || session.configIssue) return;
   busy = true;
   updateControls();
   try {

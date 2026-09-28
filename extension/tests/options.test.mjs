@@ -103,6 +103,8 @@ function install({ sites = [SITE], grants = [], storage = {}, host = {}, workerS
           type: "config_result", revision: String(state.revision), config: state.config,
           config_issue: state.configIssue,
         };
+      case "choose_folder":
+        return { type: "folder_chosen", path: "/vault", picker_token: `picker-${state.connects}` };
       case "confirm_config":
         return { type: "config_confirmed", consent_token: "consent", summary: "summary" };
       case "update_config":
@@ -129,9 +131,13 @@ function install({ sites = [SITE], grants = [], storage = {}, host = {}, workerS
       reload() {},
       connectNative() {
         const messageListeners = [];
+        const disconnectListeners = [];
+        // The test can end this host process as Chrome would report it.
+        state.exitHost = () => { for (const listener of disconnectListeners) listener(); };
+        state.connects = (state.connects ?? 0) + 1;
         return {
           onMessage: { addListener(listener) { messageListeners.push(listener); } },
-          onDisconnect: { addListener() {} },
+          onDisconnect: { addListener(listener) { disconnectListeners.push(listener); } },
           postMessage(request) {
             setTimeout(() => {
               const reply = hostReply(request);
@@ -300,4 +306,70 @@ test("the panel's recorded notes origins survive until Chrome drops the grant", 
   assert.deepEqual(state.storage.get(NOTE_ORIGINS_KEY), [SITE.origin, "https://b.com"]);
   await pruneNoteOrigins();
   assert.deepEqual([...await noteOrigins()], [SITE.origin]);
+});
+
+const FOLDER_ISSUE = "The selected notes folder is unavailable or changed. Choose it again.";
+
+test("a kept config with a folder issue needs a new folder pick before any save", async () => {
+  const state = install({ grants: ["webNavigation", PATTERN] });
+  state.configIssue = FOLDER_ISSUE;
+  await openSettings();
+  assert.match(statusText(), /needs repair/);
+  const [remove] = env.elements.get("sites-list").querySelectorAll("button");
+  assert.equal(remove.disabled, true);
+  assert.equal(env.elements.get("pause-capture").disabled, true);
+  env.elements.get("site-url").value = "https://b.com";
+  env.elements.get("site-url").dispatch("input");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(env.elements.get("enable-site").disabled, true);
+
+  env.elements.get("choose-folder").click();
+  await until(() => statusText().startsWith("Folder selected") && idle(), "the folder pick");
+  await until(() => !env.elements.get("enable-site").disabled, "Enable after the folder pick");
+});
+
+test("a canceled repair still rolls back the Chrome grants it added", async () => {
+  const state = install({
+    grants: ["webNavigation", PATTERN],
+    host: {
+      confirm_config: () => ({ type: "error", code: "cancelled", message: "The user canceled" }),
+    },
+  });
+  state.configIssue = FOLDER_ISSUE;
+  await openSettings();
+  env.elements.get("choose-folder").click();
+  await until(() => statusText().startsWith("Folder selected") && idle(), "the folder pick");
+  await typeSite("https://b.com");
+  env.elements.get("enable-site").click();
+  await until(() => statusText().startsWith("Setup failed") && idle(), "the canceled setup");
+  await until(() => !state.grants.has("https://b.com:443/*"), "the new origin grant to be rolled back");
+  assert.equal(state.grants.has("webNavigation"), true);
+  assert.equal(state.grants.has(PATTERN), true);
+});
+
+test("a host restart drops a folder selection only the old host knew", async () => {
+  const state = install({
+    sites: [],
+    host: {
+      update_config: (request, current) => request.picker_token !== `picker-${current.connects}`
+        ? { type: "error", code: "unauthorized", message: "folder selection token is unknown" }
+        : null,
+    },
+  });
+  state.config = { ...state.config, storage: null };
+  await openSettings();
+  env.elements.get("choose-folder").click();
+  await until(() => statusText().startsWith("Folder selected") && idle(), "the folder pick");
+  await typeSite("https://a.com");
+
+  state.exitHost();
+  assert.match(statusText(), /Choose the folder again/);
+  assert.equal(env.elements.get("folder-path").textContent, "None selected");
+  assert.equal(env.elements.get("enable-site").disabled, true);
+
+  env.elements.get("choose-folder").click();
+  await until(() => statusText().startsWith("Folder selected") && idle(), "the second folder pick");
+  await until(() => !env.elements.get("enable-site").disabled, "Enable after the second pick");
+  env.elements.get("enable-site").click();
+  await until(() => statusText().startsWith("Capture enabled") && idle(), "setup to finish");
 });

@@ -107,6 +107,7 @@ export class HostClient {
   private port: ChromePort | null = null;
   private readonly pending = new Map<string, Pending>();
   private readonly listeners: Array<() => void> = [];
+  private readonly exitListeners: Array<() => void> = [];
   private disposed = false;
   // Whether the current port has delivered any frame.
   private answered = false;
@@ -130,6 +131,15 @@ export class HostClient {
   /** Call `listener` whenever {@link connected} may have changed. */
   onStateChange(listener: () => void): void {
     this.listeners.push(listener);
+  }
+
+  /**
+   * Call `listener` when a host process's port closes on its own. Any state
+   * that process held, such as a folder selection token, is gone; the next
+   * call starts a new process.
+   */
+  onHostExit(listener: () => void): void {
+    this.exitListeners.push(listener);
   }
 
   async call<K extends Exclude<Response["type"], "error">>(
@@ -256,6 +266,7 @@ export class HostClient {
     this.port = null;
     const detail = chrome.runtime.lastError?.message ?? "Native host disconnected";
     this.rejectAll(new HostError("disconnected", detail));
+    for (const listener of this.exitListeners) listener();
     this.notify();
   }
 

@@ -37,6 +37,16 @@ let preflight: {
 // save, from this page or another, makes a pending selection unusable.
 const session = new ConfigSession(renderConfig, () => { picker = null; });
 
+// A folder selection's token lives only in the host process that issued it.
+// After that process exits, the next call starts a new one that would refuse
+// the token, so the folder must be chosen again.
+session.host.onHostExit(() => {
+  if (!picker) return;
+  picker = null;
+  renderConfig();
+  show("The native host restarted, so the folder selection was lost. Choose the folder again.", true);
+});
+
 function show(message: string, warning = false): void {
   status.textContent = message;
   status.classList.toggle("warning", warning);
@@ -49,14 +59,26 @@ function showConfigState(): void {
   else show("Capture is enabled for the listed sites.");
 }
 
+/**
+ * Whether a save must carry a fresh folder selection. The host keeps the
+ * settings of a config whose folder is missing or changed, but it accepts no
+ * save based on that folder until it is chosen again through the picker.
+ */
+function needsFolderPick(): boolean {
+  return !session.config?.storage || session.configIssue !== null;
+}
+
 function updateControls(): void {
   const connected = session.connected;
+  // Only a save with a new folder selection can succeed while the host
+  // configuration needs repair, so Pause and Remove wait for that repair.
+  const repairing = session.configIssue !== null;
   chooseFolderButton.disabled = !connected || busy;
   enableButton.disabled = !connected || busy || preflight === null ||
-    (!picker && !session.config?.storage);
-  pauseButton.disabled = !connected || busy || session.config?.capture_enabled !== true;
+    (!picker && needsFolderPick());
+  pauseButton.disabled = !connected || busy || repairing || session.config?.capture_enabled !== true;
   for (const button of sitesList.querySelectorAll("button")) {
-    button.disabled = !connected || busy;
+    button.disabled = !connected || busy || repairing;
   }
 }
 
@@ -96,7 +118,7 @@ async function reloadConfig(): Promise<void> {
   await session.reload();
   void refreshPreflight();
   showConfigState();
-  if (session.status?.pause_pending && session.config?.capture_enabled) {
+  if (session.status?.pause_pending && session.config?.capture_enabled && !session.configIssue) {
     show("Capture is paused locally. Use Pause capture to finish saving this setting in the host.", true);
   }
 }
@@ -190,10 +212,11 @@ async function rollbackNewPermissions(grant: {
   origin: string; pattern: string; apiGranted: boolean; originGranted: boolean;
 }): Promise<void> {
   if (grant.originGranted && grant.apiGranted) return;
+  // Each grant removed here was absent before this click, so nothing saved
+  // before it relied on it. That holds while the host configuration needs
+  // repair too: a kept config lists its sites, and an unusable one has none
+  // that capture could use.
   const latest = await session.readHostConfig();
-  if (latest.config_issue) {
-    throw new Error("The host configuration needs repair; review Chrome access in extension settings");
-  }
   const removals: Promise<boolean>[] = [];
   if (!grant.originGranted && !latest.config.sites.some((site) => site.origin === grant.origin) &&
       !(await noteOrigins()).has(grant.origin)) {
@@ -220,8 +243,10 @@ function enableSite(): void {
     show("Finish removing this site from the host before enabling it again.", true);
     return;
   }
-  if (!picker && !currentConfig.storage) {
-    show("Choose a notes folder first.", true);
+  if (!picker && needsFolderPick()) {
+    show(session.configIssue
+      ? "Choose the notes folder again to repair the host configuration."
+      : "Choose a notes folder first.", true);
     return;
   }
   if (!navigator.locks?.request) {
@@ -328,7 +353,7 @@ function enableSite(): void {
 }
 
 async function pauseCapture(): Promise<void> {
-  if (!session.config) return;
+  if (!session.config || session.configIssue) return;
   busy = true;
   updateControls();
   try {
@@ -345,7 +370,7 @@ async function pauseCapture(): Promise<void> {
 
 async function removeSite(site: SiteConfig): Promise<void> {
   const baseConfig = session.config;
-  if (busy || !baseConfig || !session.revision ||
+  if (busy || !baseConfig || !session.revision || session.configIssue ||
       !baseConfig.sites.some((entry) => sameSite(entry, site))) return;
   busy = true;
   updateControls();

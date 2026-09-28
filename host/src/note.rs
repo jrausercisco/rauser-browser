@@ -23,6 +23,12 @@ const MAX_TITLE_BYTES: usize = 2048;
 /// `fits_in_response` catches those exactly. The schema and the panel's
 /// textarea cap the body at 98304 characters, at most four bytes each.
 const MAX_BODY_BYTES: usize = 384 * 1024;
+/// A body is also refused, on save and on load, above this many UTF-16 code
+/// units: the panel textarea's `maxlength`, which counts UTF-16 units, and the
+/// schema's `maxLength`, which counts code points (never more than the UTF-16
+/// count). A longer body loaded into the panel would break the protocol
+/// contract, and Chrome would refuse every keystroke that lengthened it.
+const MAX_BODY_UTF16_UNITS: usize = 98_304;
 /// Room left in a note response for everything but the title and body: the
 /// type tag, a request ID of at most 128 characters (512 bytes escaped), the
 /// revision, and the field names.
@@ -91,7 +97,7 @@ pub fn load_note(vault: &Vault, canonical_url: &str) -> Result<LoadedNote, NoteR
         }),
         Some(contents) => {
             let parsed = parse_owned_note(canonical_url, &contents).ok_or_else(not_owned)?;
-            if !fits_in_response(&parsed.title, &parsed.body) {
+            if !body_fits_panel(&parsed.body) || !fits_in_response(&parsed.title, &parsed.body) {
                 return Err(too_large_on_disk());
             }
             Ok(LoadedNote {
@@ -111,7 +117,7 @@ pub fn save_note(
     body: &str,
     expected_revision: &str,
 ) -> Result<SaveOutcome, NoteRequestError> {
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > MAX_BODY_BYTES || !body_fits_panel(body) {
         return Err(NoteRequestError::TooLarge(
             "note is too long to save".into(),
         ));
@@ -126,7 +132,7 @@ pub fn save_note(
     };
     if expected_revision != current_revision {
         if let Some(note) = &parsed
-            && !fits_in_response(&note.title, &note.body)
+            && (!body_fits_panel(&note.body) || !fits_in_response(&note.title, &note.body))
         {
             return Err(too_large_on_disk());
         }
@@ -208,6 +214,13 @@ fn too_large_on_disk() -> NoteRequestError {
     NoteRequestError::TooLarge(
         "this page's note is too large to open here; edit it in your notes folder".into(),
     )
+}
+
+/// Whether the panel can hold this body within its textarea's `maxlength`,
+/// which also keeps it within the schema's `maxLength`.
+fn body_fits_panel(body: &str) -> bool {
+    // A UTF-8 byte is at most one UTF-16 unit, so short bodies need no count.
+    body.len() <= MAX_BODY_UTF16_UNITS || body.encode_utf16().count() <= MAX_BODY_UTF16_UNITS
 }
 
 /// Whether a response echoing this title and body fits in one native message,
@@ -536,7 +549,7 @@ mod tests {
     fn the_largest_accepted_note_fits_in_one_response() {
         let (_root, vault) = vault();
         // Quotes are the worst ordinary escape (two bytes each).
-        let body = "\"".repeat(MAX_BODY_BYTES);
+        let body = "\"".repeat(MAX_BODY_UTF16_UNITS);
         let title = "\"".repeat(MAX_TITLE_BYTES);
         assert!(matches!(
             save_note(&vault, "https://example.com/a", &title, &body, "missing"),
@@ -593,12 +606,23 @@ mod tests {
             save_note(&vault, "https://example.com/a", "T", &over, "missing"),
             Err(NoteRequestError::TooLarge(_))
         ));
-        // Within the byte limit, but each control character escapes to six
-        // bytes, so the response to a later load could not be sent.
-        let controls = "\u{1}".repeat(MAX_BODY_BYTES);
+        // Within the byte limit, but longer than the panel's textarea allows.
+        let over_panel = "a".repeat(MAX_BODY_UTF16_UNITS + 1);
         assert!(matches!(
-            save_note(&vault, "https://example.com/a", "T", &controls, "missing"),
+            save_note(&vault, "https://example.com/a", "T", &over_panel, "missing"),
             Err(NoteRequestError::TooLarge(_))
+        ));
+        // Astral characters are two UTF-16 units each, as the textarea counts.
+        let astral = "\u{1F600}".repeat(MAX_BODY_UTF16_UNITS / 2 + 1);
+        assert!(astral.len() <= MAX_BODY_BYTES);
+        assert!(matches!(
+            save_note(&vault, "https://example.com/a", "T", &astral, "missing"),
+            Err(NoteRequestError::TooLarge(_))
+        ));
+        let at_limit = "a".repeat(MAX_BODY_UTF16_UNITS);
+        assert!(matches!(
+            save_note(&vault, "https://example.com/b", "T", &at_limit, "missing"),
+            Ok(SaveOutcome::Saved { .. })
         ));
         assert!(!load_note(&vault, "https://example.com/a").unwrap().exists);
     }
@@ -619,6 +643,29 @@ mod tests {
             Err(NoteRequestError::TooLarge(_))
         ));
         // A stale save would echo the note back; that must be refused too.
+        assert!(matches!(
+            save_note(&vault, url, "T", "new", "missing"),
+            Err(NoteRequestError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn a_note_grown_past_the_panel_limit_outside_the_panel_is_refused() {
+        // Well within the byte and response limits, but longer than the
+        // schema and the textarea allow.
+        let (root, vault) = vault();
+        let url = "https://example.com/a";
+        save_note(&vault, url, "T", "small", "missing").unwrap();
+        let full = root.path().join(vault.page_relative_path(url).unwrap());
+        let grown = std::fs::read_to_string(&full)
+            .unwrap()
+            .replace("small", &"x".repeat(150_000));
+        std::fs::write(&full, grown).unwrap();
+
+        assert!(matches!(
+            load_note(&vault, url),
+            Err(NoteRequestError::TooLarge(_))
+        ));
         assert!(matches!(
             save_note(&vault, url, "T", "new", "missing"),
             Err(NoteRequestError::TooLarge(_))

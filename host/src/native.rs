@@ -152,34 +152,29 @@ fn dispatch(
         );
     }
     match request {
-        Request::Hello(value) => match config.refresh() {
-            Ok(()) => Response::HelloResult(HelloResult {
+        // An unreadable config file leaves the store inert with an issue.
+        // Report that state instead of an error: the extension treats a
+        // failed hello as a missing host, and the issue says how to repair.
+        Request::Hello(value) => {
+            let _ = config.refresh();
+            Response::HelloResult(HelloResult {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: value.request_id,
                 host_version: env!("CARGO_PKG_VERSION").to_owned(),
                 configured: config.configured(),
                 config_issue: config.config_issue().map(str::to_owned),
-            }),
-            Err(_) => error(
-                &value.request_id,
-                ErrorCode::InvalidConfig,
-                "configuration file is invalid or unavailable",
-            ),
-        },
-        Request::GetConfig(value) => match config.refresh() {
-            Ok(()) => Response::ConfigResult(ConfigResult {
+            })
+        }
+        Request::GetConfig(value) => {
+            let _ = config.refresh();
+            Response::ConfigResult(ConfigResult {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: value.request_id,
                 config: config.snapshot().clone(),
                 revision: config.revision().to_owned(),
                 config_issue: config.config_issue().map(str::to_owned),
-            }),
-            Err(_) => error(
-                &value.request_id,
-                ErrorCode::InvalidConfig,
-                "configuration file is invalid or unavailable",
-            ),
-        },
+            })
+        }
         Request::UpdateConfig(value) => {
             if config.refresh().is_err() {
                 return error(
@@ -597,6 +592,67 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_config_answers_hello_and_get_config_with_its_issue() {
+        // The extension treats a failed hello as a missing host, so an
+        // unreadable config must still answer hello and report the repair.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+        let config = ConfigStore::for_test(path);
+        let requests = [
+            Request::Hello(HelloRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "hello".into(),
+            }),
+            Request::GetConfig(GetConfigRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "read".into(),
+            }),
+            Request::UpdateConfig(UpdateConfigRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "write".into(),
+                expected_revision: "unreadable".into(),
+                config: ConfigSnapshot {
+                    storage: None,
+                    capture_enabled: false,
+                    sites: Vec::new(),
+                    strip_params: Vec::new(),
+                    near_repeat_secs: 300,
+                },
+                picker_token: None,
+                consent_token: None,
+            }),
+        ];
+        let input: Vec<u8> = requests.into_iter().flat_map(encoded_request).collect();
+        let mut output = Vec::new();
+        serve_with_io(Cursor::new(input), &mut output, config).unwrap();
+        let mut reader = Cursor::new(output);
+        let mut responses = Vec::new();
+        while let Some(body) = read_frame(&mut reader).unwrap() {
+            responses.push(serde_json::from_slice::<Response>(&body).unwrap());
+        }
+        match &responses[0] {
+            Response::HelloResult(value) => {
+                assert!(!value.configured);
+                assert!(value.config_issue.is_some());
+            }
+            other => panic!("expected hello_result, got {other:?}"),
+        }
+        match &responses[1] {
+            Response::ConfigResult(value) => {
+                assert!(value.config.storage.is_none());
+                assert!(value.config.sites.is_empty());
+                assert!(value.config_issue.is_some());
+            }
+            other => panic!("expected config_result, got {other:?}"),
+        }
+        match &responses[2] {
+            Response::Error(value) => assert_eq!(value.code, ErrorCode::InvalidConfig),
+            other => panic!("expected invalid_config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn config_revision_round_trips_and_rejects_a_stale_update() {
         let folder = tempfile::tempdir().unwrap();
         let config = ConfigStore::for_test(folder.path().join("config.toml"));
@@ -871,8 +927,9 @@ mod tests {
         let notes = folder.path().join("notes");
         std::fs::create_dir(&notes).unwrap();
         let config = configured_store(&notes);
-        // 384 KiB of quotes: the byte limit, and twice that once escaped.
-        let body = "\"".repeat(384 * 1024);
+        // 98304 quotes, the panel's and the schema's limit, which double
+        // once escaped.
+        let body = "\"".repeat(98_304);
         let requests = [
             save_request("save-1", &body, "missing"),
             load_request("load-1"),

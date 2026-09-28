@@ -82,15 +82,27 @@ impl ConfigStore {
             // answers invalid_config until the file is readable again.
             Err(error) => {
                 eprintln!("{NAMESPACE}: warning: configuration is unreadable: {error:#}");
-                Self {
+                let mut store = Self {
                     path,
                     config: empty_config(),
-                    revision: UNREADABLE_REVISION.into(),
-                    issue: Some("The configuration file cannot be read or is not a regular file. Fix or remove it, then reload this page.".into()),
+                    revision: String::new(),
+                    issue: None,
                     root_identity: None,
-                }
+                };
+                store.become_inert();
+                store
             }
         }
+    }
+
+    /// Forget the last readable config. `hello` and `get_config` report this
+    /// state with its issue, so the extension can tell the user to repair the
+    /// file; every other request refuses with invalid_config.
+    fn become_inert(&mut self) {
+        self.config = empty_config();
+        self.revision = UNREADABLE_REVISION.into();
+        self.issue = Some("The configuration file cannot be read or is not a regular file. Fix or remove it, then reload this page.".into());
+        self.root_identity = None;
     }
 
     /// Best-effort startup cleanup of temporaries a killed host left behind,
@@ -149,8 +161,16 @@ impl ConfigStore {
         self.issue.as_deref()
     }
 
+    /// Re-read config.toml. On failure the store becomes inert rather than
+    /// keeping a policy the file no longer supports.
     pub fn refresh(&mut self) -> Result<()> {
-        let state = read_disk_state(&self.path)?;
+        let state = match read_disk_state(&self.path) {
+            Ok(state) => state,
+            Err(error) => {
+                self.become_inert();
+                return Err(error);
+            }
+        };
         self.config = state.config;
         self.revision = state.revision;
         self.issue = state.issue;
@@ -1018,6 +1038,25 @@ mod tests {
         assert!(!store.configured());
         assert_eq!(store.snapshot(), &empty_config());
         assert!(store.refresh().is_err());
+        assert!(store.config_issue().is_some());
+    }
+
+    #[test]
+    fn a_config_that_becomes_unreadable_turns_inert_on_refresh() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.toml");
+        let mut store = ConfigStore::for_test(path.clone());
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
+        fs::create_dir(&path).unwrap();
+        assert!(store.refresh().is_err());
+        assert!(store.config_issue().is_some());
+        assert!(!store.configured());
+        assert_eq!(store.snapshot(), &empty_config());
+        assert_eq!(store.revision(), UNREADABLE_REVISION);
+        fs::remove_dir(&path).unwrap();
+        store.refresh().unwrap();
+        assert!(store.config_issue().is_none());
     }
 
     #[test]
