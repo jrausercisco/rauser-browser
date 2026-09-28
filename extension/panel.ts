@@ -10,6 +10,7 @@ import { ConfigSession, describe, element, setupProblem, worker } from "./settin
 import { PROTOCOL_VERSION, newRequestId } from "./native.js";
 import { APP_NAME } from "./brand.js";
 import { recordNoteOrigin } from "./grants.js";
+import { NoteEditor, type UnsavedText } from "./note-editor.js";
 
 const status = element<HTMLDivElement>("status");
 const settingsButton = element<HTMLButtonElement>("open-settings");
@@ -33,6 +34,7 @@ const noteUnavailable = element<HTMLParagraphElement>("note-unavailable");
 const noteBody = element<HTMLTextAreaElement>("note-body");
 const noteGrantOrigin = element<HTMLButtonElement>("note-grant-origin");
 const noteConflict = element<HTMLDivElement>("note-conflict");
+const noteConflictMessage = noteConflict.querySelector("p")!;
 const noteUnsaved = element<HTMLTextAreaElement>("note-unsaved");
 const copyUnsavedButton = element<HTMLButtonElement>("copy-unsaved");
 
@@ -48,18 +50,11 @@ const RETRY_POLL_MS = 30_000;
 const LEASE_RENEW_WINDOW_MS = 60 * 60_000;
 const NOTE_SAVE_DEBOUNCE_MS = 1_000;
 
-// --- Page area and note state (§5.3, §5.7) ---------------------------------
-// The panel follows the active tab. A note is identified by the tab's exact
-// URL; `noteLoadSeq` lets a superseded load from a since-abandoned tab be
-// ignored instead of clobbering a newer one.
-let noteUrl: string | null = null;
-let noteCreationTitle = "";
-let noteRevision: string | null = null;
-let noteLoaded = false;
-let noteDirty = false;
-let noteSaving = false;
-let noteLoadSeq = 0;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
+// --- Page area (§5.3, §5.7) --------------------------------------------------
+// The panel follows the active tab. `tabRefreshSeq` lets a refresh whose tab
+// query was overtaken by a newer one be ignored; the note itself is owned by
+// `notes` (note-editor.ts), which serializes every load and save.
+let tabRefreshSeq = 0;
 let grantOrigin: string | null = null;
 
 function show(message: string, warning = false): void {
@@ -181,6 +176,8 @@ function scheduleReload(): void {
         busy = false;
         if (session.status) scheduleReplay(session.status);
         updateControls();
+        // A note that could not load before (say, no folder yet) may load now.
+        void notes.retry();
       });
   }, 250);
 }
@@ -322,19 +319,37 @@ async function dismissNotices(): Promise<void> {
 
 // --- Page area and note (§5.3, §5.7) ---------------------------------------
 
-function setNoteEditable(editable: boolean): void {
-  noteBody.disabled = !editable;
+function showUnsavedText(entries: readonly UnsavedText[]): void {
+  const only = entries.length === 1 ? entries[0]! : null;
+  noteConflictMessage.textContent = only
+    ? `${only.reason} Copy your text for ${only.url} back in below:`
+    : "Some note text could not be saved. Copy it back in below:";
+  noteUnsaved.value = only
+    ? only.text
+    : entries.map((entry) => `${entry.url}\n${entry.reason}\n\n${entry.text}`).join("\n\n");
+  noteConflict.hidden = entries.length === 0;
 }
 
-function hideConflict(): void {
-  noteConflict.hidden = true;
-  noteUnsaved.value = "";
-}
-
-function showConflict(unsavedText: string): void {
-  noteUnsaved.value = unsavedText;
-  noteConflict.hidden = false;
-}
+const notes = new NoteEditor({
+  readBody: () => noteBody.value,
+  writeBody: (body) => { noteBody.value = body; },
+  setEditable: (editable) => { noteBody.disabled = !editable; },
+  setStatus: showNoteStatus,
+  showUnsaved: showUnsavedText,
+}, {
+  load: (url) => session.host.call({
+    type: "load_note",
+    protocol_version: PROTOCOL_VERSION,
+    request_id: newRequestId(),
+    url,
+  }, "note_loaded"),
+  save: (request) => session.host.callAny({
+    type: "save_note",
+    protocol_version: PROTOCOL_VERSION,
+    request_id: newRequestId(),
+    ...request,
+  }, ["note_saved", "note_conflict"]),
+}, describe, NOTE_SAVE_DEBOUNCE_MS);
 
 async function refreshGrantButton(origin: string): Promise<void> {
   try {
@@ -364,134 +379,44 @@ function requestNoteOrigin(): void {
   }).catch((error: unknown) => showNoteStatus(describe(error), true));
 }
 
-async function loadNoteFor(tab: ChromeTab): Promise<void> {
-  const url = tab.url!;
-  const seq = ++noteLoadSeq;
-  noteUrl = url;
-  noteCreationTitle = tab.title?.trim() || new URL(url).hostname;
-  noteRevision = null;
-  noteLoaded = false;
-  noteDirty = false;
-  setNoteEditable(false);
-  noteBody.value = "";
-  showNoteStatus("");
-  hideConflict();
-  try {
-    const response = await session.host.call({
-      type: "load_note",
-      protocol_version: PROTOCOL_VERSION,
-      request_id: newRequestId(),
-      url,
-    }, "note_loaded");
-    if (seq !== noteLoadSeq) return; // A newer tab switch has already started.
-    noteRevision = response.revision;
-    noteBody.value = response.body;
-    noteLoaded = true;
-    setNoteEditable(true);
-    showNoteStatus(response.exists ? "Saved" : "");
-  } catch (error) {
-    if (seq !== noteLoadSeq) return;
-    showNoteStatus(`Could not load this page's note: ${describe(error)}`, true);
-  }
-}
-
-function scheduleNoteSave(): void {
-  noteDirty = true;
-  showNoteStatus("");
-  if (saveTimer !== null) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    void flushNoteSave();
-  }, NOTE_SAVE_DEBOUNCE_MS);
-}
-
-async function flushNoteSave(): Promise<void> {
-  if (saveTimer !== null) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
-  }
-  if (!noteDirty || !noteLoaded || noteSaving || noteUrl === null || noteRevision === null) return;
-  const url = noteUrl;
-  const expectedRevision = noteRevision;
-  const body = noteBody.value;
-  const title = noteCreationTitle;
-  noteSaving = true;
-  noteDirty = false;
-  showNoteStatus("Saving…");
-  try {
-    const response = await session.host.callAny({
-      type: "save_note",
-      protocol_version: PROTOCOL_VERSION,
-      request_id: newRequestId(),
-      url,
-      title,
-      body,
-      expected_revision: expectedRevision,
-    }, ["note_saved", "note_conflict"]);
-    if (noteUrl !== url) return; // The active tab moved on while this saved.
-    if (response.type === "note_saved") {
-      noteRevision = response.revision;
-      showNoteStatus("Saved");
-    } else {
-      // The note changed elsewhere since this panel last loaded it. Nothing
-      // was written; show the newer note and let the user copy their text
-      // back in rather than losing it (§4.4, §5.3).
-      noteRevision = response.revision;
-      noteBody.value = response.body;
-      showConflict(body);
-      showNoteStatus("Could not save; this note changed elsewhere.", true);
-    }
-  } catch (error) {
-    if (noteUrl !== url) return;
-    noteDirty = true; // Retry on the next edit, tab change, or close.
-    showNoteStatus(`Could not save: ${describe(error)}`, true);
-  } finally {
-    noteSaving = false;
-  }
-}
-
 function copyUnsavedText(): void {
   void navigator.clipboard.writeText(noteUnsaved.value).catch((error: unknown) => {
     showNoteStatus(`Could not copy: ${describe(error)}`, true);
   });
 }
 
-/** Follows the active tab (§5.7). Flushes any pending save for the page
- * being left before switching the panel to a new one. */
+/** Follows the active tab (§5.7). The header and the note editor are pointed
+ * at the tab this call found in the same step, so they cannot disagree;
+ * `notes` saves the page being left before loading the new one. */
 async function refreshActiveTab(): Promise<void> {
+  const seq = ++tabRefreshSeq;
   let tab: ChromeTab | undefined;
   try {
     [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   } catch {
     tab = undefined;
   }
+  if (seq !== tabRefreshSeq) return; // A newer refresh has the current tab.
+
   if (!tab || tab.incognito) {
-    await flushNoteSave();
     pageTitle.textContent = "No page yet";
     pageUrl.textContent = "";
     pageUnusable.hidden = true;
     noteUnavailable.hidden = true;
     noteGrantOrigin.hidden = true;
-    noteUrl = null;
-    noteLoaded = false;
-    setNoteEditable(false);
-    noteBody.value = "";
+    await notes.showPage(null);
     return;
   }
 
   if (tab.url === undefined) {
     // §5.3: without an origin grant or a live activeTab, the panel cannot
     // see this tab's address at all.
-    await flushNoteSave();
     pageTitle.textContent = tab.title?.trim() || "This page";
     pageUrl.textContent = "";
     pageUnusable.hidden = true;
     noteUnavailable.hidden = false;
     noteGrantOrigin.hidden = true;
-    noteUrl = null;
-    noteLoaded = false;
-    setNoteEditable(false);
-    noteBody.value = "";
+    await notes.showPage(null);
     return;
   }
 
@@ -502,16 +427,12 @@ async function refreshActiveTab(): Promise<void> {
     url = new URL("about:blank");
   }
   if (!isHttpUrl(url)) {
-    await flushNoteSave();
     pageTitle.textContent = tab.title?.trim() || tab.url;
     pageUrl.textContent = tab.url;
     pageUnusable.hidden = false;
     noteUnavailable.hidden = true;
     noteGrantOrigin.hidden = true;
-    noteUrl = null;
-    noteLoaded = false;
-    setNoteEditable(false);
-    noteBody.value = "";
+    await notes.showPage(null);
     return;
   }
 
@@ -520,11 +441,7 @@ async function refreshActiveTab(): Promise<void> {
   pageUnusable.hidden = true;
   noteUnavailable.hidden = true;
   void refreshGrantButton(url.origin);
-
-  if (tab.url !== noteUrl) {
-    await flushNoteSave();
-    await loadNoteFor(tab);
-  }
+  await notes.showPage({ url: tab.url, title: tab.title?.trim() || url.hostname });
 }
 
 settingsButton.addEventListener("click", openSettings);
@@ -533,7 +450,7 @@ pauseButton.addEventListener("click", () => void pauseCapture());
 replayButton.addEventListener("click", () => void replayVisits());
 discardButton.addEventListener("click", () => void discardPendingVisits());
 dismissButton.addEventListener("click", () => void dismissNotices());
-noteBody.addEventListener("input", scheduleNoteSave);
+noteBody.addEventListener("input", () => notes.edited());
 noteGrantOrigin.addEventListener("click", requestNoteOrigin);
 copyUnsavedButton.addEventListener("click", copyUnsavedText);
 session.watchPolicy(scheduleReload);
@@ -550,7 +467,7 @@ window.addEventListener("pagehide", () => {
   if (retryTimer !== null) clearTimeout(retryTimer);
   if (reloadTimer !== null) clearTimeout(reloadTimer);
   // Best effort: MV3 gives no guarantee this completes before teardown.
-  void flushNoteSave();
+  void notes.flush();
   session.host.disconnect();
 });
 
@@ -558,13 +475,19 @@ void (async () => {
   busy = true;
   updateControls();
   let initialized = false;
+  let reachedHost = false;
   try {
     const hello = await session.hello();
+    reachedHost = true;
     await reloadConfig();
     if (hello.config_issue) show(hello.config_issue, true);
     initialized = true;
   } catch (error) {
-    show(`Native host unavailable: ${describe(error)}. Install or register the development host, then reopen the panel.`, true);
+    // Only a failed hello means the host is missing; later failures come from
+    // a host that answered, so reinstalling it would not help.
+    show(reachedHost
+      ? `Could not read the host settings: ${describe(error)}. Open settings to check the configuration, then reopen the panel.`
+      : `Native host unavailable: ${describe(error)}. Install or register the development host, then reopen the panel.`, true);
   } finally {
     busy = false;
     await session.refreshStatus().catch(() => undefined);
