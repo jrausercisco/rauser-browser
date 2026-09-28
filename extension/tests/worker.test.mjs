@@ -707,7 +707,7 @@ test("host config shape requires every v4 privacy and agent key", () => {
   };
   const refused = {
     ...offer, offer_id: null, adapter: "codex", harness_id: "codex", real_path: null,
-    version: null, env_optional: [], refusal: "Codex setup is not available yet",
+    version: null, env_optional: [], refusal: "codex --version output was not recognized",
   };
   const discovered = { type: "harnesses_discovered", offers: [offer, refused] };
   assert.equal(isResponseShape(discovered), true);

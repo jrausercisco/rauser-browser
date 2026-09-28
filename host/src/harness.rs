@@ -1868,8 +1868,20 @@ esac
         /// A fake Codex answering `exec --help` with the reviewed fixture and
         /// `features list` with `features`, whatever it is asked to disable.
         pub(crate) fn codex_listing(&self, version: &str, features: &str, body: &str) -> PathBuf {
+            self.codex_with(version, CODEX_EXEC_HELP, features, body)
+        }
+
+        /// A fake Codex answering `exec --help` with `exec_help` and
+        /// `features list` with `features`.
+        pub(crate) fn codex_with(
+            &self,
+            version: &str,
+            exec_help: &str,
+            features: &str,
+            body: &str,
+        ) -> PathBuf {
             let help = self.path("codex-exec-help.txt");
-            fs::write(&help, CODEX_EXEC_HELP).unwrap();
+            fs::write(&help, exec_help).unwrap();
             let listed = self.path("codex-features.txt");
             fs::write(&listed, features).unwrap();
             let body = format!(
@@ -2187,6 +2199,94 @@ mod process_tests {
             probe_with_limits(&candidate, &allow(REQUIRED_ENV), &env, quick()),
             Err(ProbeFailure::ToolUse)
         );
+    }
+
+    #[test]
+    fn codex_unexpected_enabled_feature_is_refused_before_any_probe() {
+        let fake = Fake::new();
+        let disabled = disabled_features(&codex_args("0.144.4").unwrap());
+        let listed = format!(
+            "{}\nnew_tool                             under development  true\n",
+            tests::features_after_disables(&disabled)
+        );
+        fake.codex_listing("codex-cli 0.144.4", &listed, CODEX_PASSING_BODY);
+        let env = fake.env(&[]);
+        let candidate = codex_candidate(&env);
+        assert_eq!(
+            candidate.refusal.as_deref(),
+            Some("Codex 0.144.4 reports new_tool enabled, which is not on the reviewed list")
+        );
+        assert!(candidate.help_sha256.is_none());
+        assert!(matches!(
+            probe_with_limits(&candidate, &allow(REQUIRED_ENV), &env, quick()),
+            Err(ProbeFailure::Unavailable(_))
+        ));
+        // Version, exec help, features list; the probe never ran.
+        assert_eq!(fake.log("codex", "argv.log").unwrap().lines().count(), 3);
+        assert_eq!(fake.log("codex", "stdin.log"), None);
+    }
+
+    #[test]
+    fn codex_missing_exec_flag_is_refused_before_features_list() {
+        let fake = Fake::new();
+        let help: String = tests::CODEX_EXEC_HELP
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--ephemeral"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(help, tests::CODEX_EXEC_HELP);
+        fake.codex_with(
+            "codex-cli 0.144.4",
+            &help,
+            tests::CODEX_FEATURES,
+            CODEX_PASSING_BODY,
+        );
+        let env = fake.env(&[]);
+        let candidate = codex_candidate(&env);
+        let refusal = candidate.refusal.clone().unwrap();
+        assert!(
+            refusal.contains("--ephemeral") && refusal.ends_with("in codex exec --help"),
+            "{refusal}"
+        );
+        assert_eq!(
+            fake.log("codex", "argv.log").as_deref(),
+            Some("[--version]\n[exec][--help]\n")
+        );
+        assert!(matches!(
+            probe_with_limits(&candidate, &allow(REQUIRED_ENV), &env, quick()),
+            Err(ProbeFailure::Unavailable(_))
+        ));
+        assert_eq!(fake.log("codex", "stdin.log"), None);
+    }
+
+    #[test]
+    fn codex_probe_refuses_an_event_off_the_allowlist() {
+        // A known-but-unlisted event and a text item followed by an unknown
+        // item type both fail the probe, even with a clean exit.
+        for (event, expected) in [
+            (
+                r#"{"type":"session.configured","model":"x"}"#,
+                ProbeFailure::UnexpectedOutput,
+            ),
+            (
+                r#"{"type":"item.completed","item":{"id":"w","type":"web_search","query":"x"}}"#,
+                ProbeFailure::ToolUse,
+            ),
+        ] {
+            let fake = Fake::new();
+            fake.codex(&format!(
+                r#"cat > "$log/stdin.log"
+printf '%s\n' '{{"type":"thread.started","thread_id":"t"}}' '{{"type":"turn.started"}}' '{event}' '{{"type":"item.completed","item":{{"id":"i","type":"agent_message","text":"OK"}}}}' '{{"type":"turn.completed","usage":{{"input_tokens":1,"output_tokens":1}}}}'"#
+            ));
+            let env = fake.env(&[]);
+            let candidate = codex_candidate(&env);
+            assert_eq!(candidate.refusal, None);
+            assert_eq!(
+                probe_with_limits(&candidate, &allow(REQUIRED_ENV), &env, quick()),
+                Err(expected),
+                "{event}"
+            );
+        }
     }
 
     #[test]

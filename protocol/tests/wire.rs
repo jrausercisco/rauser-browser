@@ -151,7 +151,7 @@ fn confirm_harness_setup_requires_every_key() {
 
 #[test]
 fn harnesses_discovered_offers_require_nullable_keys() {
-    let offer = r#"{"offer_id":null,"adapter":"codex","harness_id":"codex","binary":"/usr/local/bin/codex","real_path":null,"version":null,"args":[],"env_required":["HOME","PATH"],"env_optional":[{"name":"OPENAI_API_KEY","present":false}],"refusal":"Codex setup is not available yet"}"#;
+    let offer = r#"{"offer_id":null,"adapter":"codex","harness_id":"codex","binary":"/usr/local/bin/codex","real_path":null,"version":null,"args":[],"env_required":["HOME","PATH"],"env_optional":[{"name":"OPENAI_API_KEY","present":false}],"refusal":"codex --version output was not recognized"}"#;
     let message = |offer: &str| {
         format!(
             r#"{{"type":"harnesses_discovered","protocol_version":4,"request_id":"r1","offers":[{offer}]}}"#

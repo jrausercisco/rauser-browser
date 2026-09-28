@@ -282,8 +282,8 @@ echo 'fake harness: simulated failure' >&2
 exit 1`),
     // A reviewed codex-cli whose features list honors the --disable pairs it
     // is given, and fails unless the host gave it an empty CODEX_HOME (runs
-    // ignore the user's config, so the list must too). Setup is never
-    // started for it, so any other run fails.
+    // ignore the user's config, so the list must too). Its exec run prints
+    // only allowlisted text events; any other run fails.
     codex: fakeHarnessScript("codex", argvLog, `if [ "$1" = --version ]; then echo 'codex-cli 0.144.4'; exit 0; fi
 if [ "$1" = exec ] && [ "$2" = --help ]; then /bin/cat ${shellQuote(codexHelp)}; exit 0; fi
 if [ "$1" = features ] && [ "$2" = list ]; then
@@ -294,6 +294,13 @@ if [ "$1" = features ] && [ "$2" = list ]; then
     case "$disabled" in *" \${feature%% *} "*) feature="\${feature% true} false" ;; esac
     printf '%s\\n' "$feature"
   done < ${shellQuote(codexFeatures)}
+  exit 0
+fi
+if [ "$1" = exec ]; then
+  /bin/cat > /dev/null
+  printf '%s\\n' '{"type":"thread.started","thread_id":"t"}' '{"type":"turn.started"}' \\
+    '{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"OK"}}' \\
+    '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
   exit 0
 fi
 exit 1`),
@@ -1547,6 +1554,38 @@ async function run() {
           reply.config.agent_denylist_confirmed && !(await hasEntry("bank.example")),
         `The denylist after removal: ${JSON.stringify(reply.config.agent_denylist)}`);
       });
+
+      // Codex runs under the user's own HOME (and CODEX_HOME when set), so
+      // its confirmation must say so and still recommend Claude Code (§14).
+      await step("Codex setup confirmed", async () => {
+        const probesBefore = (await probeRuns()).length;
+        const rows = await detect();
+        requireCondition(rows.find((row) => row.adapter === "codex")?.ready, "Codex is not offered");
+        await inSettings((page) => page.click('#harness-offers li[data-adapter="codex"] input[type="radio"]'));
+        await startSetup();
+        const text = await scriptedDialog("confirm", "confirmed");
+        for (const expected of ["Codex runs with your normal Codex home and login",
+          "instructions (AGENTS.md) and skills can shape its answers", "Claude Code is the recommended harness",
+          `"${fakeBin}/codex"`, "--sandbox", "read-only", "--disable", "shell_tool", "{prompt}", "mail.example"]) {
+          requireCondition(text.includes(expected), `The Codex dialog does not show ${expected}: ${JSON.stringify(text)}`);
+        }
+        requireCondition(!text.includes(secret) && !text.includes("ANTHROPIC_API_KEY"),
+          "The Codex dialog shows an environment value or a Claude Code name");
+        await settledStatus("Codex is set up.");
+        const reply = await hostConfig(wrapper);
+        const agent = reply.config.agent;
+        requireCondition(agent?.binary === `${fakeBin}/codex` && reply.config.agent_denylist_confirmed &&
+          agent.env_allow.join(",") === "HOME,PATH" && reply.config.agent_denylist.join(",") === "mail.example",
+        `The host config after Codex setup: ${JSON.stringify({ ...reply.config, sites: undefined })}`);
+        requireCondition(reply.agent_status.state === "ready" && reply.agent_status.harness_version === "0.144.4",
+          `Agent status: ${JSON.stringify(reply.agent_status)}`);
+        const expectedArgv = agent.args.map((arg) => `[${arg === "{prompt}" ? PROBE_ARGV[1] : arg}]`).join("");
+        const probes = (await probeRuns()).slice(probesBefore);
+        requireCondition(probes.length === 1 && probes[0].program === "codex" && probes[0].argv === expectedArgv &&
+          probes[0].argv.startsWith("[exec][--sandbox][read-only]") && probes[0].argv.includes("[--disable][tool_suggest]") &&
+          probes[0].env.join(",") === "HOME,PATH",
+        `Expected one Codex test run with the reviewed argv and HOME,PATH only; got ${JSON.stringify(probes)}`);
+      });
     }
 
     await step("Site removal", async () => {
@@ -1603,7 +1642,7 @@ async function run() {
         const pids = (await commandOutput("/usr/bin/pgrep", ["-f", `${options.host} __dialog-`]).catch(() => ""))
           .split("\n").filter(Boolean);
         requireCondition(pids.length === 0, "A dialog process is still running");
-        requireCondition(dialogsShown === 9, `Expected nine scripted dialogs; answered ${dialogsShown}`);
+        requireCondition(dialogsShown === 10, `Expected ten scripted dialogs; answered ${dialogsShown}`);
         requireCondition(!(await maybeLstat(path.join(dialogs, "answer"))), "An unused scripted answer remains");
         await nothingOnScreen();
       });
