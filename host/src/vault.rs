@@ -190,11 +190,7 @@ impl Vault {
         let mut file = pages
             .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
             .context("creating page note temporary file")?;
-        let mut cleanup = TempFileCleanup {
-            dir: &pages,
-            name: &temporary,
-            armed: true,
-        };
+        let mut cleanup = TempFileCleanup::new(&pages, &temporary);
         let write_result = file
             .write_all(markdown.as_bytes())
             .and_then(|_| file.sync_all());
@@ -312,7 +308,7 @@ fn review_filename(page_url: &str, proposal_id: &str) -> Result<String> {
     Ok(format!("{stem}.rauser-review-{proposal_id}.md"))
 }
 
-fn checked_relative_dir(value: &str) -> Result<PathBuf> {
+pub(crate) fn checked_relative_dir(value: &str) -> Result<PathBuf> {
     let path = Path::new(value);
     if path.as_os_str().is_empty()
         || !path
@@ -365,14 +361,24 @@ fn slug(value: &str) -> String {
     }
 }
 
-struct TempFileCleanup<'a> {
+/// Removes a temporary file on early return. Disarm it once the final name is
+/// published: another writer could reuse the temporary name after that.
+pub(crate) struct TempFileCleanup<'a> {
     dir: &'a Dir,
     name: &'a str,
     armed: bool,
 }
 
-impl TempFileCleanup<'_> {
-    fn disarm(&mut self) {
+impl<'a> TempFileCleanup<'a> {
+    pub(crate) fn new(dir: &'a Dir, name: &'a str) -> Self {
+        Self {
+            dir,
+            name,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -386,18 +392,18 @@ impl Drop for TempFileCleanup<'_> {
 }
 
 #[cfg(not(windows))]
-fn sync_directory(dir: &Dir) -> io::Result<()> {
+pub(crate) fn sync_directory(dir: &Dir) -> io::Result<()> {
     dir.try_clone()?.into_std_file().sync_all()?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn sync_directory(_dir: &Dir) -> io::Result<()> {
+pub(crate) fn sync_directory(_dir: &Dir) -> io::Result<()> {
     // std does not expose a portable way to fsync a Windows directory handle.
     Ok(())
 }
 
-fn sync_directory_chain(root: &Dir, relative: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory_chain(root: &Dir, relative: &Path) -> io::Result<()> {
     let mut current = root.try_clone()?;
     sync_directory(&current)?;
     for part in relative.components() {

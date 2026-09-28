@@ -16,6 +16,12 @@ export interface QueuedVisit {
   dedupe_key: string;
   attempts: number;
   retry_after: number;
+  // Items stored before these fields existed lack them. A missing tab ID is
+  // never patched, and a missing dispatch flag counts as already dispatched.
+  tab_id?: number;
+  // Once the panel has received an item, its event is frozen: the host hashes
+  // the entry text, so a later edit would break interrupted-write recovery.
+  dispatched?: boolean;
 }
 
 export interface QueueState {
@@ -23,7 +29,10 @@ export interface QueueState {
   items: QueuedVisit[];
   overflow_count: number;
   rejected_count: number;
+  // A persistent notice that stays until the user dismisses it.
   last_error: string | null;
+  // The latest retryable failure. It clears once no pending visit has failed.
+  retry_error: string | null;
 }
 
 export interface WorkerStatus {
@@ -32,6 +41,7 @@ export interface WorkerStatus {
   overflow_count: number;
   rejected_count: number;
   last_error: string | null;
+  retry_error: string | null;
   policy_expires_at: number | null;
   revoked_origins: string[];
   pause_pending: boolean;
@@ -50,6 +60,7 @@ export type WorkerRequest =
   | { kind: "get_pending" }
   | { kind: "ack_visit"; event_id: string; outcome: VisitOutcome; reason: string | null }
   | { kind: "get_status" }
+  | { kind: "clear_notices" }
   | { kind: "ack_reenabled_origin"; origin: string; revision: string }
   | { kind: "ack_revocations"; origins: string[] };
 
@@ -66,7 +77,24 @@ export function emptyQueue(): QueueState {
     overflow_count: 0,
     rejected_count: 0,
     last_error: null,
+    retry_error: null,
   };
+}
+
+// Formats local wall-clock time with its numeric UTC offset, such as
+// 2026-09-28T09:15:00-04:00. The host files each visit under this local date.
+export function localTimestamp(date: Date): string {
+  const year = date.getFullYear();
+  if (!Number.isFinite(year) || year < 0 || year > 9_999) {
+    throw new RangeError("Visit time is outside the supported range");
+  }
+  const pad = (value: number, width = 2): string => String(value).padStart(width, "0");
+  const offset = -date.getTimezoneOffset();
+  const sign = offset < 0 ? "-" : "+";
+  const magnitude = Math.abs(offset);
+  return `${pad(year, 4)}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}` +
+    `${sign}${pad(Math.floor(magnitude / 60))}:${pad(magnitude % 60)}`;
 }
 
 export function exactOriginPattern(origin: string): string {
@@ -139,6 +167,8 @@ export function isQueuedVisit(value: unknown): value is QueuedVisit {
     item.attempts >= 0 &&
     typeof item.retry_after === "number" &&
     Number.isFinite(item.retry_after) &&
+    (item.tab_id === undefined || (typeof item.tab_id === "number" && Number.isInteger(item.tab_id))) &&
+    (item.dispatched === undefined || typeof item.dispatched === "boolean") &&
     typeof visit.event_id === "string" &&
     typeof visit.url === "string" &&
     (visit.title === null || typeof visit.title === "string") &&

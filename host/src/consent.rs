@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rauser_protocol::{ConfigSnapshot, SiteConfig};
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use uuid::Uuid;
 
 use crate::config;
+use crate::dialog::{self, DialogText};
 use crate::vault::selected_root_identity;
 
 const TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
@@ -54,13 +54,10 @@ impl ConsentAuthority {
         Self::default()
     }
 
-    /// Call on the host's main thread. macOS AppKit requires synchronous
-    /// dialogs from a non-windowed native messaging process to run there.
+    /// Blocks this connection until the user closes the picker, which runs
+    /// in a child process (see `dialog`).
     pub fn choose_folder(&mut self, revision: &str) -> Result<Option<FolderSelection>> {
-        let Some(selected) = FileDialog::new()
-            .set_title("Choose Rauser notes folder")
-            .pick_folder()
-        else {
+        let Some(selected) = dialog::pick_folder("Choose Rauser notes folder")? else {
             return Ok(None);
         };
         let canonical = fs::canonicalize(&selected)
@@ -103,14 +100,10 @@ impl ConsentAuthority {
         if !changes.is_empty() {
             let description =
                 format!("Rauser will make these changes:\n\n{summary}\n\nAllow these changes?");
-            if MessageDialog::new()
-                .set_title("Confirm Rauser settings")
-                .set_description(description)
-                .set_level(MessageLevel::Warning)
-                .set_buttons(MessageButtons::YesNo)
-                .show()
-                != MessageDialogResult::Yes
-            {
+            if !dialog::confirm(DialogText {
+                title: "Confirm Rauser settings",
+                description: &description,
+            })? {
                 return Ok(None);
             }
         }
@@ -261,12 +254,12 @@ fn approval_lines(current: &ConfigSnapshot, next: &ConfigSnapshot) -> Vec<String
             ));
         }
     }
-    let old_strip: Vec<&str> = if trusted_current {
-        current.strip_params.iter().map(String::as_str).collect()
+    let old_strip = if trusted_current {
+        current.strip_params.clone()
     } else {
-        vec!["utm_*", "fbclid", "gclid"]
+        config::default_strip_params()
     };
-    for param in old_strip {
+    for param in &old_strip {
         if !next.strip_params.iter().any(|value| value == param) {
             lines.push(format!(
                 "Keep the query parameter {param:?} in logged URLs."
@@ -276,7 +269,7 @@ fn approval_lines(current: &ConfigSnapshot, next: &ConfigSnapshot) -> Vec<String
     let prior_repeat = if trusted_current {
         current.near_repeat_secs
     } else {
-        300
+        config::default_near_repeat_secs()
     };
     if next.near_repeat_secs < prior_repeat {
         lines.push(format!(

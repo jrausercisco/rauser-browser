@@ -29,6 +29,7 @@ const pauseButton = element<HTMLButtonElement>("pause-capture");
 const sitesList = element<HTMLUListElement>("sites-list");
 const queueSummary = element<HTMLParagraphElement>("queue-summary");
 const queueWarning = element<HTMLParagraphElement>("queue-warning");
+const dismissButton = element<HTMLButtonElement>("dismiss-notices");
 const replayButton = element<HTMLButtonElement>("replay");
 const discardButton = element<HTMLButtonElement>("discard-pending");
 const noteTitle = element<HTMLInputElement>("note-title");
@@ -93,6 +94,8 @@ function updateControls(): void {
   replayButton.disabled = !connected || changing || currentConfig?.capture_enabled !== true ||
     lastWorkerStatus?.pause_pending === true;
   discardButton.disabled = changing || (lastWorkerStatus?.queued ?? 0) === 0;
+  dismissButton.disabled = changing || !lastWorkerStatus || (!lastWorkerStatus.last_error &&
+    !lastWorkerStatus.overflow_count && !lastWorkerStatus.rejected_count);
   noteButton.disabled = !connected || changing || !currentConfig?.storage ||
     currentConfig?.capture_enabled !== true || lastWorkerStatus?.pause_pending === true;
   for (const button of sitesList.querySelectorAll("button")) {
@@ -225,6 +228,7 @@ async function refreshQueue(): Promise<WorkerStatus> {
   if (state.overflow_count) messages.push(`${state.overflow_count} newer visits could not be buffered.`);
   if (state.rejected_count) messages.push(`${state.rejected_count} visits were rejected by host policy.`);
   if (state.last_error) messages.push(state.last_error);
+  if (state.retry_error) messages.push(`Retrying: ${state.retry_error}`);
   if (state.pause_pending && currentConfig?.capture_enabled) {
     messages.push("A local pause is active until the host confirms capture is off.");
   }
@@ -651,6 +655,21 @@ async function discardPendingVisits(): Promise<void> {
   }
 }
 
+async function dismissNotices(): Promise<void> {
+  if (busy || replaying || renewing || tickRunning) return;
+  busy = true;
+  updateControls();
+  try {
+    await worker<WorkerStatus>({ kind: "clear_notices" });
+  } catch (error) {
+    show(`Could not dismiss notices: ${describe(error)}`, true);
+  } finally {
+    busy = false;
+    await refreshQueue().catch((error: unknown) => show(describe(error), true));
+    updateControls();
+  }
+}
+
 async function removeSite(site: SiteConfig): Promise<void> {
   if (busy || replaying || renewing || tickRunning || !currentConfig || !revision ||
       !currentConfig.sites.some((entry) => sameSite(entry, site))) return;
@@ -792,6 +811,7 @@ enableButton.addEventListener("click", enableSite);
 pauseButton.addEventListener("click", () => void pauseCapture());
 replayButton.addEventListener("click", () => void replayVisits());
 discardButton.addEventListener("click", () => void discardPendingVisits());
+dismissButton.addEventListener("click", () => void dismissNotices());
 noteButton.addEventListener("click", () => void createPageNote());
 siteUrl.addEventListener("input", () => void refreshPreflight());
 sitePath.addEventListener("input", () => void refreshPreflight());

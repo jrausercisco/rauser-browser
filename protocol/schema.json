@@ -775,7 +775,7 @@
         "occurred_at": {
           "type": "string",
           "minLength": 20,
-          "maxLength": 20
+          "maxLength": 25
         },
         "incognito": {
           "type": "boolean"

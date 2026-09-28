@@ -6,6 +6,7 @@ import {
   exactOriginPattern,
   isPolicyLease,
   isQueuedVisit,
+  localTimestamp,
   matchingSite,
   siteMatchesUrl,
   type PolicyLease,
@@ -22,9 +23,14 @@ const REVOCATIONS_KEY = "rauser_revocations_v1";
 const PAUSE_KEY = "rauser_pause_pending_v1";
 const PAUSE_TOKEN_KEY = "rauser_pause_token_v1";
 const REMOVED_SITES_KEY = "rauser_locally_removed_sites_v1";
-const MAX_VISIT_URL_BYTES = 16 * 1_024;
+// Matches MAX_URL_BYTES in host/src/capture.rs, so the host never rejects a
+// visit the worker chose to buffer.
+const MAX_VISIT_URL_BYTES = 8_192;
 const MAX_TITLE_CHARS = 300;
 const DEDUPE_WINDOW_MS = 2_000;
+// Hold an untitled visit briefly so tabs.onUpdated can supply its title
+// before an open panel sends, and thereby freezes, the event.
+const TITLE_GRACE_MS = 3_000;
 const encoder = new TextEncoder();
 
 let storageReady: Promise<void> | null = null;
@@ -69,11 +75,14 @@ async function readQueue(): Promise<QueueState> {
     !state.items.every(isQueuedVisit) ||
     typeof state.overflow_count !== "number" ||
     typeof state.rejected_count !== "number" ||
-    !(state.last_error === null || typeof state.last_error === "string")
+    !(state.last_error === null || typeof state.last_error === "string") ||
+    !(state.retry_error === undefined || state.retry_error === null ||
+      typeof state.retry_error === "string")
   ) {
     throw new Error("Visit queue is unreadable; capture is paused");
   }
-  return value as QueueState;
+  // Queues stored before retry_error existed kept retry failures in last_error.
+  return { ...(value as QueueState), retry_error: (state.retry_error as string | null | undefined) ?? null };
 }
 
 async function writeQueue(state: QueueState): Promise<void> {
@@ -241,11 +250,28 @@ function dedupeKey(details: ChromeNavigationDetails): string {
   return `${details.tabId}:${document}:${timeBucket}:${url.href}`;
 }
 
-async function captureNavigation(details: ChromeNavigationDetails): Promise<void> {
+function withoutHash(rawUrl: string): string | null {
+  try {
+    const url = new URL(rawUrl);
+    url.hash = "";
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+async function captureNavigation(
+  details: ChromeNavigationDetails,
+  useCurrentTitle: boolean,
+): Promise<void> {
   if (details.frameId !== 0 || details.documentLifecycle !== "active" || details.tabId < 0) {
     return;
   }
   await ensureTrustedStorage();
+  // Most navigations are for sites the user never enabled. Check the cached
+  // lease first so they cost one storage read, not a full grant reconcile.
+  const cached = await readPolicy();
+  if (!cached || !matchingSite(cached, details.url)) return;
   const lease = await reconcileGrants();
   if (!lease || !matchingSite(lease, details.url)) return;
   if (encoder.encode(details.url).length > MAX_VISIT_URL_BYTES) return;
@@ -260,17 +286,16 @@ async function captureNavigation(details: ChromeNavigationDetails): Promise<void
 
   const visitedAt = new Date(details.timeStamp);
   if (!Number.isFinite(visitedAt.getTime())) return;
-  const occurred_at = `${visitedAt.toISOString().slice(0, 19)}Z`;
+  const occurred_at = localTimestamp(visitedAt);
+  // At commit, the tab still shows the previous document's title. The title
+  // arrives later through tabs.onUpdated. A same-document history update
+  // already has its current title.
   let title: string | null = null;
-  if (tab.url) {
-    try {
-      const current = new URL(tab.url);
-      const observed = new URL(details.url);
-      current.hash = "";
-      observed.hash = "";
-      if (current.href === observed.href) title = tab.title?.slice(0, MAX_TITLE_CHARS) ?? null;
-    } catch {
-      // A page title is optional. The navigation URL remains authoritative.
+  if (useCurrentTitle && tab.url) {
+    // A page title is optional. The navigation URL remains authoritative.
+    const current = withoutHash(tab.url);
+    if (current !== null && current === withoutHash(details.url)) {
+      title = tab.title?.slice(0, MAX_TITLE_CHARS) ?? null;
     }
   }
 
@@ -284,7 +309,14 @@ async function captureNavigation(details: ChromeNavigationDetails): Promise<void
   const queue = await readQueue();
   const key = dedupeKey(details);
   if (queue.items.some((item) => item.dedupe_key === key)) return;
-  const item: QueuedVisit = { event, dedupe_key: key, attempts: 0, retry_after: 0 };
+  const item: QueuedVisit = {
+    event,
+    dedupe_key: key,
+    attempts: 0,
+    retry_after: title === null ? Date.now() + TITLE_GRACE_MS : 0,
+    tab_id: details.tabId,
+    dispatched: false,
+  };
   const nextItems = [...queue.items, item];
   if (
     nextItems.length > MAX_QUEUED_VISITS ||
@@ -295,6 +327,30 @@ async function captureNavigation(details: ChromeNavigationDetails): Promise<void
   } else {
     queue.items = nextItems;
   }
+  await writeQueue(queue);
+}
+
+async function patchTitle(tabId: number, rawTitle: string, tab: ChromeTab): Promise<void> {
+  if (tab.incognito !== false || !tab.url) return;
+  await ensureTrustedStorage();
+  const lease = await readPolicy();
+  if (!lease) return;
+  const current = withoutHash(tab.url);
+  if (current === null) return;
+  const queue = await readQueue();
+  let latest: QueuedVisit | undefined;
+  for (const item of queue.items) {
+    if (item.tab_id === tabId) latest = item;
+  }
+  // Only the tab's newest visit may take the title, and only before the panel
+  // has seen it. A dispatched event may already be partly written by the host.
+  if (!latest || latest.dispatched !== false || withoutHash(latest.event.url) !== current ||
+      !matchingSite(lease, latest.event.url)) {
+    return;
+  }
+  const title = rawTitle.slice(0, MAX_TITLE_CHARS);
+  if (latest.event.title === title) return;
+  latest.event = { ...latest.event, title };
   await writeQueue(queue);
 }
 
@@ -352,6 +408,7 @@ async function currentStatus(
     overflow_count: visits.overflow_count,
     rejected_count: visits.rejected_count,
     last_error: visits.last_error,
+    retry_error: visits.retry_error,
     policy_expires_at: policy?.expires_at ?? null,
     revoked_origins: await readRevocations(),
     pause_pending: paused,
@@ -421,10 +478,16 @@ async function handleMessage(message: WorkerRequest): Promise<unknown> {
       const lease = await reconcileGrants();
       if (!lease || lease.expires_at <= Date.now() || !lease.capture_enabled) return [];
       const queue = await readQueue();
-      return queue.items.filter(
+      const ready = queue.items.filter(
         (item) =>
           item.retry_after <= Date.now() && matchingSite(lease, item.event.url) !== null,
       );
+      // Freeze these events before the panel can send them to the host.
+      if (ready.some((item) => item.dispatched !== true)) {
+        for (const item of ready) item.dispatched = true;
+        await writeQueue(queue);
+      }
+      return ready;
     }
     case "ack_visit": {
       const queue = await readQueue();
@@ -433,14 +496,16 @@ async function handleMessage(message: WorkerRequest): Promise<unknown> {
       if (message.outcome === "retryable") {
         item.attempts += 1;
         item.retry_after = Date.now() + Math.min(60 * 60_000, 5_000 * 2 ** Math.min(item.attempts, 10));
-        queue.last_error = message.reason ?? "The host could not save this visit yet";
+        queue.retry_error = message.reason ?? "The host could not save this visit yet";
       } else {
         queue.items = queue.items.filter((entry) => entry.event.event_id !== message.event_id);
         if (message.outcome === "rejected") {
           queue.rejected_count += 1;
           queue.last_error = message.reason ?? "A visit was rejected by host policy";
         } else if (!queue.items.some((entry) => entry.attempts > 0)) {
-          queue.last_error = null;
+          // last_error holds purge, overflow, and rejection notices. Only the
+          // user dismisses those; a later success clears retry state alone.
+          queue.retry_error = null;
         }
       }
       await writeQueue(queue);
@@ -449,6 +514,14 @@ async function handleMessage(message: WorkerRequest): Promise<unknown> {
     case "get_status":
       await reconcileGrants();
       return currentStatus();
+    case "clear_notices": {
+      const queue = await readQueue();
+      queue.last_error = null;
+      queue.overflow_count = 0;
+      queue.rejected_count = 0;
+      await writeQueue(queue);
+      return currentStatus(null, queue);
+    }
     case "ack_reenabled_origin": {
       // An older revocation must not delete a newly confirmed site. Clear it
       // only when this exact host revision is active and Chrome still grants
@@ -498,13 +571,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 const onCommitted = (details: ChromeNavigationDetails): void => {
-  void serialize(() => captureNavigation(details)).catch((error: unknown) => {
+  void serialize(() => captureNavigation(details, false)).catch((error: unknown) => {
     console.warn("Rauser navigation capture paused:", describe(error));
   });
 };
 
 const onHistoryStateUpdated = (details: ChromeNavigationDetails): void => {
-  void serialize(() => captureNavigation(details)).catch((error: unknown) => {
+  void serialize(() => captureNavigation(details, true)).catch((error: unknown) => {
     console.warn("Rauser SPA capture paused:", describe(error));
   });
 };
@@ -523,6 +596,15 @@ function registerNavigationListeners(): void {
 // Register synchronously whenever the optional API is present so MV3 can wake
 // this worker for navigation. A fresh permission grant can expose it later.
 registerNavigationListeners();
+
+// Chrome reports a tab's title only for origins this extension was granted.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const title = changeInfo.title;
+  if (title === undefined) return;
+  void serialize(() => patchTitle(tabId, title, tab)).catch((error: unknown) => {
+    console.warn("Rauser title update skipped:", describe(error));
+  });
+});
 
 chrome.permissions.onAdded.addListener((permissions) => {
   if (permissions.permissions?.includes("webNavigation")) registerNavigationListeners();

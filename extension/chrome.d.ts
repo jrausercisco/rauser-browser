@@ -19,6 +19,12 @@ interface ChromeTab {
   incognito: boolean;
 }
 
+interface ChromeTabChangeInfo {
+  title?: string;
+  url?: string;
+  status?: string;
+}
+
 interface ChromeNavigationDetails {
   tabId: number;
   frameId: number;
@@ -72,6 +78,11 @@ interface ChromeApi {
   tabs: {
     get(tabId: number): Promise<ChromeTab>;
     query(queryInfo: { active: boolean; currentWindow: boolean }): Promise<ChromeTab[]>;
+    onUpdated: {
+      addListener(
+        listener: (tabId: number, changeInfo: ChromeTabChangeInfo, tab: ChromeTab) => void,
+      ): void;
+    };
   };
   webNavigation?: {
     onCommitted: { addListener(listener: (details: ChromeNavigationDetails) => void): void };

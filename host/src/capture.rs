@@ -6,7 +6,7 @@
 
 use std::fs::{self, OpenOptions as StdOpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -20,7 +20,9 @@ use time::format_description::well_known::Rfc3339;
 use url::Url;
 use uuid::Uuid;
 
-use crate::vault::open_selected_root;
+use crate::vault::{
+    TempFileCleanup, checked_relative_dir, open_selected_root, sync_directory, sync_directory_chain,
+};
 
 const LOG_HEADER: &str = "<!-- rauser:daily-log v1 -->";
 const MARKER_PREFIX: &str = "<!-- rauser:visit id=";
@@ -31,6 +33,8 @@ const MAX_STRIP_RULES: usize = 64;
 const MAX_NEAR_REPEAT_SECS: u64 = 24 * 60 * 60;
 const MAX_FUTURE_SECS: i64 = 5 * 60;
 const MAX_PAST_SECS: i64 = 30 * 24 * 60 * 60;
+/// Real-world UTC offsets range from -12:00 to +14:00.
+const MAX_UTC_OFFSET_MINUTES: u16 = 14 * 60;
 
 pub struct CaptureStore {
     root: Dir,
@@ -211,11 +215,16 @@ impl CaptureStore {
         }
 
         let (relative_dir, filename) = self.log_parts(timestamp);
+        // Parent directory entries need syncing only until the day's log is
+        // published; later appends sync just the log and its directory.
+        let new_log = !self.root.exists(relative_dir.join(&filename));
         self.root
             .create_dir_all(&relative_dir)
             .context("creating daily log directory")?;
-        sync_directory_chain(&self.root, &relative_dir)
-            .context("syncing daily log parent directories")?;
+        if new_log {
+            sync_directory_chain(&self.root, &relative_dir)
+                .context("syncing daily log parent directories")?;
+        }
         let day_dir = self
             .root
             .open_dir(&relative_dir)
@@ -286,9 +295,15 @@ impl CaptureStore {
         let intent = self.intent(&relative_dir.join(&filename), &entry, metadata.len())?;
         publish_intent(&journal_path, &intent)
             .context("recording visit intent before Markdown append")?;
-        file.write_all(entry.as_bytes())
-            .context("appending daily log entry")?;
-        file.sync_all().context("syncing daily log")?;
+        if let Err(error) = file
+            .write_all(entry.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            // A torn entry left in place would block this event's replay once
+            // another visit is appended after it.
+            roll_back_append(&mut file, metadata.len(), entry.as_bytes());
+            return Err(error).context("appending daily log entry");
+        }
         sync_directory(&day_dir).context("syncing daily log directory")?;
         Ok(CaptureOutcome::Persisted {
             relative_path: relative_dir.join(filename),
@@ -375,20 +390,27 @@ impl CaptureStore {
         if intent.entry_hash != sha256_hex(entry) {
             bail!("queued visit changed after a partial write; manual repair is required");
         }
-        if metadata.len() < intent.offset || metadata.len() > intent.offset + entry.len() as u64 {
+        if metadata.len() < intent.offset {
             bail!("original daily log changed after visit intent; manual repair is required");
         }
-        let tail_len = (metadata.len() - intent.offset) as usize;
         file.seek(SeekFrom::Start(intent.offset))?;
-        let mut tail = vec![0; tail_len];
-        file.read_exact(&mut tail)?;
-        if tail != entry[..tail_len] {
+        let mut region = Vec::new();
+        file.read_to_end(&mut region)?;
+        // Other visits may have been appended after this intent was recorded,
+        // either before this entry was started or after an earlier resume.
+        // Anything else after them must be an exact prefix of this entry.
+        let tail = &region[complete_entries_len(&region)..];
+        if tail.len() > entry.len() || tail != &entry[..tail.len()] {
             bail!("original daily log was edited after visit intent; manual repair is required");
         }
-        file.write_all(&entry[tail_len..])
-            .context("completing interrupted daily log entry")?;
-        file.sync_all()
-            .context("syncing completed daily log entry")?;
+        let resume_from = metadata.len() - tail.len() as u64;
+        if let Err(error) = file
+            .write_all(&entry[tail.len()..])
+            .and_then(|()| file.sync_all())
+        {
+            roll_back_append(&mut file, resume_from, entry);
+            return Err(error).context("completing interrupted daily log entry");
+        }
         sync_directory(&day_dir).context("syncing original daily log directory")?;
         Ok(CaptureOutcome::Persisted {
             relative_path: relative_log,
@@ -461,36 +483,35 @@ impl CaptureStore {
     }
 }
 
-fn checked_relative_dir(value: &str) -> Result<PathBuf> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || !path
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)))
-    {
-        bail!("log directory must be a nonempty relative path");
-    }
-    Ok(path.to_path_buf())
-}
-
 fn parse_event_id(value: &str) -> std::result::Result<String, String> {
     let parsed = Uuid::parse_str(value).map_err(|_| "invalid_event_id".to_owned())?;
     Ok(parsed.hyphenated().to_string())
 }
 
+/// Accept `YYYY-MM-DDTHH:MM:SSZ` or the same with a `+HH:MM`/`-HH:MM`
+/// offset. The offset is the user's local time at the visit and chooses the
+/// daily log date, so evening visits stay in that day's log.
 fn parse_event_time(value: &str) -> std::result::Result<OffsetDateTime, String> {
     let bytes = value.as_bytes();
-    if bytes.len() != 20
+    let offset_ok = match bytes.len() {
+        20 => bytes[19] == b'Z',
+        25 => matches!(bytes[19], b'+' | b'-') && bytes[22] == b':',
+        _ => false,
+    };
+    if !offset_ok
         || bytes[4] != b'-'
         || bytes[7] != b'-'
         || bytes[10] != b'T'
         || bytes[13] != b':'
         || bytes[16] != b':'
-        || bytes[19] != b'Z'
     {
         return Err("invalid_timestamp".into());
     }
-    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| "invalid_timestamp".into())
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| "invalid_timestamp")?;
+    if parsed.offset().whole_minutes().unsigned_abs() > MAX_UTC_OFFSET_MINUTES {
+        return Err("invalid_timestamp".into());
+    }
+    Ok(parsed)
 }
 
 fn check_event_window(value: OffsetDateTime) -> std::result::Result<(), String> {
@@ -725,11 +746,7 @@ fn ensure_daily_log(dir: &Dir, name: &str) -> Result<bool> {
     let mut file = dir
         .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
         .context("creating daily log temporary file")?;
-    let mut cleanup = TempFileCleanup {
-        dir,
-        name: &temporary,
-        armed: true,
-    };
+    let mut cleanup = TempFileCleanup::new(dir, &temporary);
     file.write_all(format!("{LOG_HEADER}\n").as_bytes())?;
     file.sync_all()?;
     drop(file);
@@ -744,9 +761,7 @@ fn ensure_daily_log(dir: &Dir, name: &str) -> Result<bool> {
         }
         Err(error) => return Err(error).context("publishing daily log"),
     }
-    // Once the final name exists, never let Drop remove the temp name again:
-    // a different writer could reuse that name after the explicit removal.
-    cleanup.armed = false;
+    cleanup.disarm();
     if let Err(error) = dir.remove_file(&temporary) {
         eprintln!("rauser: warning: could not remove daily log temporary file: {error}");
     }
@@ -764,18 +779,52 @@ fn existing_log_is_owned(dir: &Dir, name: &str, length: u64) -> Result<bool> {
     Ok(first.trim_end_matches(['\r', '\n']) == LOG_HEADER)
 }
 
-struct TempFileCleanup<'a> {
-    dir: &'a Dir,
-    name: &'a str,
-    armed: bool,
+/// Truncate a failed append back to `offset`, but only if everything after
+/// `offset` is a prefix of `entry`. The capture lock excludes other Rauser
+/// writers; an unexpected tail is left for manual repair instead.
+fn roll_back_append(file: &mut cap_std::fs::File, offset: u64, entry: &[u8]) {
+    let result = (|| -> io::Result<bool> {
+        let length = file.metadata()?.len();
+        if length <= offset {
+            return Ok(true);
+        }
+        let written = length - offset;
+        if written > entry.len() as u64 {
+            return Ok(false);
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut tail = vec![0; written as usize];
+        file.read_exact(&mut tail)?;
+        if tail != entry[..tail.len()] {
+            return Ok(false);
+        }
+        file.set_len(offset)?;
+        file.sync_all()?;
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => {}
+        Ok(false) => eprintln!("rauser: warning: daily log changed during a failed append"),
+        Err(error) => eprintln!("rauser: warning: could not roll back a failed append: {error}"),
+    }
 }
 
-impl Drop for TempFileCleanup<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.dir.remove_file(self.name);
-        }
+/// Length of the leading run of complete Rauser visit entries in `region`.
+fn complete_entries_len(region: &[u8]) -> usize {
+    let mut consumed = 0;
+    while let Some(length) = complete_entry_len(&region[consumed..]) {
+        consumed += length;
     }
+    consumed
+}
+
+fn complete_entry_len(bytes: &[u8]) -> Option<usize> {
+    let body = bytes.strip_prefix(b"\n- ")?;
+    let marker_start = 3 + body.iter().position(|&byte| byte == b'\n')? + 1;
+    let marker_line = &bytes[marker_start..];
+    let marker_length = marker_line.iter().position(|&byte| byte == b'\n')?;
+    parse_marker(std::str::from_utf8(&marker_line[..marker_length]).ok()?)?;
+    Some(marker_start + marker_length + 1)
 }
 
 struct ScanResult {
@@ -844,27 +893,6 @@ fn safe_title(value: Option<&str>) -> String {
     } else {
         out
     }
-}
-
-#[cfg(not(windows))]
-fn sync_directory(dir: &Dir) -> io::Result<()> {
-    dir.try_clone()?.into_std_file().sync_all()?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn sync_directory(_dir: &Dir) -> io::Result<()> {
-    Ok(())
-}
-
-fn sync_directory_chain(root: &Dir, relative: &Path) -> io::Result<()> {
-    let mut current = root.try_clone()?;
-    sync_directory(&current)?;
-    for part in relative.components() {
-        current = current.open_dir(part.as_os_str())?;
-        sync_directory(&current)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1035,6 +1063,112 @@ mod tests {
             CaptureOutcome::Retryable { .. }
         ));
         assert_eq!(fs::read(&log).unwrap(), before);
+    }
+
+    #[test]
+    fn interrupted_entry_resumes_after_visits_appended_since_its_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store =
+            CaptureStore::open_at(&storage(root.path(), "log"), None, state.path()).unwrap();
+        let first = event();
+        let CaptureOutcome::Persisted { relative_path } = record(&store, &first) else {
+            panic!("expected persisted visit");
+        };
+        let hash = sha256_hex(first.event_id.as_bytes());
+        let intent = read_intent(&store.journal_path(&hash)).unwrap().unwrap();
+        let log = root.path().join(relative_path);
+        let first_entry = fs::read(&log).unwrap()[intent.offset as usize..].to_vec();
+        // Simulate a crash after the intent was published but before any
+        // bytes were appended, followed by another visit.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_len(intent.offset)
+            .unwrap();
+        let second = event();
+        assert!(matches!(
+            record(&store, &second),
+            CaptureOutcome::Persisted { .. }
+        ));
+        let with_second = fs::read(&log).unwrap();
+        // Then a resume of the first visit that was itself cut short.
+        let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(&first_entry[..10]).unwrap();
+        drop(file);
+
+        assert!(matches!(
+            record(&store, &first),
+            CaptureOutcome::Persisted { .. }
+        ));
+        let mut expected = with_second;
+        expected.extend_from_slice(&first_entry);
+        assert_eq!(fs::read(&log).unwrap(), expected);
+        assert!(matches!(
+            record(&store, &first),
+            CaptureOutcome::Suppressed { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_append_rolls_back_only_its_own_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        let entry = b"\n- entry\n";
+        root.write("log.md", b"header\n- entr").unwrap();
+        let mut file = root
+            .open_with("log.md", OpenOptions::new().read(true).append(true))
+            .unwrap();
+        roll_back_append(&mut file, 6, entry);
+        assert_eq!(root.read("log.md").unwrap(), b"header");
+
+        root.write("log.md", b"header\nuser text").unwrap();
+        let mut file = root
+            .open_with("log.md", OpenOptions::new().read(true).append(true))
+            .unwrap();
+        roll_back_append(&mut file, 7, entry);
+        assert_eq!(root.read("log.md").unwrap(), b"header\nuser text");
+    }
+
+    #[test]
+    fn visit_offset_chooses_the_local_calendar_date() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store =
+            CaptureStore::open_at(&storage(root.path(), "log"), None, state.path()).unwrap();
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        let mut dates = Vec::new();
+        // These offsets are 26 hours apart, so their local dates always differ.
+        for hours in [14, -12] {
+            let local = now.to_offset(time::UtcOffset::from_hms(hours, 0, 0).unwrap());
+            let mut visit = event();
+            visit.occurred_at = local.format(&Rfc3339).unwrap();
+            assert_eq!(visit.occurred_at.len(), 25);
+            let CaptureOutcome::Persisted { relative_path } = record(&store, &visit) else {
+                panic!("expected persisted visit");
+            };
+            let expected = format!(
+                "{:04}-{:02}-{:02}.md",
+                local.year(),
+                local.month() as u8,
+                local.day()
+            );
+            assert_eq!(relative_path.file_name().unwrap(), expected.as_str());
+            dates.push(expected);
+        }
+        assert_ne!(dates[0], dates[1]);
+    }
+
+    #[test]
+    fn event_time_accepts_only_seconds_precision_with_real_offsets() {
+        assert!(parse_event_time("2026-09-27T18:00:00Z").is_ok());
+        assert!(parse_event_time("2026-09-27T18:00:00-07:00").is_ok());
+        assert!(parse_event_time("2026-09-27T18:00:00+14:00").is_ok());
+        assert!(parse_event_time("2026-09-27T18:00:00+15:00").is_err());
+        assert!(parse_event_time("2026-09-27T18:00:00+0700").is_err());
+        assert!(parse_event_time("2026-09-27T18:00:00.5Z").is_err());
+        assert!(parse_event_time("2026-09-27 18:00:00-07:00").is_err());
     }
 
     #[test]

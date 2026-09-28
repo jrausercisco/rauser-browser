@@ -57,7 +57,9 @@ requires it for these changes. Both tokens are required-nullable fields: send
 `null` when one is unnecessary. Narrowing capture can proceed immediately.
 
 `record_visit` carries one immutable `VisitEvent` with a UUID event ID,
-original URL, nullable title, UTC timestamp, and incognito flag. The host
+original URL, nullable title, timestamp, and incognito flag. The timestamp
+is RFC 3339 with seconds precision and either `Z` or the local `+HH:MM`/`-HH:MM`
+offset; the host files the visit under that offset's calendar date. The host
 checks the original URL against its confirmed site policy and returns a
 `visit_recorded` outcome of `persisted`, `suppressed`, `rejected`, or
 `retryable`; only the first three are terminal for the extension queue.

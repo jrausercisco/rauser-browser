@@ -23,12 +23,15 @@ const MAX_SITES: usize = 128;
 const MAX_STRIP_PARAMS: usize = 64;
 const MAX_RULE_BYTES: usize = 64;
 const MISSING_REVISION: &str = "missing";
+/// Hash at most this much of an oversized config. Past it, the revision
+/// also covers the length so a growing file still changes revision.
+const MAX_HASHED_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 
-fn default_strip_params() -> Vec<String> {
+pub(crate) fn default_strip_params() -> Vec<String> {
     vec!["utm_*".into(), "fbclid".into(), "gclid".into()]
 }
 
-const fn default_near_repeat_secs() -> u32 {
+pub(crate) const fn default_near_repeat_secs() -> u32 {
     300
 }
 
@@ -279,6 +282,14 @@ impl From<StoredConfig> for ConfigSnapshot {
 }
 
 fn read_disk_state(path: &Path) -> Result<DiskState> {
+    // Check before opening: opening a FIFO for reading would block while the
+    // config lock is held.
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("{} is not a regular file", path.display())
+        }
+        _ => {}
+    }
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -292,7 +303,13 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
         }
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
-    let mut file = file;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut file = file.take(MAX_HASHED_CONFIG_BYTES);
     let mut contents = Vec::new();
     let mut hasher = Sha256::new();
     let mut bytes_read = 0u64;
@@ -310,6 +327,9 @@ fn read_disk_state(path: &Path) -> Result<DiskState> {
             .saturating_sub(contents.len())
             .min(count);
         contents.extend_from_slice(&chunk[..keep]);
+    }
+    if bytes_read == MAX_HASHED_CONFIG_BYTES {
+        hasher.update(metadata.len().to_le_bytes());
     }
     let revision = format!("sha256:{}", hex::encode(hasher.finalize()));
     if bytes_read > MAX_CONFIG_BYTES as u64 {
