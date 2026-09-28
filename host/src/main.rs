@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Result, bail};
-use rauser_host::{config::ConfigStore, native};
+use rauser_host::{config::ConfigStore, dialog, native};
 
 fn main() {
     if let Err(error) = run() {
@@ -25,6 +25,9 @@ fn run() -> Result<()> {
         // Chrome supplies its extension origin as a command-line argument to
         // native messaging hosts. The installed manifest, rather than argv,
         // authorizes the stable extension ID.
+        Some(command @ (dialog::PICK_FOLDER_COMMAND | dialog::CONFIRM_COMMAND)) => {
+            dialog::run_child_command(command)
+        }
         Some(origin) if origin.starts_with("chrome-extension://") => {
             native::serve(ConfigStore::load()?)
         }

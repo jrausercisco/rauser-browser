@@ -4,7 +4,7 @@ Rauser is a local-first browser assistant designed to help people keep useful co
 
 ## Status
 
-The M0 foundation is implemented: the repository contains a versioned native-messaging protocol, a Rust host foundation, and CI for macOS and Windows. There is no browser extension or installable release yet.
+M0 is merged. M1 development code now includes a Chrome side panel, opt-in visit capture, native folder selection and confirmation, and local Markdown page notes. The extension is an unpacked development build; there is no Chrome Web Store listing or installable release yet. The M1 flow has not had an interactive Chrome check on both operating systems, so it is not ready for general download.
 
 Read the [design specification](DESIGN.md) for the architecture, security model, planned features, and release plan.
 
@@ -18,7 +18,7 @@ The release plan calls for the browser extension to be distributed through the C
 
 ## Development
 
-The pinned Rust toolchain is in `rust-toolchain.toml`. Python 3 generates protocol types, and Node.js runs the TypeScript checks. From the repository root:
+The pinned Rust toolchain is in `rust-toolchain.toml`. Python 3 generates protocol types, and Node.js runs the TypeScript build. From the repository root:
 
 ```sh
 python3 protocol/generate.py --check
@@ -29,9 +29,34 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 npm ci --ignore-scripts
 npm run typecheck
 npm run lint
+npm run build:extension
+npm run test:extension
 ```
 
-The current host protocol supports discovery and revision-checked configuration messages. Capture stays disabled until the site permission and allowlist rules are implemented. The vault module currently creates new page files only, refuses to replace an existing file, and reports warnings if cleanup fails after publication. See [protocol/README.md](protocol/README.md) for the message contract.
+### Try the M1 development build
+
+1. Build the native host with `cargo build --locked -p rauser` and the extension with `npm ci --ignore-scripts && npm run build:extension`.
+2. In Google Chrome, open `chrome://extensions`, enable Developer mode, and load `extension/dist/` as an unpacked extension. Copy the extension ID shown there.
+3. Register the development host for that ID. On macOS, run `node scripts/register-dev-host.mjs YOUR_EXTENSION_ID "$(pwd)/target/debug/rauser"` after replacing `YOUR_EXTENSION_ID`. On Windows, run the same script from PowerShell with your extension ID and the absolute path to `target\debug\rauser.exe`.
+4. Open the Rauser side panel, choose a notes folder, enter a site URL and path prefix, then enable the site. Chrome requests the site permission and the native host confirms the capture policy. The panel can send buffered visits and create a page note for the current permitted tab.
+
+If **Choose folder** is disabled and the panel says "Native host unavailable," check that the extension ID in the native-host registration matches the ID shown on `chrome://extensions`, rebuild the host at the registered path, then close and reopen the panel. The development host registration is per user; the guided macOS smoke run below sets up its own isolated profile automatically.
+
+For a guided macOS Chrome smoke run, build both components as above, then run:
+
+```sh
+npm run smoke:macos
+```
+
+The runner opens an isolated Chrome profile and a localhost fixture, loads `extension/dist/` through a local Chrome DevTools pipe, and verifies Chrome can exchange a `hello` with the native host before pausing for Chrome permissions, native dialogs, and panel actions. The debugging flag and pipe apply only to the disposable profile; no remote debugging port is opened. It checks the host configuration, visit log, page notes, review draft, and site removal after each checkpoint. The native host uses a temporary `HOME`, and its registration lives only in the isolated Chrome profile; the runner does not change the normal Chrome host registration. It preserves its profile and notes under the printed temporary directory for inspection. Run `node scripts/smoke-macos.mjs --help` for an alternate host or Chrome binary path.
+
+The development registration in step 3 changes only the current user's Chrome native-host entry. It is for development; the signed installers planned for M5 will own installation and uninstallation. A folder path previously entered directly in an M0 config must be selected again through the native picker before M1 can use it. The host backs up malformed or incompatible config files during a revision-checked repair.
+
+The host binds the chosen folder to its filesystem identity. If that folder is moved or replaced, choose it again before capture resumes. M1 keeps a synced visit-ID intent file in the OS config directory for each saved visit so retries can recover across log dates and interrupted appends. These files remain indefinitely in the development build; compacting the index is part of the public-release work.
+
+Existing page notes are never overwritten. An unchanged create request returns the existing note; a new title or body produces a sibling review draft with a stable proposal ID, so retrying the same request does not create another draft. The panel shows the draft path. The host checks the original URL against its confirmed site rule before normalizing or logging it. See [protocol/README.md](protocol/README.md) for the message contract.
+
+M1 still needs interactive Chrome checks on both macOS and Windows. Windows power-loss durability for newly created Markdown file names is not yet established. The public package remains a later release milestone.
 
 ## License
 

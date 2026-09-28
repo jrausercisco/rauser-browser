@@ -3,7 +3,7 @@
 //! block ownership and conflict detection before replacing an existing file.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -40,24 +40,18 @@ pub enum PostPublishWarning {
 
 impl Vault {
     pub fn open(storage: &StorageConfig) -> Result<Self> {
+        Self::open_checked(storage, None)
+    }
+
+    /// The identity comes from the native picker and is persisted with config.
+    /// Check the opened directory handle, not just a canonicalized pathname:
+    /// a folder can be replaced between those two operations.
+    pub fn open_checked(storage: &StorageConfig, expected_identity: Option<&str>) -> Result<Self> {
         let chosen = Path::new(&storage.root);
-        if !chosen.is_absolute() {
-            bail!("notes folder must be an absolute path");
-        }
-        let canonical = fs::canonicalize(chosen)
-            .with_context(|| format!("resolving notes folder {}", chosen.display()))?;
-        if !canonical.is_dir() {
-            bail!("notes folder is not a directory: {}", canonical.display());
-        }
         let pages_dir = checked_relative_dir(&storage.pages_dir)?;
         checked_relative_dir(&storage.log_dir)?;
         checked_relative_dir(&storage.later_dir)?;
-
-        // This is the sole ambient filesystem entry point for vault contents.
-        // cap-std resolves subsequent paths relative to this open directory and
-        // prevents symlinks from escaping it.
-        let root = Dir::open_ambient_dir(&canonical, ambient_authority())
-            .with_context(|| format!("opening notes folder {}", canonical.display()))?;
+        let (root, _) = open_selected_root(chosen, expected_identity)?;
         Ok(Self { root, pages_dir })
     }
 
@@ -72,6 +66,87 @@ impl Vault {
         )
     }
 
+    /// Preserve a proposed change beside an existing note for manual review.
+    /// The sibling name is stable for the normalized proposal, so retrying a
+    /// lost acknowledgement cannot create an unbounded series of drafts.
+    pub fn create_review_artifact(
+        &self,
+        page_url: &str,
+        proposal_id: &str,
+        markdown: &str,
+    ) -> Result<CreatedPage> {
+        let review_name = review_filename(page_url, proposal_id)?;
+        self.create_named_with_post_publish_ops(
+            &review_name,
+            markdown,
+            |pages, name| pages.remove_file(name),
+            sync_directory,
+        )
+    }
+
+    pub fn page_relative_path(&self, page_url: &str) -> Result<PathBuf> {
+        Ok(self.pages_dir.join(page_filename(page_url)?))
+    }
+
+    pub fn review_relative_path(&self, page_url: &str, proposal_id: &str) -> Result<PathBuf> {
+        Ok(self.pages_dir.join(review_filename(page_url, proposal_id)?))
+    }
+
+    /// Read a page generated from the same canonical URL. This is used only
+    /// to distinguish an owned existing note from a filename conflict; M1
+    /// never replaces or adopts the file.
+    pub fn read_page(&self, page_url: &str) -> Result<Option<String>> {
+        let filename = page_filename(page_url)?;
+        self.read_named(&filename)
+    }
+
+    pub fn read_review_artifact(
+        &self,
+        page_url: &str,
+        proposal_id: &str,
+    ) -> Result<Option<String>> {
+        let filename = review_filename(page_url, proposal_id)?;
+        self.read_named(&filename)
+    }
+
+    fn read_named(&self, filename: &str) -> Result<Option<String>> {
+        let pages = match self.root.open_dir(&self.pages_dir) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("opening page notes directory"),
+        };
+        let metadata = match pages.symlink_metadata(filename) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("checking page note"),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("page-note name is occupied by a non-regular file");
+        }
+        if metadata.len() > MAX_NOTE_BYTES as u64 {
+            bail!("existing page note exceeds the 4 MiB read limit");
+        }
+        let mut file = pages.open(filename).context("opening page note")?;
+        let opened = file.metadata().context("checking opened page note")?;
+        if !opened.is_file() {
+            bail!("opened page note is not a regular file");
+        }
+        if opened.len() > MAX_NOTE_BYTES as u64 {
+            bail!("opened page note exceeds the 4 MiB read limit");
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((MAX_NOTE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .context("reading page note")?;
+        if bytes.len() > MAX_NOTE_BYTES {
+            bail!("existing page note exceeds the 4 MiB read limit");
+        }
+        Ok(Some(
+            String::from_utf8(bytes).context("existing page note is not UTF-8")?,
+        ))
+    }
+
     fn create_page_with_post_publish_ops<F, G>(
         &self,
         page_url: &str,
@@ -83,13 +158,29 @@ impl Vault {
         F: FnOnce(&Dir, &str) -> io::Result<()>,
         G: FnOnce(&Dir) -> io::Result<()>,
     {
+        let filename = page_filename(page_url)?;
+        self.create_named_with_post_publish_ops(&filename, markdown, remove_temporary, sync_parent)
+    }
+
+    fn create_named_with_post_publish_ops<F, G>(
+        &self,
+        filename: &str,
+        markdown: &str,
+        remove_temporary: F,
+        sync_parent: G,
+    ) -> Result<CreatedPage>
+    where
+        F: FnOnce(&Dir, &str) -> io::Result<()>,
+        G: FnOnce(&Dir) -> io::Result<()>,
+    {
         if markdown.len() > MAX_NOTE_BYTES {
             bail!("page note exceeds the 4 MiB write limit");
         }
-        let filename = page_filename(page_url)?;
         self.root
             .create_dir_all(&self.pages_dir)
             .context("creating page notes directory")?;
+        sync_directory_chain(&self.root, &self.pages_dir)
+            .context("syncing page notes parent directories")?;
         let pages = self
             .root
             .open_dir(&self.pages_dir)
@@ -99,11 +190,7 @@ impl Vault {
         let mut file = pages
             .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
             .context("creating page note temporary file")?;
-        let mut cleanup = TempFileCleanup {
-            dir: &pages,
-            name: &temporary,
-            armed: true,
-        };
+        let mut cleanup = TempFileCleanup::new(&pages, &temporary);
         let write_result = file
             .write_all(markdown.as_bytes())
             .and_then(|_| file.sync_all());
@@ -113,7 +200,7 @@ impl Vault {
         // A hard link is an atomic no-clobber publication on the same volume.
         // rename() would silently replace a user file with this name.
         pages
-            .hard_link(&temporary, &pages, &filename)
+            .hard_link(&temporary, &pages, filename)
             .with_context(|| {
                 format!("page note already exists or cannot be created: {filename}")
             })?;
@@ -139,7 +226,89 @@ impl Vault {
     }
 }
 
-fn checked_relative_dir(value: &str) -> Result<PathBuf> {
+/// Open the selected directory as a capability, then identify that handle.
+/// Reopening a pathname must never silently authorize a replacement folder.
+pub(crate) fn open_selected_root(
+    chosen: &Path,
+    expected_identity: Option<&str>,
+) -> Result<(Dir, String)> {
+    if !chosen.is_absolute() {
+        bail!("notes folder must be an absolute path");
+    }
+    let canonical = fs::canonicalize(chosen)
+        .with_context(|| format!("resolving notes folder {}", chosen.display()))?;
+    if !canonical.is_dir() {
+        bail!("notes folder is not a directory: {}", canonical.display());
+    }
+    // This is the sole ambient filesystem entry point for vault contents.
+    // cap-std confines subsequent paths to the opened directory.
+    let root = Dir::open_ambient_dir(&canonical, ambient_authority())
+        .with_context(|| format!("opening notes folder {}", canonical.display()))?;
+    let identity = directory_identity(&root)?;
+    if expected_identity.is_some_and(|expected| expected != identity) {
+        bail!("selected notes folder changed; choose it again");
+    }
+    Ok((root, identity))
+}
+
+pub(crate) fn selected_root_identity(chosen: &Path) -> Result<String> {
+    let (_, identity) = open_selected_root(chosen, None)?;
+    Ok(identity)
+}
+
+fn directory_identity(dir: &Dir) -> Result<String> {
+    let metadata = dir
+        .try_clone()
+        .context("cloning notes folder handle")?
+        .into_std_file()
+        .metadata()
+        .context("identifying notes folder")?;
+    if !metadata.is_dir() {
+        bail!("selected notes folder is not a directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "unix:{:016x}:{:016x}",
+            metadata.dev(),
+            metadata.ino()
+        ))
+    }
+    #[cfg(windows)]
+    {
+        // std's by-handle metadata accessors are unstable; winapi-util wraps
+        // GetFileInformationByHandle for the same volume and file IDs.
+        let handle = dir
+            .try_clone()
+            .context("cloning notes folder handle")?
+            .into_std_file();
+        let info = winapi_util::file::information(&handle)
+            .context("identifying notes folder on Windows")?;
+        Ok(format!(
+            "windows:{:08x}:{:016x}",
+            info.volume_serial_number(),
+            info.file_index()
+        ))
+    }
+}
+
+fn review_filename(page_url: &str, proposal_id: &str) -> Result<String> {
+    if proposal_id.len() != 64
+        || !proposal_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("review proposal ID must be a lowercase SHA-256 digest");
+    }
+    let filename = page_filename(page_url)?;
+    let stem = filename
+        .strip_suffix(".md")
+        .context("page filename has no Markdown suffix")?;
+    Ok(format!("{stem}.rauser-review-{proposal_id}.md"))
+}
+
+pub(crate) fn checked_relative_dir(value: &str) -> Result<PathBuf> {
     let path = Path::new(value);
     if path.as_os_str().is_empty()
         || !path
@@ -192,14 +361,24 @@ fn slug(value: &str) -> String {
     }
 }
 
-struct TempFileCleanup<'a> {
+/// Removes a temporary file on early return. Disarm it once the final name is
+/// published: another writer could reuse the temporary name after that.
+pub(crate) struct TempFileCleanup<'a> {
     dir: &'a Dir,
     name: &'a str,
     armed: bool,
 }
 
-impl TempFileCleanup<'_> {
-    fn disarm(&mut self) {
+impl<'a> TempFileCleanup<'a> {
+    pub(crate) fn new(dir: &'a Dir, name: &'a str) -> Self {
+        Self {
+            dir,
+            name,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -213,14 +392,24 @@ impl Drop for TempFileCleanup<'_> {
 }
 
 #[cfg(not(windows))]
-fn sync_directory(dir: &Dir) -> io::Result<()> {
+pub(crate) fn sync_directory(dir: &Dir) -> io::Result<()> {
     dir.try_clone()?.into_std_file().sync_all()?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn sync_directory(_dir: &Dir) -> io::Result<()> {
+pub(crate) fn sync_directory(_dir: &Dir) -> io::Result<()> {
     // std does not expose a portable way to fsync a Windows directory handle.
+    Ok(())
+}
+
+pub(crate) fn sync_directory_chain(root: &Dir, relative: &Path) -> io::Result<()> {
+    let mut current = root.try_clone()?;
+    sync_directory(&current)?;
+    for part in relative.components() {
+        current = current.open_dir(part.as_os_str())?;
+        sync_directory(&current)?;
+    }
     Ok(())
 }
 

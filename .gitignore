@@ -2,6 +2,7 @@
 /node_modules/
 /dist/
 /coverage/
+/protocol/ts/generated.js
 .DS_Store
 *.swp
 *.swo
