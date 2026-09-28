@@ -281,14 +281,19 @@ fn directory_identity(dir: &Dir) -> Result<String> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        let volume = metadata
-            .volume_serial_number()
-            .context("Windows did not return a notes-folder volume ID")?;
-        let file = metadata
-            .file_index()
-            .context("Windows did not return a notes-folder file ID")?;
-        Ok(format!("windows:{volume:08x}:{file:016x}"))
+        // std's by-handle metadata accessors are unstable; winapi-util wraps
+        // GetFileInformationByHandle for the same volume and file IDs.
+        let handle = dir
+            .try_clone()
+            .context("cloning notes folder handle")?
+            .into_std_file();
+        let info = winapi_util::file::information(&handle)
+            .context("identifying notes folder on Windows")?;
+        Ok(format!(
+            "windows:{:08x}:{:016x}",
+            info.volume_serial_number(),
+            info.file_index()
+        ))
     }
 }
 
