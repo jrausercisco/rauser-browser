@@ -402,17 +402,24 @@ mod tests {
     #[test]
     fn a_summary_file_at_the_same_name_is_a_conflict_not_a_note() {
         let (root, vault) = vault();
-        let path = vault.page_relative_path("https://example.com/a").unwrap();
+        let url = "https://example.com/a";
+        let path = vault.page_relative_path(url).unwrap();
         let full = root.path().join(&path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(
-            &full,
-            "---\ntitle: \"T\"\nurl: \"https://example.com/a\"\nbrauser:\n  kind: summary\n  canonical_url: \"https://example.com/a\"\n  url_id: \"x\"\n  created: 2026-01-01T00:00:00Z\n---\n\nbody\n",
-        )
-        .unwrap();
+        // Everything but `kind` matches a real note for this URL, so only the
+        // kind guard can refuse it.
+        let owned = |kind_line: &str| {
+            format!(
+                "---\ntitle: \"T\"\nurl: \"{url}\"\nbrauser:\n{kind_line}  canonical_url: \"{url}\"\n  url_id: \"{}\"\n  created: 2026-01-01T00:00:00Z\n---\n\nbody\n",
+                hex::encode(Sha256::digest(url.as_bytes()))
+            )
+        };
+        std::fs::write(&full, owned("")).unwrap();
+        assert!(load_note(&vault, url).unwrap().exists);
 
+        std::fs::write(&full, owned("  kind: summary\n")).unwrap();
         assert!(matches!(
-            load_note(&vault, "https://example.com/a"),
+            load_note(&vault, url),
             Err(NoteRequestError::Conflict(_))
         ));
     }
