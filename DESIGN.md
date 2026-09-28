@@ -125,16 +125,17 @@ The extension runs in a hostile environment (arbitrary web pages), and the host 
 
 ### 5.2 Summaries
 
-1. The extension extracts readable content (Readability-style) from the active tab on demand.
+1. The extension extracts readable content (Readability-style) from the active tab on demand. Any HTTP(S) page can be summarized. A side-panel click does not grant `activeTab` (§8), so when the extension does not already hold the page's exact origin, the panel's summarize click requests it, and Chrome prompts once for that site. A grant made for summarizing does not enable logging; the host's site rules still decide what is logged.
 2. The host checks the denylist, then invokes the configured harness with the summary prompt.
 3. Output streams back to the sidebar in chunks, staying under the 1 MB native messaging limit per message.
-4. The host writes the final summary itself. Until managed-block replacement is proven (§6.4), a page with no note gets a new note containing the summary, and a page with an existing note gets a no-clobber sibling review draft, as M1 page notes do.
+4. The host writes the final summary itself, to a summary file that is a separate record from the page note (§6.1). The note holds only the user's own text; Brauser never writes a summary into it. Each page has one summary file, keyed by the same URL-derived identity as its page note. The summary records the page URL and links to the page note. Summarizing the page again replaces the whole file atomically. Summary files belong to Brauser, and user edits to them are not preserved. Before replacing, the host checks the file's recorded canonical URL and Brauser ownership; a file that fails the check is a conflict and is never overwritten.
 
 ### 5.3 Page notes
 
 - One markdown file per normalized URL.
 - The note's title comes from the page's title (or its host name when the page has none); the panel asks only for the note text.
 - The user edits notes in the sidebar or in any external editor. Both are first-class.
+- A page note holds only the user's thoughts. Agent output goes to the page's separate summary file (§5.2).
 
 ### 5.4 Read later
 
@@ -155,7 +156,7 @@ Input is either a slash command or free text.
 
 | Command | Action |
 |---|---|
-| `/summarize` | Summarize the page into its note |
+| `/summarize` | Summarize the page into its summary file |
 | `/note <text>` | Append text to the page note |
 | `/save` | Add the page to read later |
 | `/related` | Show related pages |
@@ -186,7 +187,8 @@ The user chooses the notes folder at setup. It can be empty, or a subfolder of a
 ```
 <notes folder>/                  chosen by the user, no default
   log/2026/09/2026-09-27.md      daily browse log
-  pages/<slug>.md                page note: summary + user notes
+  pages/<slug>.md                page note: the user's text only
+  summaries/<slug>.md            one Brauser-owned summary per page (M2)
   later/<slug>.md                read-later items
 ```
 
@@ -288,13 +290,22 @@ default = "claude-code"              # whichever the user chose; unset means no 
 
 [agent.harnesses.claude-code]
 binary = "/usr/local/bin/claude"
-args = ["-p", "{prompt}"]            # illustrative; verify against harness docs
+args = ["-p", "{prompt}", "--tools", "", "--disallowedTools", "*",
+        "--strict-mcp-config", "--setting-sources", "", "--permission-mode", "dontAsk",
+        "--max-turns", "1", "--no-session-persistence", "--output-format", "stream-json",
+        "--verbose", "--include-partial-messages"]
 env_allow = ["HOME", "PATH"]
 timeout_secs = 120
 
 [agent.harnesses.codex]
 binary = "/usr/local/bin/codex"
-args = ["exec", "{prompt}"]          # illustrative; verify against harness docs
+args = ["exec", "--sandbox", "read-only", "--ignore-user-config", "--ignore-rules",
+        "--ephemeral", "--skip-git-repo-check", "--json",
+        "-c", "approval_policy=\"never\"", "-c", "web_search=\"disabled\"",
+        "--disable", "shell_tool", "--disable", "unified_exec", "--disable", "apps",
+        "--disable", "plugins", "--disable", "multi_agent", "--disable", "hooks",
+        "--disable", "memories", "--disable", "browser_use", "--disable", "computer_use",
+        "--disable", "image_generation", "{prompt}"]
 
 [agent.harnesses.generic]
 binary = "/path/to/any-cli"
@@ -303,6 +314,8 @@ stdin = "page"
 ```
 
 `{prompt}` is the command prompt only. Page content always goes on stdin, never into argv.
+
+The argument lists above follow the Claude Code 2.1.283 and codex-cli 0.144.4 documentation and help output (checked 2026-09-28) but have not yet been run. Each harness starts in a new empty temporary directory, so no project instructions or project config load. Claude Code with `--tools ""` and `--disallowedTools "*"` has no tools; if `--setting-sources ""` is rejected, `--safe-mode` also stops CLAUDE.md, hooks, MCP servers, and plugins from loading. Administrator-managed settings still apply. Codex documents no switch that removes every tool, and its feature names change between versions, so the host rejects any Codex run whose JSON event stream contains a tool call. At setup, the host records each harness's version, checks its `--help` output (and `codex features list`) for every flag it will pass, and refuses a harness that lacks one. A non-zero exit fails the run. Prompt injection in page content can still distort a summary; it cannot run commands or write files.
 
 ### 7.2 Site adapters
 
@@ -331,7 +344,7 @@ agent_denylist = []                  # user-defined; setup offers suggested cate
 strip_params = ["utm_*", "fbclid", "gclid"]
 ```
 
-The denylist starts empty rather than shipping a guess at what the user considers sensitive. Setup prompts the user to add domains and offers suggested categories (banking, email, HR, health) as examples to adapt.
+The denylist starts empty rather than shipping a guess at what the user considers sensitive. The first harness setup shows the denylist and offers suggested categories (banking, email, HR, health) as examples to adapt. No AI command runs until the user confirms the list once, even if they leave it empty.
 
 ## 8. Extension Permissions
 
@@ -341,9 +354,10 @@ The denylist starts empty rather than shipping a guess at what the user consider
 | `nativeMessaging` | Talk to the host |
 | `storage` | UI preferences and the capped visit buffer (§3.2) |
 | `webNavigation` | Optional in M1; requested only when the user enables logging |
+| `scripting` | Optional, M2; runs the pinned content extractor in a tab whose exact origin is granted |
 | `optional_host_permissions` | Manifest declares HTTP(S) patterns for sites discovered during setup; Chrome grants only the exact origin requested for an enabled site. Adapter paths remain host-enforced |
 
-The manifest's broad optional HTTP(S) patterns permit runtime requests for user-chosen sites; no origin is granted at install time. The permission request runs directly from a settings-page button while Chrome still has the user gesture, before awaiting native confirmation. If native confirmation is canceled, the extension removes any newly granted origin and optional API permission. Removing a grant stops capture for that origin and purges its buffered events. The service worker reads the title from tab metadata on granted sites; M1 requests neither `scripting` nor `activeTab`. Content extraction and its separate permissions belong to M2.
+The manifest's broad optional HTTP(S) patterns permit runtime requests for user-chosen sites; no origin is granted at install time. The permission request runs directly from a settings-page button while Chrome still has the user gesture, before awaiting native confirmation. If native confirmation is canceled, the extension removes any newly granted origin and optional API permission. Removing a grant stops capture for that origin and purges its buffered events. The service worker reads the title from tab metadata on granted sites; M1 requests neither `scripting` nor `activeTab`. M2 adds `scripting` for content extraction. It does not rely on `activeTab`, because a click in the side panel does not grant it; the summarize click requests the page's exact origin instead (§5.2).
 
 No broad host permissions are requested at install time.
 
@@ -424,12 +438,12 @@ The plan follows Chrome's current [optional-permission rules](https://developer.
 1. **M1 acceptance on macOS: done (2026-09-28).** The full run passed on both a nondefault and the default port (above).
    - **Windows parked (2026-09-28).** No Windows machine is available, so the Windows smoke runner and its interactive run are deferred. Windows CI continues to build and test every PR. Porting the runner (Chrome path, native-host registration in the registry rather than the profile, and no `pbcopy`), the Windows run, and its default-port check are release blockers tracked under M5.
 2. **Catch page-load regressions in CI (optional, recommended).** Unit tests import the pages but do not load the built extension. A headless Chrome step that loads `extension/dist/` and opens the panel and settings page would have caught the stale-manifest class of failure before a manual run.
-3. **Settle M2 design before code.** Resolve the M2 questions in §14 and record the answers in §4.5, §5.2, §7.1, and §8.
+3. **Settle M2 design before code: done (2026-09-28).** The answers are in §14 and in §5.2, §6.1, §7.1, §7.3, and §8.
 4. **Build M2 in this order**, each step reviewed and merged separately:
    1. Harness setup: the host offers harnesses found on `PATH` and shows a native confirmation of the binary, arguments, and environment allowlist. As with `storage.root`, the extension never supplies a raw binary path; `update_config` requires a single-use token bound to the confirmed harness entry.
    2. Host invocation: a cleared environment, argv from the template, page content on stdin inside the untrusted-data block, and a timeout, output cap, and process-tree kill. Test with a fake harness binary on both OSes.
    3. Streaming protocol: the host currently answers one request at a time, so it needs a reader that stays responsive while a harness runs. Add chunk, completion, error, and `cancel` messages correlated by `request_id`, each under the 1 MB native-messaging limit. Closing the panel (stdin EOF) kills the harness.
-   4. Content extraction with a bundled, pinned Readability-style library, and the permissions §14 settles.
+   4. Content extraction with a bundled, pinned Readability-style library, and the permissions in §8. First confirm with the real-Chrome smoke runner that `chrome.permissions.request` from a side-panel click shows Chrome's prompt.
    5. `/summarize` in the panel, with denylist checks and the summary write described in §5.2.
 5. **M3–M5** follow as in the table. The compact visit-ID index, the Windows smoke run, and Windows directory-entry durability are release blockers tracked under M5.
 
@@ -443,9 +457,9 @@ The plan follows Chrome's current [optional-permission rules](https://developer.
 
 No open M0 or M1 design questions. The release hosting, support, platform, browser, and signing policies are defined in §11; M1 security requirements are recorded in §12.
 
-Open for M2:
+M2 decisions (2026-09-28):
 
-- **Extraction permissions.** Enabled sites already hold an exact origin grant, so `scripting` alone could extract from them. Summarizing any other page needs `activeTab` or a per-origin request. Verify whether a click in the side panel grants `activeTab`; if not, choose between summarizing enabled sites only and requesting the origin in the click gesture.
-- **Summary destination.** §5.2 proposes a new note or a sibling review draft. The alternative is to build the displaced-byte backup (§6.4) first so summaries can replace the managed block. Recommended: ship drafts first.
-- **Harness modes.** Confirm, against current Claude Code and Codex documentation, the arguments that run each harness without shell or file-writing tools (§4.5) before shipping their templates.
-- **Denylist setup.** §7.3 starts the denylist empty. Decide whether the first harness setup requires the user to review it before any AI command runs.
+- **Extraction permissions.** Any page can be summarized. A side-panel click does not grant `activeTab`: Chrome's documentation lists only the action click, context menus, keyboard commands, and the omnibox, and Chromium withholds tab permissions from the side panel. The panel's summarize click therefore requests the page's exact origin when it is not already granted. Chromium's permission request needs only a user gesture and a browser window, so this is expected to show Chrome's prompt from the panel; confirm it with the smoke runner before building extraction (§12.2).
+- **Summary destination.** A summary is a separate record from the page note: one Brauser-owned summary file per page, replaced whole on each new summary, linking to the page and its note (§5.2). The note holds only the user's own text. Because summaries never touch notes, M2 does not need the managed-block replacement in §6.4.
+- **Harness modes.** Checked against the Claude Code 2.1.283 and codex-cli 0.144.4 documentation and help output (§7.1). Claude Code can run with no tools. Codex can run with its shell, web search, and user config disabled in a read-only sandbox, but documents no switch that removes every tool, so the host rejects any Codex run whose JSON event stream shows a tool call.
+- **Denylist setup.** Required once: the first harness setup shows the agent denylist with its suggested categories, and no AI command runs until the user confirms it, even if they leave it empty (§7.3).
