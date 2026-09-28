@@ -1,0 +1,395 @@
+# Rauser Browser Browsing Assistant — Design Specification
+
+> Status: Draft v0.3 · Short name "Rauser"; CLI and binary `rauser` · License: Apache-2.0 · Platforms: Chrome/Chromium on macOS and Windows
+
+## 1. Purpose
+
+Rauser turns the browser into a place where context accumulates instead of disappearing. It runs as an always-on sidebar that:
+
+- **Logs** important sites the user visits
+- **Summarizes** pages into notes using the user's own local AI agent
+- **Annotates** sites with persistent, per-page notes
+- **Saves** pages for later
+- **Surfaces** related pages from the user's history and notes
+- Provides an **omnibar** for commands and free-text workflows, usually operating on the current page
+
+Captured notes, browse logs, and read-later items are plain Markdown in a folder the user chooses. Operational config and a rebuildable search index stay in standard per-user OS locations. No cloud service, no account, no telemetry.
+
+## 2. Design Principles
+
+1. **The user owns the data.** Markdown files are the source of truth. Everything else, such as the search index, is a rebuildable cache.
+2. **Least privilege everywhere.** The extension cannot touch the filesystem. The host cannot do anything it isn't configured to do. Sites are opt-in.
+3. **Page content is untrusted.** Any page the user visits may contain hostile content, including prompt injection aimed at the agent.
+4. **Never clobber user edits.** Rauser only modifies what it owns.
+5. **Format-neutral, convention-friendly.** Output works in any markdown tool. Obsidian is a first-class preset, not a dependency.
+6. **Configuration over code.** Agent harnesses, site adapters, and omnibar commands are defined in config, not hardcoded.
+7. **Assume nothing about the user's setup.** No default vault location, agent, folder structure, or site list. Rauser ships with examples, and the user makes every choice explicitly at setup. It never writes into a folder the user hasn't chosen.
+8. **No always-running native service.** The host runs only while the side panel is open. If the user enables site logging, the browser's event-driven extension service worker may wake on navigation while the browser is open to buffer allowlisted visits; nothing runs when the browser is closed.
+
+## 3. Architecture
+
+```
+┌──────────────────────────────┐        native messaging        ┌──────────────────────────────┐
+│  Browser extension (TS, MV3) │  ◄──── JSON, versioned ────►   │  Native host (Rust)          │
+│                              │                                │                              │
+│  • Sidebar UI + omnibar      │                                │  • Policy enforcement        │
+│  • Navigation observation    │                                │  • Vault read/write          │
+│  • Content extraction        │                                │  • Search index (SQLite FTS5)│
+│  • No secrets, no FS access  │                                │  • Agent invocation          │
+└──────────────────────────────┘                                │  • Config owner              │
+                                                                └──────────┬───────────────────┘
+                                                                           │ argv, no shell
+                                                             ┌─────────────┴─────────────┐
+                                                             │  Local agent harness       │
+                                                             │  (Claude Code, Codex, CLI) │
+                                                             └───────────────────────────┘
+```
+
+### 3.1 Browser extension
+
+- TypeScript in strict mode, Manifest V3, bundled with a pinned build toolchain.
+- Targets Chrome first. Other Chromium-based browsers are supported only when listed in the tested release matrix in §11. Firefox and Safari are out of scope.
+- Sidebar via the Chromium `sidePanel` API.
+- Holds UI state only. It stores no secrets and makes no network requests to external services.
+- No remote code: no `eval`, no dynamically loaded scripts, and a strict extension CSP.
+
+### 3.2 Native host
+
+- Single static Rust binary, `#![forbid(unsafe_code)]` in all first-party crates.
+- The only component with filesystem and process privileges.
+- Treats every inbound message as untrusted, because a compromised page or extension context could influence it.
+- Registered through a native messaging manifest whose `allowed_origins` lists only the official extension IDs.
+
+**Lifecycle.** The host runs only while the side panel is open. It is never a daemon, service, or login item. The side panel opens the native messaging connection when it loads, the browser spawns the host, and the host exits when the connection closes (stdin EOF), which happens when the panel closes. Work the host would otherwise do in the background, such as catching up on external edits to notes, happens on connect instead (see §5.5).
+
+While the panel is closed, the extension's service worker still observes navigation on enabled sites and buffers qualifying visits in `chrome.storage.local`. The buffer holds only what a log entry needs (normalized URL, title, timestamp), is capped in size, and is flushed to the host and cleared the next time the panel opens. Summaries and other agent tasks run only while the panel is open.
+
+### 3.3 Why this split
+
+The extension runs in a hostile environment (arbitrary web pages), and the host holds real privileges (files, processes). Putting all policy in the host means a bug in the extension cannot escalate into arbitrary file writes or command execution. Rust gives memory safety on the side of the boundary where it matters most.
+
+## 4. Security Model
+
+### 4.1 Threats in scope
+
+| Threat | Mitigation |
+|---|---|
+| Malicious page influences extension messages | Host validates and authorizes every request; extension is not trusted |
+| Path traversal / symlink escape out of the vault | Host builds all paths from its own slugs; canonical-root confinement; capability-based FS access (e.g. `cap-std`) |
+| Command injection via agent invocation | Harnesses run via argv with no shell; page content passed on stdin, never interpolated into argv |
+| Prompt injection from page content | Content delimited and labelled untrusted; agent run in its most restricted mode for read-only tasks; outputs written only to Rauser-owned locations |
+| Sensitive pages sent to an agent | Agent denylist enforced in the host, overriding explicit user requests with a warning |
+| Unwanted browsing surveillance | Logging is opt-in per domain; incognito never logged |
+| Other local extensions talking to the host | `allowed_origins` restricted to official extension IDs |
+| Supply chain compromise | Pinned dependencies, `cargo-audit`/`cargo-deny`, npm lockfile audit, signed releases with provenance |
+
+### 4.2 Threats out of scope
+
+- A compromised local user account or OS
+- A compromised agent harness binary
+- Malicious config files written by the user
+
+### 4.3 Host message handling
+
+- Messages are length-prefixed JSON, capped at a configurable size (default 4 MB inbound).
+- Deserialized into typed structs with `deny_unknown_fields`. Unknown message types are rejected.
+- Every message carries a protocol version and request ID. Version mismatch returns a structured error.
+- Parser and path handling are fuzzed continuously (see §10).
+
+### 4.4 Filesystem rules
+
+- The vault root is canonicalized at startup. All file access goes through a root-scoped directory handle.
+- Filenames are generated by the host from normalized slugs. The extension never supplies a raw path.
+- Writes are atomic: temp file in the same directory, fsync, rename.
+- Advisory file locks prevent concurrent writes from the host and the user's editor from corrupting a file.
+- Destructive operations (delete, overwrite outside a managed block) require explicit user confirmation in the sidebar.
+
+### 4.5 Agent invocation rules
+
+- Each harness is a config entry: absolute binary path, argument template, and environment allowlist.
+- Spawned with a cleared environment plus allowlisted variables, a timeout, an output size cap, and cancellation support.
+- Page content goes on stdin inside a delimited block with an explicit instruction that it is untrusted data.
+- For summarization and Q&A, harnesses should be configured in a mode without shell or file-writing tools. The host writes results itself; the agent never writes into the vault directly.
+- The agent denylist (banking, HR, health portals, etc.) blocks content from those domains from ever reaching an agent.
+
+## 5. Features
+
+### 5.1 Site logging
+
+- Logging is **opt-in**: a domain allowlist, plus optional dwell-time and scroll-depth thresholds.
+- Incognito and private windows are never logged, regardless of config.
+- SPA navigation is observed via `webNavigation.onHistoryStateUpdated` and tab updates.
+- URLs are normalized before logging: tracking parameters stripped, fragments dropped, and site-adapter rules applied (e.g. GitHub collapses file views to the repository).
+- Duplicate visits within a configurable window update the existing entry instead of creating a new one.
+
+### 5.2 Summaries
+
+1. The extension extracts readable content (Readability-style) from the active tab on demand.
+2. The host checks the denylist, then invokes the configured harness with the summary prompt.
+3. Output streams back to the sidebar in chunks, staying under the 1 MB native messaging limit per message.
+4. The final summary is written into the page note's managed block.
+
+### 5.3 Page notes
+
+- One markdown file per normalized URL.
+- The user edits notes in the sidebar or in any external editor. Both are first-class.
+
+### 5.4 Read later
+
+- `/save` writes a read-later entry with an optional agent summary.
+- Items can be marked done, which moves them in the index but never deletes the file.
+
+### 5.5 Related pages
+
+- The host maintains a SQLite FTS5 index over titles, summaries, notes, and tags.
+- When the active tab changes, the sidebar shows related pages ranked by text relevance, shared tags, and shared domain.
+- v1 is keyword search. Embedding-based similarity is a later, optional stage.
+- The index lives in the OS cache directory, not in the user's notes folder, and can be deleted and rebuilt at any time with `rauser reindex`.
+- On each connect, the host does an incremental scan (by modification time) to pick up files edited outside Rauser. While connected, it watches the notes folder for changes. There is no scheduled reindexing.
+
+### 5.6 Omnibar
+
+Input is either a slash command or free text.
+
+| Command | Action |
+|---|---|
+| `/summarize` | Summarize the page into its note |
+| `/note <text>` | Append text to the page note |
+| `/save` | Add the page to read later |
+| `/related` | Show related pages |
+| `/log` | Force-log the current page, ignoring thresholds |
+| free text | Send to the agent with the page as context; show the answer in the sidebar |
+
+**Custom commands** are defined in config:
+
+```toml
+[[commands]]
+name = "actions"
+description = "Extract action items from this page"
+prompt = """
+Extract action items from the page below. Return a markdown checklist.
+"""
+include = ["page.content", "selection"]
+output = "page_note"        # sidebar | page_note | new_note | clipboard
+```
+
+Template variables: `{page.title}`, `{page.url}`, `{page.content}`, `{selection}`, `{input}`, `{date}`.
+
+## 6. Data Format
+
+### 6.1 Folder layout
+
+The user chooses the notes folder at setup. It can be empty, or a subfolder of an existing knowledge base. The three content locations are configurable; the layout below is the suggested starting point offered at setup, not a requirement.
+
+```
+<notes folder>/                  chosen by the user, no default
+  log/2026/09/2026-09-27.md      daily browse log
+  pages/<slug>.md                page note: summary + user notes
+  later/<slug>.md                read-later items
+```
+
+Rauser's own files live outside the notes folder, in standard OS locations, so it never adds hidden folders to someone's knowledge base:
+
+| File | Location |
+|---|---|
+| `config.toml` | OS config directory (e.g. `~/Library/Application Support/Rauser` on macOS, `%APPDATA%\Rauser` on Windows) |
+| `index.db` | OS cache directory |
+
+If Rauser finds an existing folder with files it didn't create, it leaves them alone. It only indexes files under its configured content locations.
+
+### 6.2 Internal model
+
+The host works on a single `Note` type: `url`, `canonical_url`, `title`, `created`, `updated`, `tags`, `links`, `summary`, `body`. Profiles only control serialization.
+
+### 6.3 Profiles
+
+The **neutral** profile (default) uses YAML frontmatter, relative markdown links, and frontmatter tag lists. It renders correctly on GitHub, in VS Code, and in Obsidian.
+
+The **obsidian** preset switches to `[[wikilinks]]` and Obsidian-compatible daily-note paths.
+
+Custom profiles can extend either one.
+
+```toml
+[storage]
+root = "/path/chosen/at/setup"       # required, no default
+profile = "neutral"                  # neutral | obsidian | <custom name>
+log_dir = "log"
+pages_dir = "pages"
+later_dir = "later"
+
+[profiles.obsidian]
+links = "wikilink"
+tags = "frontmatter"
+daily_log = "log/{YYYY}/{MM}/{YYYY-MM-DD}.md"
+filename = "{title-slug}"
+
+[profiles.custom]
+extends = "neutral"
+frontmatter = "toml"
+```
+
+**Reading is lenient, writing follows the profile.** The indexer parses both link styles and any frontmatter format. Switching profiles never rewrites existing files; `rauser migrate --profile <name>` converts them and defaults to a dry run.
+
+### 6.4 Managed blocks
+
+Rauser owns only:
+
+- Its own frontmatter keys, namespaced under `rauser:`
+- Content between `<!-- rauser:start -->` and `<!-- rauser:end -->`
+
+Everything else, including unknown frontmatter keys and anything the user writes, is preserved byte for byte. If the markers are missing or malformed, the host appends a new block and does not attempt repair.
+
+### 6.5 Example page note (neutral profile)
+
+```markdown
+---
+title: Designing Data-Intensive Applications — Chapter 5
+url: https://example.com/ddia/ch5
+tags: [replication, databases]
+rauser:
+  created: 2026-09-27T10:14:00Z
+  updated: 2026-09-27T10:15:12Z
+  visits: 3
+---
+
+<!-- rauser:start -->
+## Summary
+Leader-based replication trades write availability for consistency...
+<!-- rauser:end -->
+
+## My notes
+Compare this with how our event pipeline handles failover.
+```
+
+## 7. Configuration
+
+Config lives in the OS config directory (§6.1) and is owned by the host. The extension reads and edits it only through host messages, which validate every change.
+
+The config starts nearly empty. Setup writes only what the user chooses; everything else is either off or an inert, commented-out example. The host refuses to perform an action whose required config is missing and tells the sidebar what to configure, rather than guessing.
+
+### 7.1 Agent harnesses
+
+An agent is optional. Without one, logging, notes, read later, and related pages all still work; only AI commands are disabled.
+
+Rauser ships adapter templates for Claude Code, Codex, and a generic CLI, but configures none of them automatically. At setup, the host may look for known harnesses on `PATH` and offer what it finds; the user confirms the binary path and chooses one. Nothing is enabled without that confirmation.
+
+```toml
+[agent]
+default = "claude-code"              # whichever the user chose; unset means no agent
+
+[agent.harnesses.claude-code]
+binary = "/usr/local/bin/claude"
+args = ["-p", "{prompt}"]            # illustrative; verify against harness docs
+env_allow = ["HOME", "PATH"]
+timeout_secs = 120
+
+[agent.harnesses.codex]
+binary = "/usr/local/bin/codex"
+args = ["exec", "{prompt}"]          # illustrative; verify against harness docs
+
+[agent.harnesses.generic]
+binary = "/path/to/any-cli"
+args = ["{prompt}"]
+stdin = "page"
+```
+
+`{prompt}` is the command prompt only. Page content always goes on stdin, never into argv.
+
+### 7.2 Site adapters
+
+```toml
+[[sites]]
+name = "github"
+match = ["https://github.com/*"]
+normalize = "repo"                   # collapse to owner/repo
+log = true
+
+[[sites]]
+name = "jira"
+match = ["https://*.atlassian.net/browse/*"]
+title_selector = "h1"
+log = true
+```
+
+Rauser ships adapters for common sites as a library of templates, all disabled. The user enables the ones they want, and can edit their match patterns (for example, to point Jira at a self-hosted instance). Enabling a site adapter prompts for the matching optional host permission.
+
+### 7.3 Privacy
+
+```toml
+[privacy]
+log_incognito = false                # cannot be set to true
+min_dwell_secs = 20
+agent_denylist = []                  # user-defined; setup offers suggested categories
+strip_params = ["utm_*", "fbclid", "gclid"]
+```
+
+The denylist starts empty rather than shipping a guess at what the user considers sensitive. Setup prompts the user to add domains and offers suggested categories (banking, email, HR, health) as examples to adapt.
+
+## 8. Extension Permissions
+
+| Permission | Why |
+|---|---|
+| `sidePanel` | Always-on sidebar |
+| `nativeMessaging` | Talk to the host |
+| `storage` | UI preferences and the capped visit buffer (§3.2) |
+| `activeTab`, `scripting` | Extract content from the current page on demand |
+| `webNavigation` | Observe SPA navigation on allowlisted sites |
+| `optional_host_permissions` | Granted per site when its adapter is enabled |
+
+No broad host permissions are requested at install time.
+
+## 9. Repository Layout
+
+```
+/extension        TypeScript MV3 extension
+/host             Rust native host (workspace: protocol, vault, index, agent, cli)
+/protocol         Shared message schema (JSON Schema → generated TS and Rust types)
+/installers       macOS and Windows user installers; optional Homebrew formula
+/fixtures         Sample vault and captured pages for tests
+/docs             DESIGN.md, SECURITY.md, CONTRIBUTING.md, config reference
+```
+
+The message schema is defined once and code-generated for both sides, so the extension and host cannot drift.
+
+## 10. Quality
+
+- **Host:** unit tests, property tests on URL normalization and slug generation, and fuzzing (`cargo-fuzz`) on the message parser, frontmatter parser, and path handling.
+- **Extension:** unit tests, plus Playwright end-to-end tests running the real extension against a real host and a fixture vault.
+- **Round-trip tests:** every profile writes, reads back, and re-writes with no diff, and user content outside managed blocks survives unchanged.
+- **CI on every PR:** `clippy -D warnings`, `rustfmt`, `cargo-deny`, ESLint, TypeScript strict, dependency review, and the full test suite on macOS and Windows.
+
+## 11. Distribution
+
+- **Download experience:** provide one public Rauser download page with two clearly labeled steps: install the browser extension from the Chrome Web Store, then download and run the signed native-host installer for the user's OS. The page explains why both parts are needed, links to supported-browser instructions, and offers a short troubleshooting path. The native host is a companion installer; do not ask users to build from source, use a terminal, or install Homebrew to get started.
+- **Extension:** publish the stable release through the Chrome Web Store. Keep the published extension ID stable because the native-host manifest authorizes that exact ID. Chrome Web Store installation is the supported path on Windows and macOS; do not instruct users to install a local CRX.
+- **Supported browser:** Google Chrome Stable only, on macOS and Windows. Test the current and previous two stable major versions and publish the tested range on the download page. Edge, Brave, Arc, other Chromium browsers, Firefox, and Safari are unsupported in the first release. Chrome's Side Panel API requires Chrome 114 or later; the release floor must also satisfy the current three-version support window.
+- **macOS package:** offer a signed and notarized per-user `.pkg` for macOS 15 Sequoia and later, with a universal Intel and Apple silicon host binary and a Chrome user-level native-messaging manifest. Sign the app with the publisher's Developer ID Application identity and the installer package with its Developer ID Installer identity. Homebrew may be offered as an additional channel for technical users, not as the primary consumer install path.
+- **Windows package:** offer a signed per-user x64 installer for Windows 11 version 25H2 and later supported releases. Register the native host under `HKEY_CURRENT_USER` for Google Chrome only, without administrator rights. Sign the installer and binaries with a trusted Authenticode code-signing certificate and timestamp the signatures. Windows 10 and Windows on ARM are unsupported in the first release. Document what happens when organizational policy blocks per-user installation.
+- **Native-host registration:** register only Google Chrome, using its documented user-level manifest location on macOS and registry entry on Windows. The installer must use the stable Chrome Web Store extension ID in `allowed_origins`; it must never use wildcard origins. `rauser register` may repair the Chrome registration after installation, with a clear confirmation and status report. Uninstallation removes only Rauser's host registration and installed binaries.
+- **First-run flow:** after the extension is installed, opening the side panel checks for the host and gives a direct OS-specific download link if it is missing. After host installation, the panel verifies host/protocol compatibility and guides the user through choosing a notes folder, profile, optional agent, optional sites, and privacy exclusions. Explain permissions at the point they are requested. Show a final review of what will be captured and where it will be written; capture stays off until the user finishes setup. Include a no-agent setup path that reaches a usable capture experience.
+- **Upgrade and removal:** browser-store updates apply to the extension; host updates use the signed OS installer and preserve the configured notes folder. Show a clear incompatibility error if extension and host protocol versions do not match. Uninstall leaves the user's notes and config untouched by default, and the documentation explains how to remove them manually.
+- **Release page and support:** use the public GitHub repository's Releases page as the canonical download page. Each release links to the Chrome Web Store listing, the macOS `.pkg`, Windows x64 installer, checksums, install/upgrade/rollback/uninstall instructions, troubleshooting, and the GitHub Issues support channel. Do not publish a release until both OS installers and the extension have passed the install and uninstall checks.
+- **Release artifacts:** publish signed installers, checksums, SLSA build provenance, and an SBOM for every release. Reproducible builds are a stretch goal.
+
+## 12. Build Order
+
+| Milestone | Scope |
+|---|---|
+| **M0 — Foundation** | Protocol schema, host skeleton, config loading, vault confinement, atomic writes, CI |
+| **M1 — Capture** | Sidebar shell, site logging, URL normalization, daily log, page notes with managed blocks |
+| **M2 — Agent** | Harness adapters, streaming, `/summarize`, denylist enforcement |
+| **M3 — Related** | FTS5 index, related pages, read later, `reindex` |
+| **M4 — Omnibar** | Built-in commands, free text, custom commands |
+| **M5 — Release** | Installers, store listings, signing and provenance, docs |
+
+M1 is a useful release on its own: secure, private capture with no agent required.
+
+## 13. Platforms and License
+
+- **Browsers:** Google Chrome Stable only; see the release support window in §11. Edge and all other browsers are out of scope for the first release.
+- **Operating systems:** macOS 15 Sequoia and later on Intel or Apple silicon; Windows 11 version 25H2 and later supported releases on x64. Windows 10, Windows on ARM, and Linux are out of scope for the first release.
+- **License:** Apache-2.0, chosen for its explicit patent grant.
+
+## 14. Open Questions
+
+None. The repository URL and issued signing certificates are deployment values for the release process; the selected hosting, support, platform, browser, and signing policies are defined in §11.
