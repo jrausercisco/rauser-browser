@@ -27,4 +27,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .status { border-radius: 5px; background: #24619a20; margin: 12px 0; padding: 10px; overflow-wrap: anywhere; }
 .status.error, .warning { color: #a34126; }
 .plain-list { padding-left: 18px; margin: 4px 0; overflow-wrap: anywhere; }
+header.panel-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+button.icon-button { display: inline-grid; place-items: center; background: transparent; color: inherit; padding: 6px; margin: 0; }
+button.icon-button:hover { background: #8883; }
+.setup-warning { border: 1px solid #a3412680; border-radius: 5px; background: #a3412614; margin: 12px 0; padding: 10px; }
+.setup-warning p { margin: 0 0 8px; color: #a34126; }
 footer { border-top: 1px solid #8885; padding-top: 10px; font-size: .85rem; }

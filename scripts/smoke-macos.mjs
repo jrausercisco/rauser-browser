@@ -447,8 +447,16 @@ async function run() {
     console.log("Chrome-to-native-host hello passed.");
     console.log("Click the Rauser toolbar action to open its side panel.");
 
+    await checkpoint("First-run setup warning",
+      "Check that the side panel says Rauser isn't set up yet. Click the gear icon (or Open settings) to open Rauser settings in a tab.",
+      async () => {
+        const reply = await hostConfig(wrapper);
+        requireCondition(reply.config.storage === null && !reply.config.capture_enabled,
+          "The isolated host configuration is not in its first-run state");
+      });
+
     await checkpoint("First-run folder cancellation",
-      "Click Choose folder, cancel the native picker, and check that the panel still says None selected.",
+      "On the settings page, click Choose folder, cancel the native picker, and check that it still says None selected.",
       async () => {
         const reply = await hostConfig(wrapper);
         requireCondition(reply.config.storage === null && !reply.config.capture_enabled && reply.config.sites.length === 0,
@@ -457,7 +465,7 @@ async function run() {
       });
 
     await checkpoint("Canceled native consent",
-      `Choose ${notes}; enter Site URL ${origin} and Allowed path prefix /allowed. Click Enable this site, accept Chrome access, then decline the native confirmation. The panel should report cancellation.`,
+      `Choose ${notes}; enter Site URL ${origin} and Allowed path prefix /allowed. Click Enable this site, accept Chrome access, then decline the native confirmation. The settings page should report cancellation.`,
       async () => {
         const reply = await hostConfig(wrapper);
         requireCondition(reply.config.storage === null && !reply.config.capture_enabled && reply.config.sites.length === 0,
@@ -465,7 +473,7 @@ async function run() {
       });
 
     await checkpoint("Confirmed setup",
-      "Click Enable this site again, accept Chrome access and the native confirmation. If the selection token expired, choose the notes folder again. Reopen the panel if Chrome reloads the extension.",
+      "Click Enable this site again, accept Chrome access and the native confirmation. If the selection token expired, choose the notes folder again. If Chrome reloads the extension, reopen the settings page and the side panel. The side panel setup warning should disappear.",
       async () => {
         const reply = await hostConfig(wrapper);
         const selectedRoot = reply.config.storage?.root;
@@ -543,7 +551,7 @@ async function run() {
       });
 
     await checkpoint("Site removal",
-      `Click Remove beside ${origin}/allowed in the panel. It should disappear from Enabled sites.`,
+      `On the settings page, click Remove beside ${origin}/allowed. It should disappear from Enabled sites, and the side panel should show the setup warning again.`,
       async () => {
         const reply = await hostConfig(wrapper);
         requireCondition(!reply.config.capture_enabled && reply.config.sites.length === 0,

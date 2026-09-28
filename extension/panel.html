@@ -8,45 +8,26 @@
   </head>
   <body>
     <main>
-      <header>
-        <h1>Rauser</h1>
-        <p class="eyebrow">M1 development build · Chrome</p>
+      <header class="panel-header">
+        <div>
+          <h1>Rauser</h1>
+          <p class="eyebrow">M1 development build · Chrome</p>
+        </div>
+        <button id="open-settings" type="button" class="icon-button" aria-label="Open Rauser settings" title="Settings">
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" width="20" height="20">
+            <path fill="currentColor" d="M19.14 12.94a7.2 7.2 0 0 0 0-1.88l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7 7 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54a7 7 0 0 0-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.67 8.84a.5.5 0 0 0 .12.64l2.03 1.58a7.2 7.2 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96c.5.38 1.04.7 1.62.94l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54a7 7 0 0 0 1.62-.94l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/>
+          </svg>
+        </button>
       </header>
+
+      <div id="setup-warning" class="setup-warning" role="alert" hidden>
+        <p><strong>Rauser isn't set up yet.</strong> <span id="setup-reason"></span></p>
+        <button id="setup-open-settings" type="button">Open settings</button>
+      </div>
 
       <div id="status" class="status" role="status" aria-live="polite">Connecting to native host…</div>
 
-      <section aria-labelledby="setup-heading">
-        <h2 id="setup-heading">Private capture setup</h2>
-        <p>Choose a notes folder and one site to log. Rauser stays off until Chrome grants access and you confirm the host policy.</p>
-
-        <div class="field">
-          <label>Notes folder</label>
-          <output id="folder-path">None selected</output>
-          <button id="choose-folder" type="button" disabled>Choose folder…</button>
-        </div>
-
-        <p>Notes use neutral Markdown in M1. An Obsidian-specific profile is planned for a later milestone.</p>
-
-        <div class="field">
-          <label for="site-url">Site URL</label>
-          <input id="site-url" type="url" placeholder="https://example.com/" autocomplete="off" spellcheck="false" />
-          <small>Enter a scheme and host, with a port if needed, such as https://example.com. Wildcards are not accepted.</small>
-        </div>
-
-        <div class="field">
-          <label for="site-path">Allowed path prefix</label>
-          <input id="site-path" type="text" value="/" spellcheck="false" />
-          <small>The host checks this path; Chrome's permission covers the chosen scheme, host, and port across all paths.</small>
-        </div>
-
-        <button id="enable-site" type="button" disabled>Enable this site</button>
-        <button id="pause-capture" type="button" class="secondary" disabled>Pause capture and clear pending visits</button>
-
-        <div class="field">
-          <h3>Enabled sites</h3>
-          <ul id="sites-list" class="plain-list"><li>None</li></ul>
-        </div>
-      </section>
+      <button id="pause-capture" type="button" class="secondary" disabled>Pause capture and clear pending visits</button>
 
       <section aria-labelledby="queue-heading">
         <h2 id="queue-heading">Pending visits</h2>

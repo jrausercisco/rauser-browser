@@ -38,9 +38,9 @@ npm run test:extension
 1. Build the native host with `cargo build --locked -p rauser` and the extension with `npm ci --ignore-scripts && npm run build:extension`.
 2. In Google Chrome, open `chrome://extensions`, enable Developer mode, and load `extension/dist/` as an unpacked extension. Copy the extension ID shown there.
 3. Register the development host for that ID. On macOS, run `node scripts/register-dev-host.mjs YOUR_EXTENSION_ID "$(pwd)/target/debug/rauser"` after replacing `YOUR_EXTENSION_ID`. On Windows, run the same script from PowerShell with your extension ID and the absolute path to `target\debug\rauser.exe`.
-4. Open the Rauser side panel, choose a notes folder, enter a site URL and path prefix, then enable the site. Chrome requests the site permission and the native host confirms the capture policy. The panel can send buffered visits and create a page note for the current permitted tab.
+4. Open the Rauser side panel. Until setup is complete it warns that Rauser isn't set up; click the gear icon or **Open settings** to open the settings page in a tab. There, choose a notes folder, enter a site URL and path prefix, then enable the site. Chrome requests the site permission and the native host confirms the capture policy. The panel updates when settings change; it sends buffered visits, pauses capture, and creates a page note for the current permitted tab.
 
-If **Choose folder** is disabled and the panel says "Native host unavailable," check that the extension ID in the native-host registration matches the ID shown on `chrome://extensions`, rebuild the host at the registered path, then close and reopen the panel. The development host registration is per user; the guided macOS smoke run below sets up its own isolated profile automatically.
+If **Choose folder** is disabled and the settings page says "Native host unavailable," check that the extension ID in the native-host registration matches the ID shown on `chrome://extensions`, rebuild the host at the registered path, then reload the settings page and reopen the panel. The development host registration is per user; the guided macOS smoke run below sets up its own isolated profile automatically.
 
 For a guided macOS Chrome smoke run, build both components as above, then run:
 

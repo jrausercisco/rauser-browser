@@ -2,7 +2,7 @@
 
 ## Current state
 
-M0 is merged. M1 development code adds a Chrome side panel, opt-in site capture, native folder selection and consent, durable visit IDs, and create-only page notes with sibling review drafts. The agent integration, search index, signed installers, Chrome Web Store listing, and public release do not exist yet. M1 still needs interactive Chrome checks on macOS and Windows; Windows new-file power-loss durability is not established. Use [DESIGN.md](DESIGN.md) for intended behavior and update it when implementation changes a contract.
+M0 is merged. M1 development code adds a Chrome side panel and settings page, opt-in site capture, native folder selection and consent, durable visit IDs, and create-only page notes with sibling review drafts. The agent integration, search index, signed installers, Chrome Web Store listing, and public release do not exist yet. M1 still needs interactive Chrome checks on macOS and Windows; Windows new-file power-loss durability is not established. Use [DESIGN.md](DESIGN.md) for intended behavior and update it when implementation changes a contract.
 
 ## Repository map
 

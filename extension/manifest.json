@@ -11,6 +11,10 @@
   "action": {
     "default_title": "Open Rauser"
   },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
   "side_panel": {
     "default_path": "panel.html"
   },

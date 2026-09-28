@@ -18,10 +18,12 @@ if (result.error) throw result.error;
 if (result.status !== 0) process.exit(result.status ?? 1);
 
 await mkdir(outputDir, { recursive: true });
-for (const name of ["manifest.json", "panel.html", "panel.css"]) {
+for (const name of ["manifest.json", "options.html", "panel.html", "panel.css"]) {
   await copyFile(join(extensionDir, name), join(outputDir, name));
 }
-for (const name of ["coordination.js", "model.js", "native.js", "panel.js", "worker.js"]) {
+for (const name of [
+  "coordination.js", "model.js", "native.js", "options.js", "panel.js", "settings.js", "worker.js",
+]) {
   await copyFile(join(intermediateDir, "extension", name), join(outputDir, name));
 }
 await rm(intermediateDir, { recursive: true, force: true });
