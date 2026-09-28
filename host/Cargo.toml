@@ -1,0 +1,32 @@
+[package]
+name = "rauser"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+description = "Local native messaging host for Rauser Browser"
+
+[dependencies]
+anyhow = "1"
+cap-std = "4.0"
+directories = "6"
+hex = "0.4"
+rauser-protocol = { path = "../protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+url = "2.5"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "rauser_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rauser"
+path = "src/main.rs"
