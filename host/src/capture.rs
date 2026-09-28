@@ -301,7 +301,12 @@ impl CaptureStore {
         {
             // A torn entry left in place would block this event's replay once
             // another visit is appended after it.
-            roll_back_append(&mut file, metadata.len(), entry.as_bytes());
+            roll_back_append(
+                &day_dir,
+                Path::new(&filename),
+                metadata.len(),
+                entry.as_bytes(),
+            );
             return Err(error).context("appending daily log entry");
         }
         sync_directory(&day_dir).context("syncing daily log directory")?;
@@ -408,7 +413,7 @@ impl CaptureStore {
             .write_all(&entry[tail.len()..])
             .and_then(|()| file.sync_all())
         {
-            roll_back_append(&mut file, resume_from, entry);
+            roll_back_append(&day_dir, Path::new(filename), resume_from, entry);
             return Err(error).context("completing interrupted daily log entry");
         }
         sync_directory(&day_dir).context("syncing original daily log directory")?;
@@ -782,8 +787,12 @@ fn existing_log_is_owned(dir: &Dir, name: &str, length: u64) -> Result<bool> {
 /// Truncate a failed append back to `offset`, but only if everything after
 /// `offset` is a prefix of `entry`. The capture lock excludes other Rauser
 /// writers; an unexpected tail is left for manual repair instead.
-fn roll_back_append(file: &mut cap_std::fs::File, offset: u64, entry: &[u8]) {
+///
+/// This opens its own read-write handle: Windows refuses to truncate through
+/// an append-only handle.
+fn roll_back_append(dir: &Dir, name: &Path, offset: u64, entry: &[u8]) {
     let result = (|| -> io::Result<bool> {
+        let mut file = dir.open_with(name, OpenOptions::new().read(true).write(true))?;
         let length = file.metadata()?.len();
         if length <= offset {
             return Ok(true);
@@ -1117,17 +1126,11 @@ mod tests {
         let root = Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
         let entry = b"\n- entry\n";
         root.write("log.md", b"header\n- entr").unwrap();
-        let mut file = root
-            .open_with("log.md", OpenOptions::new().read(true).append(true))
-            .unwrap();
-        roll_back_append(&mut file, 6, entry);
+        roll_back_append(&root, Path::new("log.md"), 6, entry);
         assert_eq!(root.read("log.md").unwrap(), b"header");
 
         root.write("log.md", b"header\nuser text").unwrap();
-        let mut file = root
-            .open_with("log.md", OpenOptions::new().read(true).append(true))
-            .unwrap();
-        roll_back_append(&mut file, 7, entry);
+        roll_back_append(&root, Path::new("log.md"), 6, entry);
         assert_eq!(root.read("log.md").unwrap(), b"header\nuser text");
     }
 
