@@ -148,57 +148,143 @@ async function hostConfig(wrapper) {
   });
 }
 
-async function cdpCall(chrome, id, method, params = {}, sessionId) {
-  const outgoing = chrome.stdio[3];
-  const incoming = chrome.stdio[4];
-  if (!outgoing || !incoming) throw new Error("Chrome DevTools pipe is unavailable");
-  return new Promise((resolve, reject) => {
-    let pending = Buffer.alloc(0);
-    let settled = false;
-    const timer = setTimeout(() => finish(new Error(`Chrome ${method} timed out`)), 15_000);
-    function finish(error, result) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      incoming.off("data", onData);
-      incoming.off("error", onError);
-      chrome.off("exit", onExit);
-      if (error) reject(error);
-      else resolve(result);
+// One reader for Chrome's DevTools pipe. Replies are matched by id; events
+// are ignored because every wait below polls page or host state instead.
+class Cdp {
+  constructor(chrome) {
+    this.chrome = chrome;
+    this.outgoing = chrome.stdio[3];
+    this.incoming = chrome.stdio[4];
+    if (!this.outgoing || !this.incoming) throw new Error("Chrome DevTools pipe is unavailable");
+    this.nextId = 1;
+    this.pending = new Map();
+    this.buffer = Buffer.alloc(0);
+    this.incoming.on("data", (chunk) => this.receive(chunk));
+    const fail = (error) => {
+      for (const { reject } of this.pending.values()) reject(error);
+      this.pending.clear();
+    };
+    this.incoming.on("error", fail);
+    chrome.once("exit", (code) => fail(new Error(`Chrome exited (${code})`)));
+  }
+
+  receive(chunk) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    for (;;) {
+      const end = this.buffer.indexOf(0);
+      if (end < 0) return;
+      const text = this.buffer.subarray(0, end).toString("utf8");
+      this.buffer = this.buffer.subarray(end + 1);
+      let message;
+      try { message = JSON.parse(text); } catch { continue; }
+      const waiter = message.id === undefined ? null : this.pending.get(message.id);
+      if (!waiter) continue;
+      this.pending.delete(message.id);
+      if (message.error) waiter.reject(new Error(`Chrome ${waiter.method} failed: ${message.error.message ?? JSON.stringify(message.error)}`));
+      else waiter.resolve(message.result);
     }
-    function onError(error) { finish(error); }
-    function onExit(code) { finish(new Error(`Chrome exited during ${method} (${code})`)); }
-    function onData(chunk) {
-      pending = Buffer.concat([pending, chunk]);
-      for (;;) {
-        const end = pending.indexOf(0);
-        if (end < 0) return;
-        let message;
-        try { message = JSON.parse(pending.subarray(0, end).toString("utf8")); }
-        catch (error) { finish(new Error(`Invalid Chrome DevTools response: ${error.message}`)); return; }
-        pending = pending.subarray(end + 1);
-        if (message.id !== id) continue;
-        if (message.error) finish(new Error(`Chrome ${method} failed: ${message.error.message ?? JSON.stringify(message.error)}`));
-        else finish(null, message.result);
-        return;
-      }
+  }
+
+  send(method, params = {}, sessionId = undefined, timeout = 15_000) {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Chrome ${method} timed out`));
+      }, timeout);
+      this.pending.set(id, {
+        method,
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+      this.outgoing.write(`${JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })}\0`,
+        (error) => { if (error) this.pending.get(id)?.reject(error); });
+    });
+  }
+
+  async targets() {
+    return (await this.send("Target.getTargets")).targetInfos;
+  }
+
+  async targetFor(url) {
+    return (await this.targets()).find((target) => target.url === url || target.url.startsWith(`${url}?`)) ?? null;
+  }
+
+  /** Attach to a target for one operation, then detach. */
+  async withTarget(targetId, action) {
+    const { sessionId } = await this.send("Target.attachToTarget", { targetId, flatten: true });
+    try {
+      return await action(new PageDriver(this, sessionId));
+    } finally {
+      await this.send("Target.detachFromTarget", { sessionId }).catch(() => undefined);
     }
-    incoming.on("data", onData);
-    incoming.on("error", onError);
-    chrome.once("exit", onExit);
-    outgoing.write(`${JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })}\0`,
-      (error) => { if (error) finish(error); });
-  });
+  }
 }
 
-async function nativeHostPreflight(chrome, extensionId) {
-  const target = await cdpCall(chrome, 2, "Target.createTarget", {
+// Drives an extension or fixture page. Clicks are real input events, so
+// Chrome treats them as user gestures just as it would a mouse click.
+class PageDriver {
+  constructor(cdp, sessionId) {
+    this.cdp = cdp;
+    this.sessionId = sessionId;
+  }
+
+  async evaluate(expression, { userGesture = false } = {}) {
+    const reply = await this.cdp.send("Runtime.evaluate", {
+      expression, awaitPromise: true, returnByValue: true, userGesture,
+    }, this.sessionId);
+    if (reply.exceptionDetails) {
+      throw new Error(reply.exceptionDetails.exception?.description ?? reply.exceptionDetails.text);
+    }
+    return reply.result?.value;
+  }
+
+  async click(selector) {
+    const point = await this.evaluate(`(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!element) throw new Error("Missing ${selector.replaceAll('"', "'")}");
+      if (element.disabled) throw new Error("${selector.replaceAll('"', "'")} is disabled");
+      element.scrollIntoView({ block: "center" });
+      const box = element.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    })()`);
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await this.cdp.send("Input.dispatchMouseEvent", {
+        type, x: point.x, y: point.y, button: "left", clickCount: 1,
+      }, this.sessionId);
+    }
+  }
+
+  async fill(selector, value) {
+    await this.evaluate(`(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!element) throw new Error("Missing ${selector.replaceAll('"', "'")}");
+      element.value = ${JSON.stringify(value)};
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+    })()`);
+  }
+
+  text(selector) {
+    return this.evaluate(`document.querySelector(${JSON.stringify(selector)})?.textContent ?? null`);
+  }
+
+  enabled(selector) {
+    return this.evaluate(`(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      return element !== null && !element.disabled;
+    })()`);
+  }
+
+  hidden(selector) {
+    return this.evaluate(`document.querySelector(${JSON.stringify(selector)})?.hidden ?? null`);
+  }
+}
+
+async function nativeHostPreflight(cdp, extensionId) {
+  const target = await cdp.send("Target.createTarget", {
     url: `chrome-extension://${extensionId}/panel.html`, background: true,
   });
   try {
-    const attached = await cdpCall(chrome, 3, "Target.attachToTarget", {
-      targetId: target.targetId, flatten: true,
-    });
     const expression = `new Promise(resolve => {
       const port = chrome.runtime.connectNative("com.rauser.browser");
       const timer = setTimeout(() => resolve({ok: false, error: "native host timed out"}), 5000);
@@ -213,20 +299,30 @@ async function nativeHostPreflight(chrome, extensionId) {
       });
       port.postMessage({type: "hello", protocol_version: 2, request_id: "smoke-preflight"});
     })`;
-    let lastError = "extension page did not load";
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const reply = await cdpCall(chrome, 4 + attempt, "Runtime.evaluate", {
-        expression, awaitPromise: true, returnByValue: true,
-      }, attached.sessionId);
-      if (!reply.exceptionDetails && reply.result?.value?.ok === true) return;
-      lastError = reply.result?.value?.error ?? reply.exceptionDetails?.text ??
-        `unexpected host response ${reply.result?.value?.type ?? "none"}`;
-      if (!reply.exceptionDetails || !/connectNative/.test(lastError)) break;
-      await delay(250);
-    }
-    throw new Error(`Chrome could not connect to the native host: ${lastError}`);
+    await cdp.withTarget(target.targetId, async (page) => {
+      let lastError = "extension page did not load";
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        let reply;
+        try {
+          reply = await page.evaluate(expression);
+        } catch (error) {
+          lastError = error.message;
+          if (!/connectNative/.test(lastError)) break;
+          await delay(250);
+          continue;
+        }
+        if (reply?.ok === true) return;
+        lastError = reply?.error ?? `unexpected host response ${reply?.type ?? "none"}`;
+        break;
+      }
+      throw new Error(`Chrome could not connect to the native host: ${lastError}`);
+    });
   } finally {
-    await cdpCall(chrome, 30, "Target.closeTarget", { targetId: target.targetId }).catch(() => undefined);
+    await cdp.send("Target.closeTarget", { targetId: target.targetId }).catch(() => undefined);
+    // This tab has the side panel's URL; later steps must not mistake it for the panel.
+    await waitFor(async () => requireCondition(
+      !(await cdp.targets()).some((entry) => entry.targetId === target.targetId),
+      "Preflight tab is still closing")).catch(() => undefined);
   }
 }
 
@@ -325,13 +421,18 @@ function requireCondition(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-async function waitFor(check) {
+async function waitFor(check, { timeout = 12_000, interval = 400, signal } = {}) {
+  const deadline = Date.now() + timeout;
   let lastError;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    try { return await check(); } catch (error) { lastError = error; }
-    await delay(400);
+  for (;;) {
+    if (signal?.aborted) throw signal.reason;
+    try { return await check(); } catch (error) {
+      if (error.fatal) throw error;
+      lastError = error;
+    }
+    if (Date.now() >= deadline) throw lastError;
+    await delay(interval);
   }
-  throw lastError;
 }
 
 async function run() {
@@ -369,18 +470,161 @@ async function run() {
     return answer;
   }
 
-  async function checkpoint(title, instructions, check) {
-    console.log(`\n${title}\n${instructions}`);
-    for (;;) {
-      await ask("Press Enter to check, or q to stop: ");
+  let cdp = null;
+  let extensionId = null;
+  const panelUrl = () => `chrome-extension://${extensionId}/panel.html`;
+  const settingsUrl = () => `chrome-extension://${extensionId}/options.html`;
+
+  async function step(title, action) {
+    console.log(`\n${title}`);
+    await action();
+    console.log(`PASS: ${title}`);
+  }
+
+  // Only Chrome's permission prompt and Rauser's native dialogs need a person.
+  async function userAction(instruction, check) {
+    console.log(`  ACTION: ${instruction}`);
+    // Say what is still missing, so a stuck wait is diagnosable.
+    let reported = null;
+    let since = Date.now();
+    return waitFor(async () => {
       try {
-        await check();
-        console.log(`PASS: ${title}`);
-        return;
+        return await check();
       } catch (error) {
-        console.error(`Not yet: ${error.message}`);
+        if (error.message !== reported && Date.now() - since > 5_000) {
+          console.log(`  Waiting: ${error.message}`);
+          reported = error.message;
+          since = Date.now();
+        }
+        throw error;
+      }
+    }, { timeout: 60 * 60_000, interval: 500, signal: abort.signal });
+  }
+
+  async function onPage(url, action) {
+    const target = await cdp.targetFor(url);
+    requireCondition(target, `${url.endsWith("panel.html") ? "The side panel" : "The settings page"} is not open`);
+    return cdp.withTarget(target.targetId, action);
+  }
+
+  const onPanel = (action) => onPage(panelUrl(), action);
+  const onSettings = (action) => onPage(settingsUrl(), action);
+
+  async function inSettings(action) {
+    const target = await cdp.targetFor(settingsUrl());
+    requireCondition(target, "The settings page is not open");
+    // Input events reach only a visible tab.
+    await cdp.send("Target.activateTarget", { targetId: target.targetId });
+    return cdp.withTarget(target.targetId, action);
+  }
+
+  async function openPanel() {
+    if (await cdp.targetFor(panelUrl())) return;
+    // Opening the side panel needs a user gesture in an extension page.
+    // Evaluate with a gesture in the settings page, or a temporary tab.
+    let source = await cdp.targetFor(settingsUrl());
+    let temporary = null;
+    if (!source) {
+      temporary = await cdp.send("Target.createTarget", { url: panelUrl(), background: true });
+      source = { targetId: temporary.targetId };
+    }
+    try {
+      await cdp.withTarget(source.targetId, async (page) => {
+        await waitFor(() => page.evaluate("typeof chrome.sidePanel?.open === 'function' || Promise.reject(new Error('loading'))"));
+        const windowId = await page.evaluate("chrome.tabs.getCurrent().then((tab) => tab.windowId)");
+        await page.evaluate(`chrome.sidePanel.open({ windowId: ${Number(windowId)} })`, { userGesture: true });
+      });
+    } catch (error) {
+      console.log(`  Could not open the side panel automatically (${error.message}).`);
+    } finally {
+      if (temporary) {
+        await cdp.send("Target.closeTarget", { targetId: temporary.targetId }).catch(() => undefined);
+        await waitFor(async () => requireCondition(
+          !(await cdp.targets()).some((entry) => entry.targetId === temporary.targetId),
+          "Temporary tab is still closing")).catch(() => undefined);
       }
     }
+    try {
+      await waitFor(async () => requireCondition(await cdp.targetFor(panelUrl()), "Side panel did not open"),
+        { timeout: 4_000 });
+    } catch {
+      await userAction("Click the Rauser toolbar button to open the side panel.",
+        async () => requireCondition(await cdp.targetFor(panelUrl()), "Side panel is not open yet"));
+    }
+  }
+
+  async function closePanel() {
+    const target = await cdp.targetFor(panelUrl());
+    if (!target) return;
+    await cdp.withTarget(target.targetId, (page) => page.evaluate("window.close()")).catch(() => undefined);
+    const closed = async () => requireCondition(!(await cdp.targetFor(panelUrl())), "Side panel is still open");
+    try {
+      await waitFor(closed, { timeout: 4_000 });
+    } catch {
+      await userAction("Close the Rauser side panel.", closed);
+    }
+  }
+
+  async function openSettingsTab() {
+    if (await cdp.targetFor(settingsUrl())) return;
+    await cdp.send("Target.createTarget", { url: settingsUrl() });
+  }
+
+  async function settingsConnected() {
+    await waitFor(() => onSettings(async (page) =>
+      requireCondition(await page.enabled("#choose-folder"), "Settings page is not connected to the host")));
+  }
+
+  async function fixtureTarget(origin) {
+    const target = (await cdp.targets()).find((entry) => entry.type === "page" && entry.url.startsWith(`${origin}/`));
+    requireCondition(target, "The fixture tab is not open");
+    return target;
+  }
+
+  async function navigate(origin, url) {
+    const target = await fixtureTarget(origin);
+    await cdp.withTarget(target.targetId, async (page) => {
+      await cdp.send("Page.navigate", { url }, page.sessionId);
+      await waitFor(async () => requireCondition(
+        await page.evaluate(`location.href === ${JSON.stringify(url)} && document.readyState === "complete"`),
+        `Fixture did not finish loading ${url}`));
+    });
+    // The worker fills a visit's title from the tab's title update.
+    await delay(1_500);
+  }
+
+  async function pendingVisitsCleared() {
+    await waitFor(() => onPanel(async (page) => {
+      const summary = await page.text("#queue-summary");
+      requireCondition(summary === "0 pending visits.", `Panel shows: ${summary}`);
+    }), { timeout: 20_000 });
+  }
+
+  async function settingsStatus() {
+    return onSettings((page) => page.text("#status"));
+  }
+
+  async function chromeGrants(pattern) {
+    return onSettings((page) => page.evaluate(`Promise.all([
+      chrome.permissions.contains({ origins: [${JSON.stringify(pattern)}] }),
+      chrome.permissions.contains({ permissions: ["webNavigation"] }),
+    ]).then(([origin, api]) => ({ origin, api }))`));
+  }
+
+  async function createNote(expected, title, body) {
+    await waitFor(() => onPanel(async (page) =>
+      requireCondition(await page.enabled("#create-note"), "Create page note is disabled")));
+    await onPanel(async (page) => {
+      await page.fill("#note-title", title);
+      await page.fill("#note-body", body);
+      await page.click("#create-note");
+    });
+    return waitFor(() => onPanel(async (page) => {
+      const result = await page.text("#note-result");
+      requireCondition(await page.enabled("#create-note") && result?.startsWith(expected),
+        `Panel note result: ${result || "(none yet)"}`);
+      return result;
+    }), { timeout: 20_000 });
   }
 
   try {
@@ -393,7 +637,7 @@ async function run() {
       (inside(testHome, configPath) || inside(actualHome, configPath)),
     `Host config would escape the temporary home: ${configPath}`);
     const dist = await realpath(DIST);
-    const extensionId = unpackedExtensionId(dist);
+    extensionId = unpackedExtensionId(dist);
     const hostManifest = Buffer.from(`${JSON.stringify({
       name: "com.rauser.browser",
       description: DEV_DESCRIPTION,
@@ -433,7 +677,8 @@ async function run() {
       chrome.once("error", reject);
     });
 
-    const loaded = await cdpCall(chrome, 1, "Extensions.loadUnpacked", { path: dist });
+    cdp = new Cdp(chrome);
+    const loaded = await cdp.send("Extensions.loadUnpacked", { path: dist });
     const loadedId = loaded?.id;
     requireCondition(loadedId === extensionId,
       `Chrome loaded extension ID ${loadedId ?? "none"}; expected ${extensionId}`);
@@ -443,131 +688,232 @@ async function run() {
         `Expected ${extensionId} for ${DIST} in this isolated Chrome profile; found ${discovered.join(", ") || "none"}`);
     });
     console.log(`Loaded and confirmed isolated Chrome profile extension ID ${extensionId}.`);
-    await nativeHostPreflight(chrome, extensionId);
+    await nativeHostPreflight(cdp, extensionId);
     console.log("Chrome-to-native-host hello passed.");
-    console.log("Click the Rauser toolbar action to open its side panel.");
+    console.log("The runner drives Rauser's pages itself. Answer only the prompts it names; press Ctrl+C to stop.");
 
-    await checkpoint("First-run setup warning",
-      "Check that the side panel says Rauser isn't set up yet. Click the gear icon (or Open settings) to open Rauser settings in a tab.",
-      async () => {
-        const reply = await hostConfig(wrapper);
-        requireCondition(reply.config.storage === null && !reply.config.capture_enabled,
-          "The isolated host configuration is not in its first-run state");
+    const pattern = `${origin}/*`;
+    // Any empty folder will do; the suggested one is only a convenience.
+    // Later checks count files, so the chosen folder must start empty.
+    let notesRoot = null;
+    const sameFolder = async (value) => value && notesRoot !== null &&
+      await realpath(value).catch(() => null) === notesRoot;
+
+    await step("First-run setup warning", async () => {
+      await openPanel();
+      await waitFor(() => onPanel(async (page) => {
+        requireCondition(await page.hidden("#setup-warning") === false, "Setup warning is hidden");
+        const reason = await page.text("#setup-reason");
+        requireCondition(reason === "No notes folder is chosen.", `Setup warning says: ${reason}`);
+      }));
+      const reply = await hostConfig(wrapper);
+      requireCondition(reply.config.storage === null && !reply.config.capture_enabled,
+        "The isolated host configuration is not in its first-run state");
+      await onPanel((page) => page.click("#open-settings"));
+      await waitFor(async () => requireCondition(await cdp.targetFor(settingsUrl()), "The gear did not open settings"));
+      await settingsConnected();
+    });
+
+    await step("First-run folder cancellation", async () => {
+      await inSettings((page) => page.click("#choose-folder"));
+      await userAction("In the macOS folder picker, click Cancel.", async () => {
+        const status = await settingsStatus();
+        requireCondition(status?.startsWith("Canceled"), `Settings page says: ${status}`);
+        await onSettings(async (page) => {
+          requireCondition(await page.text("#folder-path") === "None selected", "A folder is shown as selected");
+          requireCondition(await page.enabled("#choose-folder"), "Picker is still open");
+        });
       });
+      const reply = await hostConfig(wrapper);
+      requireCondition(reply.config.storage === null && !reply.config.capture_enabled && reply.config.sites.length === 0,
+        "The isolated host configuration changed after picker cancellation");
+      requireCondition(!(await maybeLstat(configPath)), "A config file appeared after picker cancellation");
+    });
 
-    await checkpoint("First-run folder cancellation",
-      "On the settings page, click Choose folder, cancel the native picker, and check that it still says None selected.",
-      async () => {
-        const reply = await hostConfig(wrapper);
-        requireCondition(reply.config.storage === null && !reply.config.capture_enabled && reply.config.sites.length === 0,
-          "The isolated host configuration changed after picker cancellation");
-        requireCondition(!(await maybeLstat(configPath)), "A config file appeared after picker cancellation");
+    await step("Canceled native consent", async () => {
+      await commandOutput("/bin/sh", ["-c", `printf %s ${shellQuote(notes)} | pbcopy`]);
+      await inSettings((page) => page.click("#choose-folder"));
+      await userAction(`In the folder picker, choose any empty folder. The suggested one's path is on the clipboard: press Cmd+Shift+G, clear the box, paste, press Return, then click Open.\n  Path: ${notes}`,
+        () => onSettings(async (page) => {
+          const shown = await page.text("#folder-path");
+          requireCondition(shown && shown !== "None selected", "No folder is selected yet");
+          const chosen = await realpath(shown);
+          const entries = (await readdir(chosen)).filter((name) => name !== ".DS_Store");
+          if (entries.length) {
+            throw Object.assign(new Error(`${chosen} is not empty; rerun and choose an empty folder`), { fatal: true });
+          }
+          notesRoot = chosen;
+        }));
+      console.log(`  Using notes folder ${notesRoot}`);
+      await onSettings(async (page) => {
+        await page.fill("#site-url", origin);
+        await page.fill("#site-path", "/allowed");
       });
-
-    await checkpoint("Canceled native consent",
-      `Choose ${notes}; enter Site URL ${origin} and Allowed path prefix /allowed. Click Enable this site, accept Chrome access, then decline the native confirmation. The settings page should report cancellation.`,
-      async () => {
-        const reply = await hostConfig(wrapper);
-        requireCondition(reply.config.storage === null && !reply.config.capture_enabled && reply.config.sites.length === 0,
-          "Capture was saved even though native consent was declined");
+      await waitFor(() => onSettings(async (page) =>
+        requireCondition(await page.enabled("#enable-site"), "Enable this site is disabled")));
+      await inSettings((page) => page.click("#enable-site"));
+      await userAction("In Chrome's prompt, click Allow. Then click No in Rauser's confirmation dialog.", async () => {
+        const status = await settingsStatus();
+        if (status?.includes("Chrome access was declined")) {
+          throw Object.assign(new Error("Chrome access was declined; this step needs Allow in Chrome and No in Rauser"), { fatal: true });
+        }
+        requireCondition(status?.includes("Canceled"), `Settings page says: ${status}`);
+        await onSettings(async (page) => requireCondition(await page.enabled("#enable-site"), "Setup is still running"));
       });
+      const reply = await hostConfig(wrapper);
+      requireCondition(reply.config.storage === null && !reply.config.capture_enabled && reply.config.sites.length === 0,
+        "Capture was saved even though native consent was declined");
+      const grants = await chromeGrants(pattern);
+      requireCondition(!grants.origin && !grants.api, "Chrome access granted for the declined change was not removed");
+    });
 
-    await checkpoint("Confirmed setup",
-      "Click Enable this site again, accept Chrome access and the native confirmation. If the selection token expired, choose the notes folder again. If Chrome reloads the extension, reopen the settings page and the side panel. The side panel setup warning should disappear.",
-      async () => {
+    await step("Confirmed setup", async () => {
+      await inSettings(async (page) => {
+        // Clear the previous step's result so only a new failure stops the run.
+        await page.evaluate('document.getElementById("status").textContent = ""');
+        await page.click("#enable-site");
+      });
+      await userAction("In Chrome's prompt, click Allow. Then click Yes in Rauser's confirmation dialog.", async () => {
+        const status = await settingsStatus().catch(() => null);
+        if (status?.startsWith("Setup failed")) {
+          throw Object.assign(new Error(`${status} Rerun the smoke test; a folder selection expires after five minutes.`), { fatal: true });
+        }
         const reply = await hostConfig(wrapper);
         const selectedRoot = reply.config.storage?.root;
-        requireCondition(selectedRoot && await realpath(selectedRoot) === await realpath(notes),
-          `Expected the isolated notes folder; host has ${selectedRoot ?? "none"}`);
+        requireCondition(await sameFolder(selectedRoot),
+          `Expected ${notesRoot}; host has ${selectedRoot ?? "none"}`);
         requireCondition(reply.config.capture_enabled === true, "Capture is not enabled in the host");
         requireCondition(reply.config.sites.length === 1 &&
           reply.config.sites[0].origin === origin && reply.config.sites[0].path_prefix === "/allowed",
         "Host site rule does not match the fixture origin and /allowed prefix");
       });
+      // A first navigation grant makes the settings page restart the extension,
+      // which closes every Rauser page.
+      const outcome = await waitFor(async () => {
+        const target = await cdp.targetFor(settingsUrl());
+        if (!target) return "restarted";
+        const status = await settingsStatus().catch(() => null);
+        if (status?.startsWith("Capture enabled for")) return "enabled";
+        if (status?.startsWith("Chrome is restarting")) throw new Error("Waiting for the extension restart");
+        throw new Error(`Settings page says: ${status}`);
+      }, { timeout: 20_000 });
+      if (outcome === "restarted") {
+        console.log("  The extension restarted to activate navigation access; reopening its pages.");
+        await delay(1_000);
+        await openSettingsTab();
+        await settingsConnected();
+      }
+      await openPanel();
+      await waitFor(() => onPanel(async (page) =>
+        requireCondition(await page.hidden("#setup-warning") === true, "Panel still shows the setup warning")),
+      { timeout: 20_000 });
+    });
 
-    await checkpoint("Allowed and blocked visit replay",
-      `Close the Rauser panel. Navigate to ${allowed}, then ${blocked}. Reopen the panel and wait until it shows 0 pending visits; click Send pending visits if needed.`,
-      async () => waitFor(async () => {
-        const files = await markdownFiles(path.join(notes, "log"));
-        const rows = files.flatMap((file) => file.text.split("\n").filter((line) => line.startsWith("- ")));
+    const logRows = async () => {
+      const files = await markdownFiles(path.join(notesRoot, "log"));
+      return { files, rows: files.flatMap((file) => file.text.split("\n").filter((line) => line.startsWith("- "))) };
+    };
+
+    await step("Allowed and blocked visit replay", async () => {
+      await closePanel();
+      await navigate(origin, allowed);
+      await navigate(origin, blocked);
+      await openPanel();
+      await pendingVisitsCleared();
+      await waitFor(async () => {
+        const { files, rows } = await logRows();
         requireCondition(rows.filter((line) => line.includes(`<${allowed}>`)).length === 1,
           "Expected exactly one allowed visit in the daily log");
         requireCondition(!files.some((file) => file.text.includes(blocked)),
           "Blocked-path visit appeared in the daily log");
-      }));
-
-    await checkpoint("Panel reopen does not duplicate the visit",
-      "Close and reopen the side panel without navigating again. Wait for 0 pending visits.",
-      async () => {
-        const files = await markdownFiles(path.join(notes, "log"));
-        const rows = files.flatMap((file) => file.text.split("\n").filter((line) => line.startsWith("- ")));
-        requireCondition(rows.filter((line) => line.includes(`<${allowed}>`)).length === 1,
-          "Allowed visit was duplicated or removed");
       });
+    });
+
+    await step("Panel reopen does not duplicate the visit", async () => {
+      await closePanel();
+      await openPanel();
+      await pendingVisitsCleared();
+      await delay(1_000);
+      const { rows } = await logRows();
+      requireCondition(rows.filter((line) => line.includes(`<${allowed}>`)).length === 1,
+        "Allowed visit was duplicated or removed");
+    });
 
     let originalNote;
-    await checkpoint("Page note creation",
-      `Navigate to ${allowed}. In the panel, enter Title: ${title} and Your note: ${firstBody}; click Create page note.`,
-      async () => {
-        const files = await markdownFiles(path.join(notes, "pages"));
-        const base = files.filter((file) => !file.path.includes(".rauser-review-"));
-        requireCondition(base.length === 1 && files.length === 1, "Expected one page note and no review draft");
-        requireCondition(base[0].text.includes(title) && base[0].text.includes(firstBody) &&
-          base[0].text.includes(allowed), "Page note content does not match the fixture request");
-        originalNote = base[0];
-      });
+    await step("Page note creation", async () => {
+      await navigate(origin, allowed);
+      await cdp.send("Target.activateTarget", { targetId: (await fixtureTarget(origin)).targetId });
+      await createNote("Page note created", title, firstBody);
+      const files = await markdownFiles(path.join(notesRoot, "pages"));
+      const base = files.filter((file) => !file.path.includes(".rauser-review-"));
+      requireCondition(base.length === 1 && files.length === 1, "Expected one page note and no review draft");
+      requireCondition(base[0].text.includes(title) && base[0].text.includes(firstBody) &&
+        base[0].text.includes(allowed), "Page note content does not match the fixture request");
+      originalNote = base[0];
+    });
 
-    await checkpoint("Identical page note is idempotent",
-      "Click Create page note again with the same title and body. The panel should say Page note already exists.",
-      async () => {
-        const files = await markdownFiles(path.join(notes, "pages"));
-        requireCondition(files.length === 1 && files[0].path === originalNote.path &&
-          files[0].text === originalNote.text, "Identical retry changed the note or created a file");
-      });
+    await step("Identical page note is idempotent", async () => {
+      await createNote("Page note already exists", title, firstBody);
+      const files = await markdownFiles(path.join(notesRoot, "pages"));
+      requireCondition(files.length === 1 && files[0].path === originalNote.path &&
+        files[0].text === originalNote.text, "Identical retry changed the note or created a file");
+    });
 
     let reviewNote;
-    await checkpoint("Changed page note creates one review draft",
-      `Replace Your note with: ${changedBody}; click Create page note. The panel should say Page note needs review.`,
-      async () => {
-        const files = await markdownFiles(path.join(notes, "pages"));
-        const review = files.filter((file) => file.path.includes(".rauser-review-"));
-        const base = files.find((file) => file.path === originalNote.path);
-        requireCondition(files.length === 2 && review.length === 1, "Expected one original note and one sibling review draft");
-        requireCondition(base?.text === originalNote.text, "Original page note was changed");
-        requireCondition(review[0].text.includes(changedBody) &&
-          review[0].text.includes("review_of:") && review[0].text.includes("proposal_id:"),
-        "Review draft does not contain the proposal and ownership metadata");
-        reviewNote = review[0];
-      });
+    let reviewResult;
+    await step("Changed page note creates one review draft", async () => {
+      reviewResult = await createNote("Page note needs review", title, changedBody);
+      const files = await markdownFiles(path.join(notesRoot, "pages"));
+      const review = files.filter((file) => file.path.includes(".rauser-review-"));
+      const base = files.find((file) => file.path === originalNote.path);
+      requireCondition(files.length === 2 && review.length === 1, "Expected one original note and one sibling review draft");
+      requireCondition(base?.text === originalNote.text, "Original page note was changed");
+      requireCondition(review[0].text.includes(changedBody) &&
+        review[0].text.includes("review_of:") && review[0].text.includes("proposal_id:"),
+      "Review draft does not contain the proposal and ownership metadata");
+      reviewNote = review[0];
+    });
 
-    await checkpoint("Review draft retry is idempotent",
-      "Click Create page note again with the changed body. The panel should still show the same review draft path.",
-      async () => {
-        const files = await markdownFiles(path.join(notes, "pages"));
-        requireCondition(files.length === 2 &&
-          files.some((file) => file.path === originalNote.path && file.text === originalNote.text) &&
-          files.some((file) => file.path === reviewNote.path && file.text === reviewNote.text),
-        "Review retry changed an existing file or created another draft");
-      });
+    await step("Review draft retry is idempotent", async () => {
+      const result = await createNote("Page note needs review", title, changedBody);
+      requireCondition(result === reviewResult, `Retry reported a different result: ${result}`);
+      const files = await markdownFiles(path.join(notesRoot, "pages"));
+      requireCondition(files.length === 2 &&
+        files.some((file) => file.path === originalNote.path && file.text === originalNote.text) &&
+        files.some((file) => file.path === reviewNote.path && file.text === reviewNote.text),
+      "Review retry changed an existing file or created another draft");
+    });
 
-    await checkpoint("Site removal",
-      `On the settings page, click Remove beside ${origin}/allowed. It should disappear from Enabled sites, and the side panel should show the setup warning again.`,
-      async () => {
+    await step("Site removal", async () => {
+      await inSettings((page) => page.click(`button[aria-label="Remove ${origin}/allowed"]`));
+      await waitFor(async () => {
         const reply = await hostConfig(wrapper);
         requireCondition(!reply.config.capture_enabled && reply.config.sites.length === 0,
           "Host still has capture enabled or the site rule");
+      }, { timeout: 20_000, interval: 1_000 });
+      await waitFor(async () => {
+        const grants = await chromeGrants(pattern);
+        requireCondition(!grants.origin && !grants.api, `Chrome still grants ${grants.origin ? origin : "webNavigation"}`);
       });
-    console.log("Open Rauser's Details page in chrome://extensions and inspect Site access / permissions.");
-    const grantRemoved = await ask(`Type yes after confirming Chrome no longer grants ${origin}: `);
-    requireCondition(grantRemoved.toLowerCase() === "yes", "Chrome grant removal was not confirmed");
+      await waitFor(() => onPanel(async (page) => {
+        requireCondition(await page.hidden("#setup-warning") === false, "Panel does not show the setup warning");
+        const reason = await page.text("#setup-reason");
+        requireCondition(reason === "No sites are enabled for capture.", `Setup warning says: ${reason}`);
+      }), { timeout: 20_000 });
+    });
 
-    await checkpoint("No capture after removal",
-      `Close the panel, navigate to ${afterRemoval}, then reopen the panel. Check that it shows 0 pending visits.`,
-      async () => {
-        const files = await markdownFiles(path.join(notes, "log"));
-        requireCondition(!files.some((file) => file.text.includes(afterRemoval)),
-          "A visit was logged after site removal");
-      });
+    await step("No capture after removal", async () => {
+      await closePanel();
+      await navigate(origin, afterRemoval);
+      await openPanel();
+      await pendingVisitsCleared();
+      const { files } = await logRows();
+      requireCondition(!files.some((file) => file.text.includes(afterRemoval)),
+        "A visit was logged after site removal");
+    });
+
+    const cursor = await ask("\nDid a spinning busy cursor stay on screen after any Rauser dialog closed? Type no or yes: ");
+    requireCondition(cursor.toLowerCase() === "no", "A busy cursor persisted after a native dialog");
 
     console.log("\nPASS: guided macOS Chrome M1 smoke run completed.");
   } catch (error) {
