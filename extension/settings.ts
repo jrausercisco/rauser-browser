@@ -84,10 +84,14 @@ export class ConfigSession {
     // Called whenever the host revision changes, from any page. Anything bound
     // to the previous revision, such as a folder selection, is now stale.
     private readonly onRevisionChange: () => void = () => undefined,
-  ) {}
+  ) {
+    // A host that exits is restarted by the next call; one that cannot start
+    // leaves the page disconnected until a later call reaches it again.
+    this.host.onStateChange(() => this.onChange());
+  }
 
   get connected(): boolean {
-    return this.config !== null && this.revision !== null;
+    return this.config !== null && this.revision !== null && this.host.connected;
   }
 
   hello() {

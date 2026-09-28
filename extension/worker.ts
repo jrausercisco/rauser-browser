@@ -31,8 +31,8 @@ const REMOVED_SITES_KEY = storageKey("locally_removed_sites_v1");
 const MAX_VISIT_URL_BYTES = 8_192;
 const MAX_TITLE_CHARS = 300;
 const DEDUPE_WINDOW_MS = 2_000;
-// Hold an untitled visit briefly so tabs.onUpdated can supply its title
-// before an open panel sends, and thereby freezes, the event.
+// Hold a new visit briefly so tabs.onUpdated can supply its title before an
+// open panel sends, and thereby freezes, the event.
 const TITLE_GRACE_MS = 3_000;
 const encoder = new TextEncoder();
 
@@ -292,7 +292,8 @@ async function captureNavigation(
   const occurred_at = localTimestamp(visitedAt);
   // At commit, the tab still shows the previous document's title. The title
   // arrives later through tabs.onUpdated. A same-document history update
-  // already has its current title.
+  // starts from the tab's current title, but an SPA usually sets the new
+  // route's title after pushState, so that title may still be the old one.
   let title: string | null = null;
   if (useCurrentTitle && tab.url) {
     // A page title is optional. The navigation URL remains authoritative.
@@ -316,7 +317,8 @@ async function captureNavigation(
     event,
     dedupe_key: key,
     attempts: 0,
-    retry_after: title === null ? Date.now() + TITLE_GRACE_MS : 0,
+    // Either way, hold the visit so tabs.onUpdated can supply the real title.
+    retry_after: Date.now() + TITLE_GRACE_MS,
     tab_id: details.tabId,
     dispatched: false,
   };
@@ -411,7 +413,9 @@ async function currentStatus(
     overflow_count: visits.overflow_count,
     rejected_count: visits.rejected_count,
     last_error: visits.last_error,
-    retry_error: visits.retry_error,
+    // A retry notice describes a visit still waiting to retry. Once rejection,
+    // discard, removal, pause, or a purge leaves none, it has nothing to say.
+    retry_error: visits.items.some((item) => item.attempts > 0) ? visits.retry_error : null,
     policy_expires_at: policy?.expires_at ?? null,
     revoked_origins: await readRevocations(),
     pause_pending: paused,
@@ -505,11 +509,10 @@ async function handleMessage(message: WorkerRequest): Promise<unknown> {
         if (message.outcome === "rejected") {
           queue.rejected_count += 1;
           queue.last_error = message.reason ?? "A visit was rejected by host policy";
-        } else if (!queue.items.some((entry) => entry.attempts > 0)) {
-          // last_error holds purge, overflow, and rejection notices. Only the
-          // user dismisses those; a later success clears retry state alone.
-          queue.retry_error = null;
         }
+        // last_error holds purge, overflow, and rejection notices. Only the
+        // user dismisses those; retry_error lapses with the last retrying visit.
+        if (!queue.items.some((entry) => entry.attempts > 0)) queue.retry_error = null;
       }
       await writeQueue(queue);
       return currentStatus(null, queue);
@@ -520,6 +523,7 @@ async function handleMessage(message: WorkerRequest): Promise<unknown> {
     case "clear_notices": {
       const queue = await readQueue();
       queue.last_error = null;
+      queue.retry_error = null;
       queue.overflow_count = 0;
       queue.rejected_count = 0;
       await writeQueue(queue);
