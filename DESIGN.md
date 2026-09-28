@@ -6,7 +6,7 @@
 
 Brauser turns the browser into a place where context accumulates instead of disappearing. It runs as an always-on sidebar that:
 
-- **Remembers the work artifacts** the user opens (tickets, docs, pull requests, designs) as one record per artifact, with how long they worked on it and how they got there (§5.1)
+- **Remembers the work artifacts** the user opens (tickets, docs, pull requests, designs) as one record per artifact, with how long they focused on it and how they got there, and shows them in one Recent list and an optional worklog across every tool (§5.1)
 - **Summarizes** pages into a separate summary file per page, using the user's own local AI agent
 - **Annotates** sites with persistent, per-page notes
 - **Saves** pages for later
@@ -20,7 +20,7 @@ Captured notes, the artifact log, artifact files, and read-later items are plain
 1. **The user owns the data.** Markdown files are the source of truth. Everything else, such as the search index, is a rebuildable cache.
 2. **Least privilege everywhere.** The extension cannot touch the filesystem. The host cannot do anything it isn't configured to do. Sites are opt-in.
 3. **Page content is untrusted.** Any page the user visits may contain hostile content, including prompt injection aimed at the agent.
-4. **Never clobber user edits.** Brauser only modifies what it owns. Summary files are the one kind of file Brauser owns whole, and a new summary replaces the old one, including any edits to it (§5.2).
+4. **Never clobber user edits.** Brauser only modifies what it owns. Brauser owns a few kinds of file whole: summary files (§5.2), artifact files and optional worklog files regenerated from the log (§5.1, §6.7), and page notes, which are edited only in the side panel (§5.3). Any edit made elsewhere to a summary, artifact, or worklog file is replaced when that file is next written. Brauser never adopts or replaces a file whose recorded kind and identity do not match.
 5. **Format-neutral, convention-friendly.** Output works in any markdown tool. Obsidian is a first-class preset, not a dependency.
 6. **Configuration over code.** Agent harnesses, site adapters, and omnibar commands are defined in config, not hardcoded.
 7. **Assume nothing about the user's setup.** No default vault location, agent, folder structure, or site list. Brauser ships with examples, and the user makes every choice explicitly at setup. It never writes into a folder the user hasn't chosen.
@@ -49,8 +49,8 @@ Captured notes, the artifact log, artifact files, and read-later items are plain
 
 - TypeScript in strict mode, Manifest V3, bundled with a pinned build toolchain.
 - Targets Google Chrome Stable on macOS and Windows for the first release. Other browsers are out of scope.
-- Sidebar via the Chromium `sidePanel` API for the current page: its note, summary, related pages, and the omnibar, with capture status in a collapsible strip (§5.7). The side panel's header has a settings (gear) button, and the panel shows a warning with a link to settings until a notes folder, at least one site, and capture are configured.
-- A dedicated settings page (`options_ui`, opened in a tab) holds configuration: notes folder, enabled sites, and pause. A full tab hosts Chrome's permission prompt and the native dialogs better than the narrow panel. The panel keeps a one-click pause as an emergency stop.
+- Sidebar via the Chromium `sidePanel` API for the current page: its note, summary, related pages, and the omnibar, with capture status in a collapsible strip (§5.7). The side panel's header has a settings (gear) button, and the panel shows a warning with a link to settings until a notes folder, at least one enabled artifact adapter, and capture are configured.
+- A dedicated settings page (`options_ui`, opened in a tab) holds configuration: notes folder, enabled artifact adapters and their origins, and pause. A full tab hosts Chrome's permission prompt and the native dialogs better than the narrow panel. The panel keeps a one-click pause as an emergency stop.
 - Holds UI state only. It stores no secrets and makes no network requests to external services.
 - No remote code: no `eval`, no dynamically loaded scripts, and a strict extension CSP. From M2 the manifest sets `content_security_policy.extension_pages` to `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'none'; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'`. Native messaging does not go through CSP.
 
@@ -63,9 +63,9 @@ Captured notes, the artifact log, artifact files, and read-later items are plain
 
 **Lifecycle.** The host runs only while the side panel or settings page is open. It is never a daemon, service, or login item. Each of those pages opens its own native messaging connection when it loads, the browser spawns a host process for it, and that host exits when the connection closes (stdin EOF), which happens when the page closes. Work the host would otherwise do in the background, such as catching up on external edits to notes, happens on connect instead (see §5.5).
 
-While the panel is closed, the extension's service worker still observes navigation on enabled sites and buffers qualifying visits in `chrome.storage.local`. Each record has a stable event ID, original HTTP(S) URL, optional title, and timestamp. The buffer is capped by count and bytes. Before writing any record, the worker awaits `setAccessLevel({accessLevel: "TRUSTED_CONTEXTS"})`, loads a revisioned, host-confirmed site policy with a bounded expiry, and checks the current Chrome grant; absent or expired policy fails closed. The host independently enforces its confirmed site allowlist and privacy rules against the original URL before any lossy normalization. The host cannot inspect Chrome's live grants. Events leave the buffer only after a terminal host acknowledgement (`persisted`, `suppressed`, or permanent-policy `rejected`); transient errors retain the event for bounded retry and appear in the panel alongside rejections and queue overflow. An invalid or newer host config suspends the extension policy without deleting buffered visits; the panel offers an explicitly confirmed discard action during repair. Disabling logging or confirming a site grant revocation purges affected records. The side panel and settings page serialize config changes and Chrome grant cleanup across every open window through one shared lock, and recheck the grant before enabling capture. The worker accepts messages only from those two extension pages. Each page watches the worker's policy lease and re-reads the host when another page publishes a different revision. An explicit re-enable clears a prior revocation only when the worker has the committed host revision and Chrome currently grants that origin. Summaries and other agent tasks run only while the panel is open.
+While the panel is closed, the extension's service worker still observes navigation on enabled origins and buffers qualifying events in `chrome.storage.local` (with artifact logging, hourly `activity` events; see below). Each record has a stable event ID, original HTTP(S) URL, optional title, and timestamp. The buffer is capped by count and bytes. Before writing any record, the worker awaits `setAccessLevel({accessLevel: "TRUSTED_CONTEXTS"})`, loads a revisioned, host-confirmed site policy with a bounded expiry, and checks the current Chrome grant; absent or expired policy fails closed. The host independently enforces its confirmed site allowlist and privacy rules against the original URL before any lossy normalization. The host cannot inspect Chrome's live grants. Events leave the buffer only after a terminal host acknowledgement (`persisted`, `suppressed`, or permanent-policy `rejected`); transient errors retain the event for bounded retry and appear in the panel alongside rejections and queue overflow. An invalid or newer host config suspends the extension policy without deleting buffered visits; the panel offers an explicitly confirmed discard action during repair. Disabling logging or confirming a site grant revocation purges affected records. The side panel and settings page serialize config changes and Chrome grant cleanup across every open window through one shared lock, and recheck the grant before enabling capture. The worker accepts messages only from those two extension pages. Each page watches the worker's policy lease and re-reads the host when another page publishes a different revision. An explicit re-enable clears a prior revocation only when the worker has the committed host revision and Chrome currently grants that origin. Summaries and other agent tasks run only while the panel is open.
 
-With artifact logging (§5.1), the worker forwards every main-frame visit on an enabled origin, and the host decides whether it is an artifact; the worker holds no adapter patterns and never decides what is recorded. The worker also keeps the one open focus interval in `chrome.storage.session`, which survives service-worker suspension but not a browser restart, and moves it into the `storage.local` buffer as an ordinary event once it closes.
+With artifact logging (§5.1), recognition has to happen while the page is live, because the host is usually not running when a visit happens. The host-confirmed policy lease the worker already caches therefore also carries each enabled adapter's confirmed match rules, `id` template, title pattern, mode map, and Tier 1 selectors, under the same revision and expiry. The worker prefilters with them: a visit no adapter matches is dropped before it reaches the buffer, and a matching visit is buffered with its provisional `artifact_id` and, when the adapter has Tier 1 fields, the values read from the live page. The prefilter only narrows capture. At delivery the host re-runs its own recognition on the original URL and title and discards any field the confirmed adapter does not declare, so a compromised worker can drop visits but cannot widen what is recorded. An absent or expired lease fails closed, as in M1. The worker also accumulates attention into one pending total per artifact per local hour in trusted-only `storage.local`. The total stays open until its hour ends; the worker then freezes it into one `activity` event in the buffer (§5.1).
 
 ### 3.3 Why this split
 
@@ -82,8 +82,8 @@ The extension runs in a hostile environment (arbitrary web pages), and the host 
 | Command injection via agent invocation | Harnesses run via argv with no shell; page content passed on stdin, never interpolated into argv |
 | Prompt injection from page content | Content delimited and labelled untrusted; agent run in its most restricted mode for read-only tasks; outputs written only to Brauser-owned locations; output shown as text and stored with remote embeds neutralized (§5.2) |
 | Sensitive pages sent to an agent | Agent denylist enforced in the host, overriding explicit user requests with a warning |
-| Unwanted browsing surveillance | Logging is opt-in per origin and records only URLs an enabled artifact adapter recognizes; other pages on the origin are dropped by the host (§5.1); incognito never logged; a summary file is written only for a page the user explicitly summarizes, and is the only record Brauser keeps of pages on sites not enabled for logging |
-| Hostile adapter patterns or captured fields | Patterns run in Rust's linear-time `regex` crate with size limits; captured IDs never become paths (the host builds slugs); titles and DOM fields are untrusted text, escaped and embed-neutralized before writing (§7.2) |
+| Unwanted browsing surveillance | Automatic logging is opt-in per adapter and origin. Only artifact activity reaches the delivery buffer: the worker drops other pages on an enabled origin before buffering, using the confirmed rules in its policy lease, and the host re-checks every delivered event (§3.2, §5.1). The one exception is the Tier 2 hint's sample in the worker, capped at 20 unrecognized URLs and titles per enabled origin for 7 days and never written to the notes folder (§5.1). A compromised worker could still buffer or deliver anything it sees on a granted origin, but the host records only what a confirmed adapter matches. Incognito is never logged. On pages outside enabled origins, Brauser keeps only what the user explicitly creates: a page note, a `/log` entry, or a summary |
+| Hostile adapter patterns or captured fields | Patterns run in Rust's linear-time `regex` crate with size limits; the worker's copy is limited to a dialect with the same meaning in JavaScript, no nested unbounded quantifiers, and capped inputs (§7.2); captured IDs never become paths (the host builds slugs); titles and DOM fields are untrusted text, escaped and embed-neutralized before writing (§7.2) |
 | Confidential titles leaving the machine through a synced notes folder | Setup names what artifact logging records and warns when the folder is inside a known sync location (§5.1) |
 | Other local extensions talking to the host | `allowed_origins` restricted to official extension IDs |
 | Supply chain compromise | Pinned dependencies, `cargo-audit`/`cargo-deny`, npm lockfile audit, signed releases with provenance |
@@ -108,7 +108,7 @@ The extension runs in a hostile environment (arbitrary web pages), and the host 
 - M0 creates new page files only: write a temp file in the same directory, fsync it, then publish with an atomic no-clobber hard link. It never replaces an existing file.
 - Page notes are edited only in the side panel (§5.3), so the host replaces a note whole: write a temp file in the same directory, fsync it, then atomically rename it over the note. Each save names the note version it was based on; if the file has changed since then (for example, from another Brauser window), the host refuses the save and returns the current note. Before replacing, the host checks the file's recorded canonical URL and Brauser ownership, as for summaries (§5.2).
 - M2 summary files (§5.2) are also replaced whole, without a version check. Brauser owns the whole file, so the `/summarize` action is the confirmation for replacing it. The host writes and fsyncs a temp file in the summaries directory, then publishes with a no-clobber hard link if the name is absent, or renames over the existing name only if it is a regular file (not a symlink) whose leading frontmatter has `brauser.kind: summary` and the requested `canonical_url` and `url_id`. Anything else is a `conflict` and is left untouched. On Windows the rename uses `MOVEFILE_REPLACE_EXISTING`; a sharing violation or access-denied error while another program holds the file is retried briefly, then returned as `retryable` with nothing changed. The window between the check and the rename is accepted for summary files only: an external save in that window loses only an edit to Brauser's summary text, never note text. Logs and read-later files stay create-only.
-- Artifact files (§5.1, §6.7) are regenerated from the log and replaced whole with the same checked rename as summary files, matched on `brauser.kind: artifact` and the requested `artifact_id`. Anything else at the path is a `conflict` and is left untouched.
+- Artifact files (§5.1, §6.7) are regenerated from the log and replaced whole with the same checked rename as summary files, matched on `brauser.kind: artifact` and the requested `artifact_id`. Anything else at the path is a `conflict` and is left untouched. Regeneration is lazy (§6.7), and a file whose new bytes equal its current bytes is not rewritten, so sync clients and version control see a change only when the content changed.
 - Destructive operations, such as deleting a note or read-later file, require explicit user confirmation in the sidebar. Saving a note's text is not destructive.
 
 ### 4.5 Agent invocation rules
@@ -130,16 +130,33 @@ Artifact logging replaces M1's per-site automatic logging; the two do not run si
 **Recognition.** An adapter maps a URL on an enabled origin to an artifact type and canonical ID, for example "this URL is Jira issue `PROJ-123` in `acme.atlassian.net`." Adapters are config (§7.2) and are recognized in three tiers:
 
 - **Tier 0: URL and tab title.** This tier needs no permissions beyond the exact-origin grant, and it provides most of the value. Work tools put their identity in the URL and most of their metadata in the tab title, which the worker already reads from tab metadata on granted origins. Jira uses `/browse/PROJ-123`, or `?selectedIssue=PROJ-123` when the issue opens as a board modal. Confluence uses `/wiki/spaces/<space>/pages/<id>`. Google Docs, Sheets, and Slides use `/<kind>/d/<id>/`, with a title such as "Name - Google Docs". A GitHub pull request title carries the title, author, number, and repository. Notion, Figma, and Linear use stable path IDs. SharePoint often puts identity in a `sourcedoc` GUID in the query string. Every adapter must work at Tier 0.
-- **Tier 1: declarative DOM fields.** Optional per adapter, for data the title does not carry, such as status, assignee, labels, or parent epic. The adapter lists named CSS selectors. On an already-granted origin, the extension runs one fixed, bundled extraction function through `scripting` (§8), with the selectors passed as arguments. It returns only those named fields, reads only each element's rendered `innerText`, and never reads form values or attributes. Values are capped plain text and are untrusted like any page content. Tier 1 runs only on a URL the host has already recognized.
-- **Tier 2: drafted adapters.** When the user keeps visiting unrecognized pages on an enabled origin, the panel says so, for example "Looks like you have recurring pages on `wiki.internal`." On request, the configured agent receives only a handful of those URLs and titles, never page content, and drafts an adapter. The host parses the draft as config and validates it like any user setting. The user reviews it, and enabling it takes the native confirmation that any widening of capture needs (§7). A draft may use only origins that are already enabled and cannot add an origin. The agent denylist (§7.3) applies to the sample. To support the hint, the host keeps, for each enabled origin, at most 20 recent unrecognized URLs and titles in the OS cache directory. These expire after 7 days, never enter the notes folder, and are purged when the origin is disabled. They are the only record of non-artifact pages, and the settings page can clear them. Tier 2 needs M2's harness invocation.
+- **Tier 1: declarative DOM fields.** Optional per adapter, for data the title does not carry, such as status, assignee, labels, or parent epic. The adapter lists named CSS selectors. On an already-granted origin, the extension runs one fixed, bundled extraction function through `scripting` (§8), with the selectors passed as arguments. It returns only those named fields, reads only each element's rendered `innerText`, and never reads form values or attributes. Values are capped plain text and are untrusted like any page content. The worker runs Tier 1 while the page is live, whether or not the panel is open, and only on a URL its lease-based prefilter has recognized (§3.2). It reads the fields once the tab's title update settles, which for an SPA route is after `onHistoryStateUpdated`, and retries once a few seconds later if a field is empty, because work tools often render late. The values travel in the buffered visit. At delivery the host keeps only the fields the confirmed adapter declares, capped again. A field the worker could not read stays empty; the host never fetches it later.
+- **Tier 2: drafted adapters.** When the user keeps visiting unrecognized pages on an enabled origin, the panel says so, for example "Looks like you have recurring pages on `wiki.internal`." On request, the configured agent receives only a handful of those URLs and titles, never page content, and drafts an adapter. The host parses the draft as config and validates it like any user setting. The user reviews it, and enabling it takes the native confirmation that any widening of capture needs (§7). A draft may use only origins that are already enabled and cannot add an origin. The agent denylist (§7.3) applies to the sample. Unrecognized visits never reach the host, so the hint's sample lives in the worker. For each enabled origin it keeps a count and at most 20 recent unrecognized URLs and titles in trusted-only `storage.local`, separate from the delivery buffer. These expire after 7 days and are purged when the origin is disabled. They go to the host only when the user asks for a draft, and they never enter the notes folder. They are the only record of non-artifact pages, and the settings page can clear them. Tier 2 needs M2's harness invocation.
 
-**Engagement.** A skim is recorded differently from real work. The worker stores the current focus start (tab, document, and time) in `chrome.storage.session`, which survives service-worker suspension. The interval closes on `tabs.onActivated`, `windows.onFocusChanged` (including focus leaving Chrome), a navigation in that tab, `tabs.onRemoved`, or `idle.onStateChanged` reporting idle or locked. None of these events needs the `tabs` permission. The closed interval goes into the buffer as an event that references the visit's event ID. An interval that is still open when the browser exits is dropped rather than guessed. The host classifies accumulated focus per artifact per day as *glanced* or *worked on*, using configurable thresholds (for example, under 30 seconds and at least 2 minutes). Without `idle`, a tab left focused over lunch would count as work, so `idle` (§8) is part of this feature.
+**Engagement.** Brauser records what it measured, not what it infers. It does not label an artifact "worked on"; it records "focused 42 min". The worker measures attention only on tabs whose current document its prefilter recognized, and keeps two separate numbers:
 
-**Trails.** Each visit also carries how the user got there. `webNavigation.onCommitted` gives the transition type (`link`, `typed`, `auto_bookmark`, `form_submit`, and others), and the worker records the previous URL in the same tab and the `openerTabId` tab's current URL, but only when that URL is on a granted origin. The worker cannot see any other URL. That `openerTabId` is readable without `tabs` must be confirmed in the smoke runner before this ships. The host resolves both ends to artifacts, which gives edges such as "opened PROJ-123 from PR #412". An adapter's `refs` patterns add *mentions* edges, for example an issue key in a pull request title. A ref resolves to a known artifact only when exactly one enabled adapter of the target type exists. Otherwise it stays an unresolved key. *Co-worked* edges, between artifacts worked on in the same focus window, are derived in the index and never written to the log.
+- **Focused:** the tab is the active tab in the focused Chrome window.
+- **Background:** the tab is still the active tab of the last-focused window, but focus has left Chrome, for example to take notes in a terminal beside the doc. Brauser cannot tell whether the tab is still visible, so this time is kept separate and never added to focused time.
+
+Either measure stops when the user switches tabs (`tabs.onActivated`), navigates in that tab, or closes it (`tabs.onRemoved`), or when `idle.onStateChanged` reports idle or locked. Focus moving between Chrome and another app (`windows.onFocusChanged`) moves time between the two measures and does not stop it. None of these events needs the `tabs` permission. The worker sets the idle detection interval to 5 minutes (configurable; Chrome's minimum is 15 seconds) instead of the 60-second default, because reading a long document involves no keyboard or mouse input. On `idle`, the time up to the idle report counts, so up to one detection interval of reading without input is counted. On `locked`, counting stops at the lock. The panel says "focused 42 min · 15 min in background · opened 3 times". Searches and filters use the measured values with visible thresholds, such as "focused at least 5 min", so no time range is left unclassified.
+
+**Coarse log.** The log records one line per artifact per active hour, not one per tab switch. Visits and attention on an artifact during a local hour are merged in the worker into one pending **activity** total, keyed by provisional `artifact_id`, local date, hour, and UTC offset, and kept in trusted-only `storage.local` so it survives a browser restart. The total holds the open count, focused and background seconds, the modes seen, the latest canonical URL, title, and Tier 1 values, and the distinct trail sources (`from` and transition), capped at 10. Only a stretch still running when the browser exits is lost. When the hour ends, the worker freezes the total into one `activity` event with a stable event ID. Delivery sends only frozen events, and the panel reads the current hour's open total from the worker for its live view. A heavy workday then produces at most one line per artifact per hour. The host appends a delivery batch as one write, one sync, and one intent record covering every event ID in it, not one durable intent file per event.
+
+**Trails.** Each visit also carries how the user got there. `webNavigation.onCommitted` gives the transition type (`link`, `typed`, `auto_bookmark`, `form_submit`, and others). The worker keeps a map from each tab to its current document's provisional artifact in `chrome.storage.session`, built from the same `onCommitted` and `onHistoryStateUpdated` events it already handles. An entry is cleared when that tab moves to a page that is not an artifact, so a new tab opened from a Jira filter page is never credited to whatever ticket that tab showed before. Edges are captured when they happen:
+
+- **New tab or window.** `webNavigation.onCreatedNavigationTarget` fires when a link opens a new tab or window (middle-click, `target=_blank`, `window.open`). It gives the new `tabId` and the `sourceTabId`, and the worker looks up the source tab's artifact at that moment. The worker stores it as the new tab's pending source, and the new tab's first recognized commit consumes it. Reading an opener tab's URL later would record the wrong edge whenever the opener had navigated since, which is common when the user middle-clicks several results from a list and keeps going. This event is part of `webNavigation`, which logging already requests, so `openerTabId` and its untested readability without `tabs` are not used.
+- **Same tab.** The map's previous entry for that tab is the source of a link or form navigation.
+
+A source is recorded only when it is a recognized artifact, which means it is on a granted origin; the worker never sees any other URL. The host re-resolves both ends at delivery, which gives edges such as "opened PROJ-123 from PR #412". An adapter's `refs` patterns add *mentions* edges, for example an issue key in a pull request title. A ref resolves to a known artifact only when exactly one enabled adapter of the target type exists. Otherwise it stays an unresolved key. *Co-focused* edges, between artifacts focused on in the same hour, are derived in the index and never written to the log.
 
 **Mode.** Many tools reveal a mode in the URL: Google Docs `/edit` versus `/view` or `/preview`, Confluence's edit paths, and GitHub's `/files` review tab. An adapter maps these URLs to `view`, `edit`, or `review`. The record states what the URL showed: "opened in edit mode" is recorded, but "edited" is not claimed. Google Docs, for example, serves `/edit` to many view-only readers.
 
 **Why I'm here.** The artifact card has an optional one-line note. It is appended to the log as its own event, and the latest one is shown. It is separate from the page note (§5.3). Most people will skip it, but when they do write one it is often the most useful entry in the log.
+
+**Recent and worklog.** Every tool being adapted already has its own "recently viewed" list. What Brauser adds is one list across all of them, and that has to be visible in M1.5, not only on the artifact card of a page the user is already on:
+
+- **Recent tab.** The panel lists artifacts grouped by local day, newest day first, and within a day sorted by focused time. It can be filtered by type (for example, only `jira.issue` or `github.pr`) and by a title substring. Each row shows the title, type, focused and background minutes, and the one-liner if there is one, and opens the artifact's last URL. It reads the index (§5.5) through a `list_artifacts` message, so it needs no FTS5.
+- **Worklog.** An optional daily or weekly summary, generated by the host from the index without an agent. It uses the same measured wording as the rest of the log, for example: "Opened 9 artifacts. PROJ-123 *Release blocker — SBOM export times out*: focused 2 h, opened from PR #412. Why: blocking the release." The panel shows yesterday's, today's, or this week's worklog with Copy, for standups and status reports. When the user turns on worklog files, the host also writes Brauser-owned `worklog/<YYYY-MM-DD>.md` or `worklog/<YYYY>-W<ww>.md` files (`brauser.kind: worklog`). They are regenerated lazily and skipped when unchanged, like artifact files (§6.7), and are not rewritten after their period ends unless `brauser reindex` runs. Worklog files are off by default, and the settings page shows the sync caution below before they are enabled.
 
 **Sync caution.** Titles of confidential tickets and documents now sit in the notes folder. The setup confirmation for the first adapter says what artifact logging records (IDs, titles, Tier 1 fields, times, and trails) and, when the chosen folder is inside a known sync location (iCloud Drive, OneDrive, Dropbox, Google Drive), names that location. It warns and never blocks.
 
@@ -147,7 +164,8 @@ Artifact logging replaces M1's per-site automatic logging; the two do not run si
 
 - Logging is **opt-in**: the user enables an adapter for an exact origin and grants that origin from a setup action. The host independently checks scheme, host, and the adapter's match rules before recording a visit; Chrome's origin permission does not enforce URL paths.
 - Incognito and private windows are never logged, regardless of config. The extension manifest uses `incognito: "not_allowed"`, and the event handler resolves the tab's incognito state and rejects it defensively.
-- A URL no enabled adapter recognizes gets the terminal outcome `suppressed` with reason `not_an_artifact`, and nothing is written to the notes folder.
+- A URL no enabled adapter recognizes is dropped by the worker and never buffered. If one arrives anyway (a stale lease, an engine mismatch, or a compromised worker), the host returns the terminal outcome `suppressed` with reason `not_an_artifact` and writes nothing to the notes folder.
+- **Buffer pressure.** The buffer holds only artifact events, so it fills far more slowly than a buffer of every visit on an origin would. Hourly activity totals (Coarse log, above) keep it small: each artifact adds at most one buffered event per hour, however often it is opened. At 80% of either the count or byte cap, the worker sets the toolbar badge (`action.setBadgeText`, no permission needed) to prompt the user to open the panel. Overflow is never silent: the dropped count and time range are kept and shown in the panel's capture strip, and an overflow marker is appended to the log on the next delivery.
 - `/log` (§5.6) stays a one-off action on any HTTP(S) page. It records a `web.page` artifact keyed by the normalized URL.
 - M1's site entries keep their grants and confirmations after the upgrade but record nothing until an adapter is enabled for the origin, and the settings page says so. Existing daily logs are left as they are, and the indexer reads their M1 visit entries as `web.page` visits.
 
@@ -155,7 +173,7 @@ Artifact logging replaces M1's per-site automatic logging; the two do not run si
 
 - M1 observes main-frame `webNavigation.onCommitted` and `onHistoryStateUpdated` events, using document identity and lifecycle to avoid subframes, redirects, and duplicate SPA records. It does not keep dwell or scroll timers only in service-worker memory. A committed document's title arrives after commit, and an SPA usually sets a new route's title after `pushState`, so the worker briefly holds every new visit and fills its title from the tab's title update; the event is frozen once handed to the panel because the host hashes it for interrupted-write recovery. Each visit carries its local UTC offset, and the daily log uses that local calendar date.
 - M1 normalization drops fragments and configured tracking parameters after host authorization. Artifact adapters (§7.2) do not rewrite URLs. They map a URL to an artifact ID, and the log keeps the normalized URL alongside that ID.
-- Deliveries are idempotent by event ID recorded in the Markdown log. The host keeps a durable per-event intent in its OS config directory to find the original daily log across date and `log_dir` changes; only a complete Markdown marker proves persistence. Shared locks cover the current policy check, intent, append, and file sync, so revocation and concurrent panel connections cannot race a write. An interrupted append can resume only from an exact byte prefix in the still-selected folder; changed or missing logs require review. Near-repeat visits within a configurable window are suppressed rather than rewriting a prior Markdown entry; the daily log remains append-only. Dwell time is now kept in `chrome.storage.session` as focus intervals (Engagement, above). Scroll depth is not planned.
+- Deliveries are idempotent by event ID recorded in the Markdown log. The host keeps a durable per-event intent in its OS config directory to find the original daily log across date and `log_dir` changes; only a complete Markdown marker proves persistence. Shared locks cover the current policy check, intent, append, and file sync, so revocation and concurrent panel connections cannot race a write. An interrupted append can resume only from an exact byte prefix in the still-selected folder; changed or missing logs require review. Near-repeat visits within a configurable window are suppressed rather than rewriting a prior Markdown entry; the daily log remains append-only. Dwell time is now kept as hourly activity totals (Engagement and Coarse log, above). With artifact logging, one intent record covers a whole delivery batch. The per-event intent journal is M1's, and compacting it moves from M5 into M1.5 (§12.2 step 7), because artifact logging is always on. Scroll depth is not planned.
 
 ### 5.2 Summaries
 
@@ -228,7 +246,7 @@ Template variables: `{page.title}`, `{page.url}`, `{page.content}`, `{selection}
 
 A command's output never goes into the page note (§5.3). `new_note` writes a separate Brauser-owned file.
 
-`/log` and notes are one-off actions the user takes on a single page, so they need Chrome's grant for that site but not the host's native confirmation (§7). `/log` writes one entry to the daily log; it does not enable automatic logging for the site.
+`/log` and notes are one-off actions the user takes on a single page, so they need Chrome's grant for that site but not the host's native confirmation (§7). `/log` records the page as a `web.page` artifact: one `activity` event in the log, and an artifact file and index entry like any other artifact (§5.1). It does not enable automatic logging for the site.
 
 ### 5.7 Side panel layout
 
@@ -240,14 +258,14 @@ The panel is about the page in the active tab. Capture housekeeping collapses in
 ├────────────────────────────────────────────┤
 │ Designing Data-Intensive Apps — Ch. 5      │  current page; follows the
 │ oreilly.com/library/view/…/ch05            │  active tab
-│ ● Logged   ✦ AI allowed        ☆ Save      │  status chips; ☆ = /save
+│ ● Artifact logged  ✦ AI allowed   ☆ Save   │  status chips; ☆ = /save
 ├────────────────────────────────────────────┤
 │ ARTIFACT  jira.issue PROJ-123   In review  │  only on a recognized page
-│ Worked on 5× · 2 h total · last Tue        │  (§5.1); Tier 1 fields
+│ Focused 2 h over 5 days · last Tue         │  (§5.1); Tier 1 fields
 │ ← opened from PR #412 · 3 linked           │  when configured
 │ Why: blocking the release             ✎    │  optional one-liner
 ├────────────────────────────────────────────┤
-│ [ This page ]   Read later (3)             │
+│ [ This page ]   Recent   Read later (3)    │
 ├────────────────────────────────────────────┤
 │ ┌ ANSWER ─────────────────────── ✕ ──────┐ │  only after a question or a
 │ │ Leader-based replication sends every   │ │  sidebar-output command;
@@ -272,7 +290,7 @@ The panel is about the page in the active tab. Capture housekeeping collapses in
 └────────────────────────────────────────────┘  Discard…, Dismiss, Pause
 ```
 
-The Read later tab lists saved pages with a search box and a checkbox to mark each done; done items move to a collapsed "Done" group and their files are kept.
+The Recent tab (M1.5, §5.1) lists artifacts by day, with a type filter, a title filter, and a Worklog view with Copy. The Read later tab lists saved pages with a search box and a checkbox to mark each done; done items move to a collapsed "Done" group and their files are kept.
 
 Each state changes one area rather than the layout:
 
@@ -280,13 +298,13 @@ Each state changes one area rather than the layout:
 |---|---|
 | Not set up | The setup warning replaces the tabs; the omnibar and page controls are disabled; the strip reads "Off". |
 | Native host unavailable | A banner under the header with the fix; everything below is disabled. |
-| Site not logged | Chip `○ Not logged · Log this site…`, which opens settings with the site filled in. Notes, `/log`, and summaries still work. |
+| Origin not enabled | Chip `○ Not logged · Set up artifacts for this site…`, which opens settings with the origin filled in and offers any matching adapter template. Notes, `/log`, and summaries still work. |
 | Enabled origin, page not an artifact | No artifact card; chip `○ Not an artifact`. When unrecognized pages recur, a hint offers to draft an adapter (Tier 2, §5.1). |
 | Site on the agent denylist | Chip `⊘ AI off for this site`; summarize and questions are disabled with the reason. |
 | No agent set up | Chip `✦ AI not set up`; the omnibar offers only commands that need no agent, plus a link to settings. |
 | Not an HTTP(S) page | The page area names the tab and says Brauser can't use it; only Read later is active. |
 
-Milestones fill the layout in: the page area, My note, and the capture strip first; the artifact card in M1.5; the answer card, Summary, and omnibar in M2; Related and Read later in M3; the full command list in M4.
+Milestones fill the layout in: the page area, My note, and the capture strip first; the artifact card, the Recent tab, and the worklog in M1.5; the answer card, Summary, and omnibar in M2; Related and Read later in M3; the full command list in M4.
 
 ## 6. Data Format
 
@@ -298,12 +316,13 @@ The user chooses the notes folder at setup. It can be empty, or a subfolder of a
 <notes folder>/                  chosen by the user, no default
   log/2026/09/2026-09-27.md      daily artifact log: append-only source of truth
   artifacts/<type>/<site>/<slug>.md  one Brauser-owned file per artifact, regenerated from the log (M1.5)
+  worklog/2026-09-28.md          optional Brauser-owned daily or weekly worklog (M1.5, off by default)
   pages/<slug>.md                page note: the user's text only
   summaries/<slug>.summary.md    one Brauser-owned summary per page (M2)
   later/<slug>.md                read-later items
 ```
 
-`artifacts_dir` is a fifth content location under the same no-overlap rule. Artifact paths are built by the host from slugs of the adapter type, the site host, and the artifact ID; the captured ID is never used as a path directly. When slugging an ID would lose information, for example a case-sensitive Google Docs ID on a case-insensitive filesystem, the host appends a short hash of the full `artifact_id` so two artifacts never share a file.
+`artifacts_dir` and the optional `worklog_dir` are further content locations under the same no-overlap rule. Artifact paths are built by the host from slugs of the adapter type, the site host, and the artifact ID; the captured ID is never used as a path directly. When slugging an ID would lose information, for example a case-sensitive Google Docs ID on a case-insensitive filesystem, the host appends a short hash of the full `artifact_id` so two artifacts never share a file.
 
 No content location may equal, contain, or sit inside another, compared case-insensitively; the host rejects an overlapping config. An M1 config has no `summaries_dir`: capture keeps working, `/summarize` reports `not_configured`, and the first harness setup proposes `summaries` in its native confirmation (§7.3). An overlap found then is a recoverable setup error, never resolved silently.
 
@@ -319,7 +338,7 @@ If Brauser finds an existing folder with files it didn't create, it leaves them 
 
 ### 6.2 Internal model
 
-The host works on two record types. A `PageNote` has `url`, `canonical_url`, `url_id`, `title`, `created`, `updated`, `tags`, `links`, and `body`. A `Summary` has `url`, `canonical_url`, `url_id`, `title`, `generated`, `harness`, `harness_version`, `note_link`, and `body`; it is Brauser-owned and replaced whole (§5.2). An `Artifact` has `artifact_id`, `type`, `site`, `title`, `url` (the last canonical URL seen), `fields` (Tier 1), `first_seen`, `last_seen`, `engaged_secs`, `last_mode`, `why`, and `edges`. It is derived from log events (`visit`, `focus`, `why`) and regenerated, never edited in place. The index joins notes and summaries by `url_id`, and joins them to artifacts through the URLs recorded on each visit.
+The host works on two record types. A `PageNote` has `url`, `canonical_url`, `url_id`, `title`, `created`, `updated`, `tags`, `links`, and `body`. A `Summary` has `url`, `canonical_url`, `url_id`, `title`, `generated`, `harness`, `harness_version`, `note_link`, and `body`; it is Brauser-owned and replaced whole (§5.2). An `Artifact` has `artifact_id`, `type`, `site`, `title`, `url` (the last canonical URL seen), `fields` (Tier 1), `first_seen`, `last_seen`, `focused_secs`, `background_secs`, `opens`, `days_opened`, `last_mode`, `why`, and `edges`. It is derived from log events (`activity`, `why`) and regenerated, never edited in place. The index joins notes and summaries by `url_id`, and joins them to artifacts through the URLs recorded on each visit.
 
 `artifact_id` has the form `<system>:<host>/<native id>`, for example `jira:acme.atlassian.net/PROJ-123`, `confluence:acme.atlassian.net/123456`, `gdoc:docs.google.com/<id>`, or `github.pr:github.com/owner/repo/412`. The native ID is the tool's own identifier, with case normalized only where the tool treats it as case-insensitive (Jira keys are uppercased). Other systems that already know these artifacts can then join on the ID without Brauser fetching anything. The scheme is fixed by each adapter's `id` template and is part of the adapter's documented contract. Profiles only control serialization, including how `note_link` is rendered.
 
@@ -419,10 +438,12 @@ brauser:
   artifact_id: jira:acme.atlassian.net/PROJ-123
   type: jira.issue
   status: In review
-  first_seen: 2026-09-22T15:02:11Z
-  last_seen: 2026-09-29T17:40:03Z
-  engaged_secs: 7260
-  worked_on_days: 5
+  first_seen: 2026-09-22
+  last_seen: 2026-09-29
+  focused_min: 121
+  background_min: 35
+  opens: 14
+  days_opened: 5
   last_mode: view
 ---
 
@@ -430,8 +451,9 @@ Why: blocking the release
 
 ## Timeline
 
-- 2026-09-29 · worked on 42 min · opened from [PR #412](../../github.pr/github-com/owner-repo-412.md)
-- 2026-09-24 · glanced · typed
+- 2026-09-29 · focused 42 min · 15 min in background · opened 3× · from [PR #412](../../github.pr/github-com/owner-repo-412.md)
+- 2026-09-24 · focused 1 min · opened 1× · typed
+- Week of 2026-09-14 · focused 38 min · opened 6× on 2 days
 
 ## Linked
 
@@ -439,7 +461,13 @@ Why: blocking the release
 - opened → [SBOM export design](../../gdoc/docs-google-com/sbom-export-design-3f9a1c.md)
 ```
 
-Artifact files belong to Brauser and are rebuildable in the same way as the index: `brauser reindex` regenerates them from the log, and user edits to them are replaced (§4.4). Titles, Tier 1 fields, and the one-liner are written with YAML escaping, and their Markdown is neutralized as in §5.2 step 6, so a hostile ticket title cannot make a viewer fetch a remote resource. Links follow the profile's link style.
+Artifact files belong to Brauser and are rebuildable in the same way as the index: `brauser reindex` regenerates them from the log, and user edits to them are replaced (§4.4).
+
+Artifact files are written to be quiet in synced and versioned folders:
+
+- **Lazy regeneration.** Delivery updates the index and marks changed artifacts dirty there; it does not touch their files. The host regenerates dirty files on a best-effort pass when the panel's connection closes, on the first connection of each local day, and when the user chooses "Update artifact files now" in settings. The dirty set lives in the index, so a host that exits before its pass loses nothing. The panel's artifact card reads the index, so a file that is not yet regenerated never makes the panel stale.
+- **Stable content.** Frontmatter uses dates, not timestamps, and whole minutes. A file whose regenerated bytes are unchanged is not rewritten (§4.4). An extra visit in the same day changes one Timeline line and a few counters, not the whole file.
+- **Bounded size.** The Timeline keeps one line per day for the last 14 days with activity. Older days roll into one line per week, and weeks older than 26 weeks roll into one line per month. Linked lists the 50 strongest edges and ends with "N more" pointing at the omnibar. The full detail stays in the log and the index, so a ticket opened every day for a year still has a file of a few dozen lines. Titles, Tier 1 fields, and the one-liner are written with YAML escaping, and their Markdown is neutralized as in §5.2 step 6, so a hostile ticket title cannot make a viewer fetch a remote resource. Links follow the profile's link style.
 
 ## 7. Configuration
 
@@ -528,8 +556,9 @@ mode   = { edit = "edit", view = "view", preview = "view" }
 ```
 
 - **Evaluation.** The host evaluates every pattern with Rust's `regex` crate, which runs in linear time, so a user-written or agent-drafted pattern cannot hang the host through catastrophic backtracking. Config validation compiles each pattern with bounded `size_limit` and `dfa_size_limit` and caps the pattern length and the number of adapters. Matching runs against the original URL after host authorization, so a path pattern is also the adapter's path rule. The first matching rule of the first matching adapter wins.
+- **The worker's copy.** The same confirmed patterns go to the worker in the policy lease (§3.2), where JavaScript's backtracking `RegExp` runs them. The host therefore accepts only a dialect whose meaning is the same in both engines: literals, explicit ASCII character classes, anchors, groups, named captures, alternation, and quantifiers. Lookaround and backreferences are not allowed; Rust rejects them anyway. Unicode-sensitive shorthands such as `\d`, `\w`, `\s`, and `\b` are rewritten by the host to explicit ASCII classes before the lease is published, and the worker compiles every pattern with the `u` flag. To keep backtracking bounded, the host also rejects nested unbounded quantifiers such as `(a+)+` or `(.*)*`, and the worker caps its inputs (for example, URLs at 2048 characters and titles at 512) before matching. A disagreement between the engines can only cost a visit the prefilter wrongly dropped, never add one, because the host re-checks. A conformance test runs every shipped template's fixture URLs and titles through both engines and fails on any difference.
 - **Captures.** Named captures fill the `id` template. `{host}` is the authorized origin's host. A capture never becomes a path (§6.1). The title pattern runs on the tab title, and when it does not match, the whole tab title is used.
-- **Tier 1 `fields`** are optional named selectors, used as in §5.1. The fixed extractor caps each value (for example at 256 characters) and the total. When a selector matches nothing, the field is empty and nothing fails.
+- **Tier 1 `fields`** are optional named selectors, used as in §5.1, and travel to the worker in the lease with the match rules. The fixed extractor caps each value (for example at 256 characters) and the total. When a selector matches nothing, the field is empty and nothing fails.
 - **Templates.** Brauser ships adapters for common tools (Jira, Confluence, Google Docs/Sheets/Slides, GitHub pull requests and issues, Notion, Figma, Linear, SharePoint) as disabled templates with a placeholder origin such as `https://<your-site>.atlassian.net`. Before enabling one, the user resolves it to an exact scheme, host, and port and can edit it for self-hosted tools. Tool UIs change, so each template records the date it was last checked. A Tier 1 selector that stops matching degrades to Tier 0; it never fails the visit.
 - **Consent.** Enabling an adapter requests the origin's optional Chrome grant, when it is not already held, and the host's native confirmation. The confirmation shows the adapter's match rules, Tier 1 fields, and the §5.1 sync caution. Adding or widening an adapter's match rules or fields widens capture and needs the same confirmation. Removing or narrowing them takes effect immediately.
 - **M1 compatibility.** M1's `[[sites]]` entries (an exact origin and an optional path prefix) remain valid config that grants an origin but records nothing on their own (§5.1).
@@ -557,11 +586,11 @@ Each entry is a hostname. The host stores it lowercased, converted to punycode, 
 | `sidePanel` | Always-on sidebar |
 | `nativeMessaging` | Talk to the host |
 | `storage` | UI preferences and the capped visit buffer (§3.2) |
-| `webNavigation` | Optional in M1; requested only when the user enables logging |
-| `scripting` | Required, M2; runs the pinned content extractor in a tab under an `activeTab` grant or an enabled site's grant. Adds no install warning without host permissions |
+| `webNavigation` | Optional; requested only when the user enables the first artifact adapter. Provides main-frame commits, SPA route changes, transition types, and `onCreatedNavigationTarget` for trails (§5.1) |
+| `scripting` | Required from M2, or from M1.5 if Tier 1 ships first; runs the pinned content extractor in a tab under an `activeTab` grant or an enabled origin's grant, and the fixed Tier 1 field extractor from the worker on recognized artifact pages (§5.1). Adds no install warning without host permissions |
 | `activeTab` | Required, brought forward from M2 by the side-panel rework (§12.2 step 4); grants temporary access to one tab from the `note` command, the page context menu, or the toolbar action. No install warning |
 | `contextMenus` | Required, brought forward from M2 by the side-panel rework; the page context menu's "Add a note in Brauser" (M2 adds "Summarize with Brauser" alongside it) |
-| `idle` | M1.5; closes a focus interval when the user is idle or the screen locks (§5.1). No install warning |
+| `idle` | M1.5; stops counting attention when the user has been idle for the detection interval (5 min by default) or the screen locks (§5.1). No install warning |
 | `commands` | A `note` entry, brought forward from M2, starts the first note on an ungranted page (§5.3); `summarize` remains M2 |
 | `optional_host_permissions` | Manifest declares HTTP(S) patterns for sites discovered during setup; Chrome grants only the exact origin requested for an enabled logging site or a first note. Adapter paths remain host-enforced |
 
@@ -569,7 +598,7 @@ The manifest's broad optional HTTP(S) patterns permit runtime requests for user-
 
 M2 adds `scripting` and a `summarize` entry under `commands`, reusing the `activeTab` and `contextMenus` permissions the side-panel rework already added. A side-panel click grants neither `activeTab` nor the tab's URL, so summarizing an ungranted page starts from the `summarize` command, the context menu, or the toolbar action (§5.2, §5.6), the same pattern notes and `/log` already use for the first note or log entry on a new site (§5.3). Notes and `/log` request the page's exact origin; summarizing does not. M2 does not add `tabs`, which Chrome labels "Read your browsing history", and makes no persistent origin grants for summarizing, so none accumulate and logging-site removal never affects summarizing.
 
-M1.5 adds `idle` and uses `tabs.onActivated`, `tabs.onRemoved`, and `windows.onFocusChanged`, none of which needs `tabs`. It reads `openerTabId` from `tabs.get`, which the smoke runner must confirm is present without `tabs` (§5.1). Tier 1 fields need `scripting` on an already-granted origin. If Tier 1 ships before M2 step 5.4, `scripting` moves forward with it, and it still adds no install warning without host permissions.
+M1.5 adds `idle` and uses `tabs.onActivated`, `tabs.onRemoved`, and `windows.onFocusChanged`, none of which needs `tabs`. Trails use `webNavigation.onCreatedNavigationTarget`, under the `webNavigation` permission logging already requests, and not `openerTabId` (§5.1). Tier 1 fields need `scripting` on an already-granted origin, called from the worker while the page is live. M1.5 also sets the toolbar badge (`action.setBadgeText`, no permission) when the buffer nears its cap. If Tier 1 ships before M2 step 5.4, `scripting` moves forward with it, and it still adds no install warning without host permissions.
 
 No broad host permissions are requested at install time.
 
@@ -614,7 +643,7 @@ The layout above is the planned release layout. M0 currently contains `protocol/
 |---|---|
 | **M0 — Foundation** | Protocol schema, host skeleton, config loading, vault confinement, atomic writes, CI |
 | **M1 — Capture** | Side panel and settings page, site logging, URL normalization, daily log, create-only page notes with review drafts |
-| **M1.5 — Artifacts** | Tier 0 adapters and templates replacing per-site logging, focus intervals, trails and refs, mode, the one-liner, artifact files, `artifacts`/`visits`/`edges` index tables, the artifact card. Tier 1 when `scripting` lands; Tier 2 after M2 step 5.2. No agent required |
+| **M1.5 — Artifacts** | Tier 0 adapters and templates replacing per-site logging, the worker prefilter from the policy lease, hourly activity totals, trails and refs, mode, the one-liner, lazily regenerated artifact files, `artifacts`/`visits`/`edges` index tables, compact intents, the artifact card, the Recent tab, and the optional worklog. Tier 1 when `scripting` lands; Tier 2 after M2 step 5.2. No agent required |
 | **M2 — Agent** | Harness setup with native confirmation, content extraction, streaming with cancellation, `/summarize`, denylist enforcement |
 | **M3 — Related** | FTS5 index, related pages, read later, `reindex` |
 | **M4 — Omnibar** | Built-in commands, free text, custom commands |
@@ -661,14 +690,15 @@ The plan follows Chrome's current [optional-permission rules](https://developer.
    5. `/summarize` in the panel, with denylist checks and the summary write and result contract in §5.2 and §4.4. Test an external-editor race, a Windows rename while another process holds the file open, a shared or overlapping summaries directory, and a config change during a fake-harness run, which must discard the output.
 6. **M3–M5** follow as in the table. The compact visit-ID index, the Windows smoke run, and Windows directory-entry durability are release blockers tracked under M5.
 7. **Build M1.5 (artifacts)** in this order, independent of M2 except where noted. It gives the product a clear first-release reason to exist ("Brauser remembers the tickets and docs you work on") without an agent.
-   1. Smoke-runner probes first: `openerTabId` from `tabs.get` without `tabs`; `webNavigation` transition types for a link, a typed URL, and a board-modal `?selectedIssue=` change (`onHistoryStateUpdated`); and `chrome.storage.session` surviving a forced worker stop.
-   2. Adapter config: the `[[artifacts]]` schema, regex limits, `id` templates, validation, and the native confirmation (§7.2), with a protocol version bump coordinated with M2's. The worker keeps forwarding every visit on an enabled origin, and the host returns `suppressed`/`not_an_artifact` for the rest. Tests cover a pathological pattern, a capture containing `../`, and an adapter whose origin is not enabled.
-   3. Log events: `visit` gains `artifact_id`, `mode`, `transition`, and `from`, and new `focus` and `why` events are added, all append-only and idempotent by event ID like M1 visits. The `focus` interval comes from the worker's `storage.session` state, and `idle` closes it.
-   4. Index tables and artifact files: `artifacts`, `visits`, and `edges` in `index.db`, with artifact files regenerated under the checked rename (§4.4) and `brauser reindex` rebuilding both from the logs. Tests cover a hostile title (embeds and YAML breakers), a case-colliding ID, and an external edit to an artifact file being replaced.
-   5. Panel: the artifact card (§5.7), the one-liner, and a `get_artifact` message.
-   6. Templates for the common tools, each checked against the live tool on the date it records, plus the sync-location warning.
-   7. Tier 1 fields, once `scripting` is in the manifest.
-   8. Tier 2 drafting, after M2 step 5.2 (host invocation), using the same harness isolation and the unrecognized-URL sample in §5.1.
+   1. Smoke-runner probes first: `webNavigation.onCreatedNavigationTarget` for a middle-click, a `target=_blank` link, and `window.open`, including a source tab that navigates on before the new tab commits; transition types for a link, a typed URL, and a board-modal `?selectedIssue=` change (`onHistoryStateUpdated`); `chrome.storage.session` and a pending `storage.local` activity total surviving a forced worker stop; and `idle.setDetectionInterval` at 5 minutes.
+   2. Adapter config and lease: the `[[artifacts]]` schema, the two-engine pattern dialect and its host-side rewrite, regex limits, `id` templates, validation, and the native confirmation (§7.2), with a protocol version bump coordinated with M2's. The policy lease carries the confirmed adapter rules and Tier 1 selectors, and the worker prefilters with them before buffering (§3.2). The host re-checks every delivered event and returns `suppressed`/`not_an_artifact` for any that does not match. Tests cover a pathological pattern, a nested-quantifier pattern rejected by the dialect, a capture containing `../`, an adapter whose origin is not enabled, the two-engine conformance corpus, and a simulated compromised worker that delivers an unrecognized URL, a URL outside the adapter's rules, or an undeclared Tier 1 field; none may be recorded.
+   3. Activity events: the worker's hourly totals (focused and background seconds, opens, modes, trail sources) frozen into `activity` events, plus `why` events. All are append-only and idempotent by event ID, like M1 visits. Tests cover an hour boundary, a UTC-offset change, a browser restart with an open total, and idle and lock during a long read.
+   4. Delivery and durability: one write, one sync, and one intent record per delivery batch, and the compact intent index brought forward from M5, with buffer-pressure coalescing, the 80% badge, and overflow accounting shown in the strip and marked in the log (§5.1).
+   5. Index tables and artifact files: `artifacts`, `visits`, and `edges` in `index.db`; lazy regeneration from the dirty set, skip-if-unchanged, and the Timeline rollups (§6.7); `brauser reindex` rebuilding both from the logs. Tests cover a hostile title (embeds and YAML breakers), a case-colliding ID, an external edit to an artifact file being replaced, a day of heavy use producing no file write until the regeneration pass, and a year of daily opens staying within the rollup bounds.
+   6. Panel: the artifact card (§5.7), the one-liner, the Recent tab, and the optional worklog (§5.1), with `get_artifact`, `list_artifacts`, and `worklog` messages.
+   7. Templates for the common tools, each checked against the live tool on the date it records, plus the sync-location warning.
+   8. Tier 1 fields in the worker while the page is live, once `scripting` is in the manifest. The smoke run checks that fields are captured with the panel closed, including a late-rendering SPA field that needs the retry.
+   9. Tier 2 drafting, after M2 step 5.2 (host invocation), using the same harness isolation and the unrecognized-URL sample in §5.1.
 
 ## 13. Platforms and License
 
@@ -684,14 +714,18 @@ Artifact decisions (2026-09-28):
 
 - **Artifacts replace per-site logging.** Automatic capture records only URLs an enabled adapter recognizes as an artifact (§5.1, §7.2). Per-site "log every page" is not offered alongside it. `/log` remains the explicit one-off exception.
 - **Log is the source of truth; artifact files are derived.** The daily log stays append-only. Artifact files and the index tables are rebuildable from it, so replacing an artifact file whole is safe under the same ownership rules as summaries (§4.4).
-- **Engagement in `storage.session`.** Dwell time returns as focus intervals that survive worker suspension and close on focus, navigation, tab close, or idle (§5.1).
+- **Measured, not inferred.** Attention is recorded as focused and background minutes, with no "glanced" or "worked on" labels. The idle detection interval is 5 minutes, so a long read without input still counts (§5.1).
+- **Recognition in the worker.** The policy lease carries the confirmed adapter rules and Tier 1 selectors, so the worker prefilters and reads fields while the page is live. The host re-checks every event, so the worker can only narrow what is recorded (§3.2).
+- **Coarse log, lazy files.** The worker merges each artifact's activity per hour, the host writes one sync and one intent per delivery batch, and artifact files regenerate lazily with bounded Timelines (§5.1, §6.7).
+- **Trails at creation time.** New-tab edges come from `onCreatedNavigationTarget` and the worker's tab-to-current-artifact map, not from reading the opener's URL later (§5.1).
+- **Recent and worklog ship with M1.5.** A cross-tool Recent list and a "what did I do yesterday" worklog, so the milestone is useful without the M3/M4 queries (§5.1).
 - **Mode, not edits.** The URL's mode is recorded as seen; Brauser does not claim the user edited something.
 
 Open artifact questions:
 
-- **Note identity for artifacts.** Page notes are keyed by normalized URL (§5.3), so PROJ-123 opened from a board modal and from `/browse/` would get two notes. Should a note on a recognized page be keyed by `artifact_id` instead? Recommended: yes for new notes, with URL-keyed notes left in place and shown as "older note on this URL". This changes note filenames and the `load_note` key, so it must be settled before step 7.5.
-- **ID scheme alignment.** If a user's other tools already key these artifacts (for example AMOS's Jira and Confluence ingestion), should the shipped templates' `id` templates match that scheme exactly? Confirm the target scheme before templates ship in step 7.6.
-- **Unrecognized-URL sample.** Is a 20-per-origin, 7-day sample in the OS cache (§5.1) acceptable by default, or should the Tier 2 hint be opt-in, so no non-artifact URL is kept at all until the user asks?
+- **Note identity for artifacts.** Page notes are keyed by normalized URL (§5.3), so PROJ-123 opened from a board modal and from `/browse/` would get two notes. Should a note on a recognized page be keyed by `artifact_id` instead? Recommended: yes for new notes, with URL-keyed notes left in place and shown as "older note on this URL". This changes note filenames and the `load_note` key, so it must be settled before step 7.6.
+- **ID scheme alignment.** If a user's other tools already key these artifacts (for example AMOS's Jira and Confluence ingestion), should the shipped templates' `id` templates match that scheme exactly? Confirm the target scheme before templates ship in step 7.7.
+- **Unrecognized-URL sample.** Is a 20-per-origin, 7-day sample in the worker's `storage.local` (§5.1) acceptable by default, or should the Tier 2 hint be opt-in, so no non-artifact URL is kept at all until the user asks?
 
 M2 decisions (2026-09-28):
 
