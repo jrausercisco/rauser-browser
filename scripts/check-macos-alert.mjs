@@ -4,8 +4,8 @@
 // checks that it closes by itself, with no click, when the host closes the
 // dialog child's stdin (the cancel path) and when it times out. The alert is
 // drawn by UserNotificationCenter, so the check counts that process's
-// on-screen windows. It puts alerts on screen, so it runs only in a macOS VM
-// unless --on-desktop is given. See TESTING.md, "Real-UI acceptance".
+// on-screen windows. It puts alerts on the user's screen, so it runs only when
+// given --on-desktop. See TESTING.md, "Real-UI acceptance".
 
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -27,7 +27,7 @@ const TIMEOUT_SECONDS = 1;
 
 function usage() {
   console.log(`Usage: node scripts/check-macos-alert.mjs [--host /absolute/path/to/${BINARY_NAME}] [--on-desktop]`);
-  console.log("  --on-desktop  Run outside a VM. It shows two alerts for about 3 seconds each; do not click them.");
+  console.log("  --on-desktop  Required. Shows two alerts on screen for about 3 seconds each; do not click them.");
   console.log(`Build first with:\n  ${BUILD}`);
 }
 
@@ -46,11 +46,6 @@ async function commandOutput(executable, args) {
       else reject(new Error(`${executable} exited ${code}: ${stderr.trim()}`));
     });
   });
-}
-
-// kern.hv_vmm_present is 1 inside a virtual machine on Apple hardware.
-async function inVirtualMachine() {
-  return (await commandOutput("/usr/sbin/sysctl", ["-n", "kern.hv_vmm_present"]).catch(() => "0")) === "1";
 }
 
 async function alertWindows(windowCheck) {
@@ -130,8 +125,8 @@ async function main() {
     else throw new Error(`unknown argument ${args[index]}; run with --help`);
   }
   if (process.platform !== "darwin") throw new Error("this check runs only on macOS");
-  if (!onDesktop && !(await inVirtualMachine())) {
-    throw new Error("this check shows real alerts, so it runs only in a macOS VM; pass --on-desktop to run it here anyway");
+  if (!onDesktop) {
+    throw new Error("this check shows real alerts on screen; run it with --on-desktop, and only when the user has agreed");
   }
   const runDir = await mkdtemp(path.join(os.tmpdir(), "brauser-alert-check-"));
   try {
