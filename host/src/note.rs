@@ -10,10 +10,23 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::brand::FRONTMATTER_KEY;
+use crate::native::MAX_OUTBOUND_BYTES;
 use crate::vault::Vault;
 
+/// A new note's title is clamped to this many UTF-8 bytes, never refused.
 const MAX_TITLE_BYTES: usize = 2048;
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// A body is refused above this many UTF-8 bytes. `note_loaded` and
+/// `note_conflict` echo the title and body, and JSON escaping at most doubles
+/// ordinary text (quotes, backslashes, newlines, tabs), so a note at both
+/// limits still fits under `MAX_OUTBOUND_BYTES`. Only other control
+/// characters (six bytes each as `\u00XX`) can overflow it;
+/// `fits_in_response` catches those exactly. The schema and the panel's
+/// textarea cap the body at 98304 characters, at most four bytes each.
+const MAX_BODY_BYTES: usize = 384 * 1024;
+/// Room left in a note response for everything but the title and body: the
+/// type tag, a request ID of at most 128 characters (512 bytes escaped), the
+/// revision, and the field names.
+const RESPONSE_ENVELOPE_BYTES: usize = 4 * 1024;
 const MISSING_REVISION: &str = "missing";
 
 pub struct LoadedNote {
@@ -48,7 +61,10 @@ pub struct OwnershipConflict(pub String);
 
 #[derive(Debug)]
 pub enum NoteRequestError {
-    Invalid(String),
+    /// The note, as it would be saved or as found on disk, cannot be sent back
+    /// in one native message, so it is refused instead of failing the
+    /// response.
+    TooLarge(String),
     Conflict(OwnershipConflict),
     Internal(anyhow::Error),
 }
@@ -75,6 +91,9 @@ pub fn load_note(vault: &Vault, canonical_url: &str) -> Result<LoadedNote, NoteR
         }),
         Some(contents) => {
             let parsed = parse_owned_note(canonical_url, &contents).ok_or_else(not_owned)?;
+            if !fits_in_response(&parsed.title, &parsed.body) {
+                return Err(too_large_on_disk());
+            }
             Ok(LoadedNote {
                 exists: true,
                 revision: revision_for(&contents),
@@ -92,9 +111,9 @@ pub fn save_note(
     body: &str,
     expected_revision: &str,
 ) -> Result<SaveOutcome, NoteRequestError> {
-    if title.len() > MAX_TITLE_BYTES || body.len() > MAX_BODY_BYTES {
-        return Err(NoteRequestError::Invalid(
-            "note title or body exceeds its size limit".into(),
+    if body.len() > MAX_BODY_BYTES {
+        return Err(NoteRequestError::TooLarge(
+            "note is too long to save".into(),
         ));
     }
     let existing = vault.read_page(canonical_url)?;
@@ -106,6 +125,11 @@ pub fn save_note(
         }
     };
     if expected_revision != current_revision {
+        if let Some(note) = &parsed
+            && !fits_in_response(&note.title, &note.body)
+        {
+            return Err(too_large_on_disk());
+        }
         return Ok(SaveOutcome::Stale {
             revision: current_revision,
             exists: parsed.is_some(),
@@ -127,10 +151,18 @@ pub fn save_note(
         .as_ref()
         .map(|note| note.created.clone())
         .unwrap_or_else(|| now.clone());
+    // The title only matters when the note is created, so an over-long page
+    // title is clamped there and never blocks a save.
     let effective_title = parsed
         .as_ref()
         .map(|note| note.title.clone())
-        .unwrap_or_else(|| normalized_title(canonical_url, title).to_owned());
+        .unwrap_or_else(|| clamped_title(normalized_title(canonical_url, title)).to_owned());
+    // A save must never produce a note that a later load cannot return.
+    if !fits_in_response(&effective_title, body) {
+        return Err(NoteRequestError::TooLarge(
+            "note has too many special characters to save".into(),
+        ));
+    }
     let markdown = render_note(canonical_url, &effective_title, body, &created, &now)?;
     let replacing = existing.is_some();
     let published = vault.replace_page(canonical_url, &markdown)?;
@@ -161,8 +193,47 @@ fn normalized_title<'a>(canonical_url: &'a str, title: &'a str) -> &'a str {
     }
 }
 
-fn normalized_body(body: &str) -> &str {
-    body.trim_end_matches('\n')
+fn clamped_title(title: &str) -> &str {
+    if title.len() <= MAX_TITLE_BYTES {
+        return title;
+    }
+    let mut end = MAX_TITLE_BYTES;
+    while !title.is_char_boundary(end) {
+        end -= 1;
+    }
+    title[..end].trim_end()
+}
+
+fn too_large_on_disk() -> NoteRequestError {
+    NoteRequestError::TooLarge(
+        "this page's note is too large to open here; edit it in your notes folder".into(),
+    )
+}
+
+/// Whether a response echoing this title and body fits in one native message,
+/// measured with the same JSON escaping the response uses.
+fn fits_in_response(title: &str, body: &str) -> bool {
+    escaped_len(title) + escaped_len(body) + RESPONSE_ENVELOPE_BYTES <= MAX_OUTBOUND_BYTES
+}
+
+fn escaped_len(value: &str) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    // Serializing a string into this writer cannot fail; if it somehow did,
+    // treat the value as too large rather than guessing.
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
 }
 
 fn revision_for(contents: &str) -> String {
@@ -186,7 +257,8 @@ fn render_note(
     let digest = hex::encode(Sha256::digest(canonical_url.as_bytes()));
     let digest_json =
         serde_json::to_string(&digest).map_err(|error| NoteRequestError::Internal(error.into()))?;
-    let body = normalized_body(body);
+    // The body is stored verbatim; parse_owned_note removes only the one
+    // newline written after it.
     Ok(format!(
         "---\ntitle: {title_json}\nurl: {url_json}\n{FRONTMATTER_KEY}\n  canonical_url: {url_json}\n  url_id: {digest_json}\n  created: {created}\n  updated: {updated}\n---\n\n{body}\n"
     ))
@@ -421,6 +493,135 @@ mod tests {
         assert!(matches!(
             load_note(&vault, url),
             Err(NoteRequestError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn trailing_blank_lines_in_a_body_survive_a_round_trip() {
+        let (_root, vault) = vault();
+        for body in ["Todo:\n- a\n\n\n", "\n", "\n\nlead", ""] {
+            let url = format!("https://example.com/{}", body.len());
+            save_note(&vault, &url, "T", body, "missing").unwrap();
+            assert_eq!(load_note(&vault, &url).unwrap().body, body);
+        }
+    }
+
+    #[test]
+    fn a_long_title_is_clamped_on_creation_and_ignored_afterwards() {
+        let (_root, vault) = vault();
+        // 3-byte characters, so a byte cut could land inside one.
+        let long = "界".repeat(MAX_TITLE_BYTES);
+        let SaveOutcome::Saved { revision, .. } =
+            save_note(&vault, "https://example.com/a", &long, "one", "missing").unwrap()
+        else {
+            panic!("expected a save");
+        };
+        let loaded = load_note(&vault, "https://example.com/a").unwrap();
+        assert!(loaded.title.len() <= MAX_TITLE_BYTES);
+        assert!(long.starts_with(&loaded.title));
+        assert!(!loaded.title.is_empty());
+
+        // A later save sends the same over-long title; it must not be refused.
+        assert!(matches!(
+            save_note(&vault, "https://example.com/a", &long, "two", &revision),
+            Ok(SaveOutcome::Saved { .. })
+        ));
+        assert_eq!(
+            load_note(&vault, "https://example.com/a").unwrap().body,
+            "two"
+        );
+    }
+
+    #[test]
+    fn the_largest_accepted_note_fits_in_one_response() {
+        let (_root, vault) = vault();
+        // Quotes are the worst ordinary escape (two bytes each).
+        let body = "\"".repeat(MAX_BODY_BYTES);
+        let title = "\"".repeat(MAX_TITLE_BYTES);
+        assert!(matches!(
+            save_note(&vault, "https://example.com/a", &title, &body, "missing"),
+            Ok(SaveOutcome::Saved { .. })
+        ));
+        let loaded = load_note(&vault, "https://example.com/a").unwrap();
+        assert_eq!(loaded.body, body);
+        // Worst-case envelope: the longest request_id, every character escaped.
+        let response = brauser_protocol::Response::NoteConflict(brauser_protocol::NoteConflict {
+            protocol_version: brauser_protocol::PROTOCOL_VERSION,
+            request_id: "\"".repeat(128),
+            exists: true,
+            revision: loaded.revision,
+            title: loaded.title,
+            body: loaded.body,
+        });
+        assert!(serde_json::to_vec(&response).unwrap().len() <= MAX_OUTBOUND_BYTES);
+    }
+
+    #[test]
+    fn schema_and_panel_body_limits_stay_within_the_host_byte_limit() {
+        // A code point is at most four UTF-8 bytes, and the panel's
+        // `maxlength` counts UTF-16 units, of which a code point has at least
+        // one; so any body both allow is within MAX_BODY_BYTES.
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol/schema.json")).unwrap();
+        for name in ["SaveNoteRequest", "NoteLoaded", "NoteConflict"] {
+            let limit = schema["$defs"][name]["properties"]["body"]["maxLength"]
+                .as_u64()
+                .unwrap() as usize;
+            assert!(limit * 4 <= MAX_BODY_BYTES, "{name}.body maxLength");
+        }
+        let panel = include_str!("../../extension/panel.html");
+        let textarea = &panel[panel.find("id=\"note-body\"").unwrap()..];
+        let textarea = &textarea[..textarea.find('>').unwrap()];
+        let panel_limit: u64 = textarea
+            .split("maxlength=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            Some(panel_limit),
+            schema["$defs"]["SaveNoteRequest"]["properties"]["body"]["maxLength"].as_u64()
+        );
+    }
+
+    #[test]
+    fn a_body_over_its_limit_or_too_large_once_escaped_is_refused() {
+        let (_root, vault) = vault();
+        let over = "a".repeat(MAX_BODY_BYTES + 1);
+        assert!(matches!(
+            save_note(&vault, "https://example.com/a", "T", &over, "missing"),
+            Err(NoteRequestError::TooLarge(_))
+        ));
+        // Within the byte limit, but each control character escapes to six
+        // bytes, so the response to a later load could not be sent.
+        let controls = "\u{1}".repeat(MAX_BODY_BYTES);
+        assert!(matches!(
+            save_note(&vault, "https://example.com/a", "T", &controls, "missing"),
+            Err(NoteRequestError::TooLarge(_))
+        ));
+        assert!(!load_note(&vault, "https://example.com/a").unwrap().exists);
+    }
+
+    #[test]
+    fn a_note_grown_outside_the_panel_is_refused_not_returned() {
+        let (root, vault) = vault();
+        let url = "https://example.com/a";
+        save_note(&vault, url, "T", "small", "missing").unwrap();
+        let full = root.path().join(vault.page_relative_path(url).unwrap());
+        let grown = std::fs::read_to_string(&full)
+            .unwrap()
+            .replace("small", &"x".repeat(MAX_OUTBOUND_BYTES));
+        std::fs::write(&full, grown).unwrap();
+
+        assert!(matches!(
+            load_note(&vault, url),
+            Err(NoteRequestError::TooLarge(_))
+        ));
+        // A stale save would echo the note back; that must be refused too.
+        assert!(matches!(
+            save_note(&vault, url, "T", "new", "missing"),
+            Err(NoteRequestError::TooLarge(_))
         ));
     }
 
