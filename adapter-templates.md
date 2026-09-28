@@ -281,7 +281,7 @@ alias = { from = "meta", name = "ajs-page-id", value = "{id:int}" }
 
 A `tab_title` alias names a title capture. A `meta` alias names one `<meta>` element and a value template that is a single capture matching the element's whole `content`. Either one yields a second ID through the adapter's `id` template.
 
-Both signals come from text the page controls. They are recorded as **suggested** aliases and change record keys only after the user confirms them on the artifact card or a server redirect between the same two IDs corroborates them (DESIGN.md §5.1, §6.2). Server-redirect aliases need no declaration.
+Both signals come from text the page controls. They are recorded as **suggested** aliases, listed on the artifact card but not grouped, and change record keys or group activity only after the user confirms them on the artifact card or a server redirect between the same two IDs corroborates them (DESIGN.md §5.1, §6.2). Server-redirect aliases need no declaration.
 
 ## 10. Refs, evaluation, and validation
 
