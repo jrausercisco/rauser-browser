@@ -11,7 +11,7 @@
       <header class="panel-header">
         <div>
           <h1>{{FULL_NAME}}</h1>
-          <p class="eyebrow">M1 development build · Chrome</p>
+          <p class="eyebrow">Pre-M2 development build · Chrome</p>
         </div>
         <button id="open-settings" type="button" class="icon-button" aria-label="Open {{APP_NAME}} settings" title="Settings">
           <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" width="20" height="20">
@@ -27,27 +27,45 @@
 
       <div id="status" class="status" role="status" aria-live="polite">Connecting to native host…</div>
 
-      <button id="pause-capture" type="button" class="secondary" disabled>Pause capture and clear pending visits</button>
-
-      <section aria-labelledby="queue-heading">
-        <h2 id="queue-heading">Pending visits</h2>
-        <p id="queue-summary">No visits buffered.</p>
-        <p id="queue-warning" class="warning" aria-live="polite"></p>
-        <button id="dismiss-notices" type="button" class="secondary" disabled>Dismiss notices</button>
-        <button id="replay" type="button" class="secondary" disabled>Send pending visits</button>
-        <button id="discard-pending" type="button" class="secondary" disabled>Discard pending visits</button>
+      <section id="page-area" aria-labelledby="page-heading">
+        <h2 id="page-heading" class="visually-hidden">Current page</h2>
+        <p id="page-title" class="page-title">No page yet</p>
+        <p id="page-url" class="page-url"></p>
+        <p id="page-unusable" class="warning" hidden>{{APP_NAME}} can't use this tab. Switch to an http(s) page to see its note.</p>
       </section>
 
       <section aria-labelledby="note-heading">
-        <h2 id="note-heading">Page note</h2>
-        <p>Create a note for the current, permitted page. Existing notes stay untouched.</p>
-        <div class="field">
-          <label for="note-body">Your note</label>
-          <textarea id="note-body" rows="5" maxlength="60000"></textarea>
+        <div class="note-header">
+          <h2 id="note-heading">My note</h2>
+          <span id="note-status" class="note-status" role="status" aria-live="polite"></span>
         </div>
-        <button id="create-note" type="button" disabled>Create page note</button>
-        <p id="note-result" role="status" aria-live="polite"></p>
+        <p id="note-unavailable" class="warning" hidden>
+          {{APP_NAME}} can't see this tab's address yet. Click the {{APP_NAME}} toolbar button, press its keyboard
+          shortcut, or right-click the page and choose <strong>Add a note in {{APP_NAME}}</strong> to start a note here.
+        </p>
+        <div class="field">
+          <label for="note-body" class="visually-hidden">Your note</label>
+          <textarea id="note-body" rows="6" maxlength="1048576" disabled></textarea>
+        </div>
+        <button id="note-grant-origin" type="button" class="secondary" hidden>Keep working on this page from the panel</button>
+        <div id="note-conflict" class="setup-warning" hidden>
+          <p>This note changed elsewhere and your edit could not be saved. Copy it back in below:</p>
+          <textarea id="note-unsaved" rows="4" readonly></textarea>
+          <button id="copy-unsaved" type="button" class="secondary">Copy</button>
+        </div>
       </section>
+
+      <details id="capture-strip" class="capture-strip">
+        <summary id="capture-strip-summary">● Capture off · 0 pending</summary>
+        <div class="capture-strip-body">
+          <button id="pause-capture" type="button" class="secondary" disabled>Pause capture and clear pending visits</button>
+          <p id="queue-summary">No visits buffered.</p>
+          <p id="queue-warning" class="warning" aria-live="polite"></p>
+          <button id="dismiss-notices" type="button" class="secondary" disabled>Dismiss notices</button>
+          <button id="replay" type="button" class="secondary" disabled>Send pending visits</button>
+          <button id="discard-pending" type="button" class="secondary" disabled>Discard pending visits</button>
+        </div>
+      </details>
 
       <footer>
         <p>{{APP_NAME}} runs locally. This development build requires a separately registered native host and has no installer yet.</p>

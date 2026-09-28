@@ -6,13 +6,14 @@ use std::io::{self, Read, Write};
 use anyhow::{Context, Result, bail};
 use brauser_protocol::{
     ConfigConfirmed, ConfigResult, ConfigUpdated, ErrorCode, ErrorResponse, FolderChosen,
-    HelloResult, PROTOCOL_VERSION, PageNoteResult, Request, Response, VisitOutcome, VisitRecorded,
+    HelloResult, NoteConflict, NoteLoaded, NoteSaved, PROTOCOL_VERSION, Request, Response,
+    VisitOutcome, VisitRecorded,
 };
 
 use crate::capture::{CaptureOutcome, CapturePolicy, CaptureStore};
 use crate::config::{self, ConfigStore};
 use crate::consent::ConsentAuthority;
-use crate::page_note;
+use crate::note;
 use crate::vault::Vault;
 
 const MAX_INBOUND_BYTES: usize = 4 * 1024 * 1024;
@@ -323,7 +324,8 @@ fn dispatch(
             }
         }
         Request::RecordVisit(value) => record_visit(value, config),
-        Request::CreatePageNote(value) => create_page_note(value, config),
+        Request::LoadNote(value) => load_note(value, config),
+        Request::SaveNote(value) => save_note(value, config),
     }
 }
 
@@ -398,10 +400,67 @@ fn record_visit(value: brauser_protocol::RecordVisitRequest, config: &mut Config
     })
 }
 
-fn create_page_note(
-    value: brauser_protocol::CreatePageNoteRequest,
+/// Resolve the canonical URL and vault shared by `load_note` and `save_note`.
+/// Notes work on any HTTP(S) page (§5.3): unlike visit logging, this never
+/// checks the site allowlist. The error is a small `(code, message)` pair,
+/// not a `Response`, so callers pay for the large `Response` enum only once.
+fn note_vault(
     config: &mut ConfigStore,
-) -> Response {
+    url: &str,
+) -> Result<(String, Vault), (ErrorCode, &'static str)> {
+    if config.refresh().is_err() || config.config_issue().is_some() {
+        return Err((
+            ErrorCode::InvalidConfig,
+            "configuration is unavailable or needs repair",
+        ));
+    }
+    let Some(storage) = config.snapshot().storage.as_ref() else {
+        return Err((ErrorCode::NotConfigured, "choose a notes folder first"));
+    };
+    let canonical = crate::capture::canonical_url(url, &config.snapshot().strip_params)
+        .map_err(|_| (ErrorCode::InvalidRequest, "page URL is invalid"))?;
+    let vault = Vault::open_checked(storage, config.root_identity())
+        .map_err(|_| (ErrorCode::Internal, "notes folder is unavailable"))?;
+    Ok((canonical, vault))
+}
+
+fn note_error(request_id: &str, error_value: note::NoteRequestError) -> Response {
+    match error_value {
+        note::NoteRequestError::Invalid(message) => {
+            error(request_id, ErrorCode::InvalidRequest, &message)
+        }
+        note::NoteRequestError::Conflict(note::OwnershipConflict(message)) => {
+            error(request_id, ErrorCode::Conflict, &message)
+        }
+        note::NoteRequestError::Internal(_) => error(
+            request_id,
+            ErrorCode::Internal,
+            "could not access this page's note",
+        ),
+    }
+}
+
+fn load_note(value: brauser_protocol::LoadNoteRequest, config: &mut ConfigStore) -> Response {
+    let (canonical, vault) = match note_vault(config, &value.url) {
+        Ok(resolved) => resolved,
+        Err((code, message)) => return error(&value.request_id, code, message),
+    };
+    match note::load_note(&vault, &canonical) {
+        Ok(loaded) => Response::NoteLoaded(NoteLoaded {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: value.request_id,
+            exists: loaded.exists,
+            revision: loaded.revision,
+            title: loaded.title,
+            body: loaded.body,
+        }),
+        Err(note_error_value) => note_error(&value.request_id, note_error_value),
+    }
+}
+
+fn save_note(value: brauser_protocol::SaveNoteRequest, config: &mut ConfigStore) -> Response {
+    // Serialize with config updates and other note saves so the version check
+    // below and the write it guards happen without a concurrent writer.
     let _config_lock = match config.lock_current() {
         Ok(lock) => lock,
         Err(_) => {
@@ -412,71 +471,42 @@ fn create_page_note(
             );
         }
     };
-    if config.refresh().is_err() || config.config_issue().is_some() {
-        return error(
-            &value.request_id,
-            ErrorCode::InvalidConfig,
-            "configuration is unavailable or needs repair",
-        );
-    }
-    let Some(storage) = config.snapshot().storage.as_ref() else {
-        return error(
-            &value.request_id,
-            ErrorCode::NotConfigured,
-            "choose a notes folder first",
-        );
+    let (canonical, vault) = match note_vault(config, &value.url) {
+        Ok(resolved) => resolved,
+        Err((code, message)) => return error(&value.request_id, code, message),
     };
-    match crate::capture::url_allowed(&value.url, &config.snapshot().sites) {
-        Ok(true) => {}
-        Ok(false) => {
-            return error(
-                &value.request_id,
-                ErrorCode::Unauthorized,
-                "site is not enabled",
-            );
-        }
-        Err(_) => {
-            return error(
-                &value.request_id,
-                ErrorCode::InvalidRequest,
-                "page URL is invalid",
-            );
-        }
-    }
-    let canonical = match crate::capture::canonical_url(&value.url, &config.snapshot().strip_params)
-    {
-        Ok(canonical) => canonical,
-        Err(_) => {
-            return error(
-                &value.request_id,
-                ErrorCode::InvalidRequest,
-                "page URL is invalid",
-            );
-        }
-    };
-    let vault = match Vault::open_checked(storage, config.root_identity()) {
-        Ok(vault) => vault,
-        Err(_) => {
-            return error(
-                &value.request_id,
-                ErrorCode::Internal,
-                "notes folder is unavailable",
-            );
-        }
-    };
-    match page_note::create_page_note(&vault, &canonical, &value.title, &value.body) {
-        Ok(result) => Response::PageNoteResult(PageNoteResult {
+    match note::save_note(
+        &vault,
+        &canonical,
+        &value.title,
+        &value.body,
+        &value.expected_revision,
+    ) {
+        Ok(note::SaveOutcome::Saved {
+            outcome,
+            revision,
+            relative_path,
+        }) => Response::NoteSaved(NoteSaved {
             protocol_version: PROTOCOL_VERSION,
             request_id: value.request_id,
-            outcome: result.outcome,
-            relative_path: result.relative_path,
-            message: result.message,
+            outcome,
+            revision,
+            relative_path,
         }),
-        Err(_) => error(
-            &value.request_id,
-            ErrorCode::Internal,
-            "could not create page note",
-        ),
+        Ok(note::SaveOutcome::Stale {
+            revision,
+            exists,
+            title,
+            body,
+        }) => Response::NoteConflict(NoteConflict {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: value.request_id,
+            exists,
+            revision,
+            title,
+            body,
+        }),
+        Err(note_error_value) => note_error(&value.request_id, note_error_value),
     }
 }
 
@@ -672,6 +702,111 @@ mod tests {
         match decoded_response(output) {
             Response::Error(value) => assert_eq!(value.code, ErrorCode::MessageTooLarge),
             other => panic!("expected size error, got {other:?}"),
+        }
+    }
+
+    fn configured_store(root: &std::path::Path) -> ConfigStore {
+        let mut store = ConfigStore::for_test(root.join("config.toml"));
+        let snapshot = brauser_protocol::ConfigSnapshot {
+            storage: Some(brauser_protocol::StorageConfig {
+                root: root.to_string_lossy().into_owned(),
+                profile: "neutral".into(),
+                log_dir: "log".into(),
+                pages_dir: "pages".into(),
+                later_dir: "later".into(),
+            }),
+            capture_enabled: false,
+            sites: Vec::new(),
+            strip_params: Vec::new(),
+            near_repeat_secs: 300,
+        };
+        let identity = crate::vault::selected_root_identity(root).unwrap();
+        store
+            .update_with_root_identity(snapshot, "missing", Some(&identity))
+            .unwrap()
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn loading_a_note_works_on_any_http_page_without_site_authorization() {
+        let folder = tempfile::tempdir().unwrap();
+        let notes = folder.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let mut config = configured_store(&notes);
+        // No site is enabled for logging; notes must still work (§5.3).
+        let response = dispatch(
+            Request::LoadNote(brauser_protocol::LoadNoteRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "load-1".into(),
+                url: "https://example.com/a".into(),
+            }),
+            &mut config,
+            &mut ConsentAuthority::new(),
+        );
+        match response {
+            Response::NoteLoaded(value) => {
+                assert!(!value.exists);
+                assert_eq!(value.revision, "missing");
+            }
+            other => panic!("expected note_loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn saving_a_note_then_reusing_a_stale_revision_returns_the_current_note() {
+        let folder = tempfile::tempdir().unwrap();
+        let notes = folder.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let mut config = configured_store(&notes);
+        let mut consent = ConsentAuthority::new();
+        let save = |config: &mut ConfigStore,
+                    consent: &mut ConsentAuthority,
+                    body: &str,
+                    revision: &str| {
+            dispatch(
+                Request::SaveNote(brauser_protocol::SaveNoteRequest {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: "save-1".into(),
+                    url: "https://example.com/a".into(),
+                    title: "A Title".into(),
+                    body: body.into(),
+                    expected_revision: revision.into(),
+                }),
+                config,
+                consent,
+            )
+        };
+        let first = match save(&mut config, &mut consent, "hello", "missing") {
+            Response::NoteSaved(value) => value,
+            other => panic!("expected note_saved, got {other:?}"),
+        };
+        assert!(matches!(
+            first.outcome,
+            brauser_protocol::NoteSaveOutcome::Created
+        ));
+
+        // Reusing the old (now stale) revision must be refused, not clobber
+        // the note that was just saved.
+        match save(&mut config, &mut consent, "goodbye", "missing") {
+            Response::NoteConflict(value) => {
+                assert!(value.exists);
+                assert_eq!(value.body, "hello");
+                assert_eq!(value.revision, first.revision);
+            }
+            other => panic!("expected note_conflict, got {other:?}"),
+        }
+
+        // The correct revision replaces the note whole.
+        match save(&mut config, &mut consent, "goodbye", &first.revision) {
+            Response::NoteSaved(value) => {
+                assert!(matches!(
+                    value.outcome,
+                    brauser_protocol::NoteSaveOutcome::Replaced
+                ));
+                assert_ne!(value.revision, first.revision);
+            }
+            other => panic!("expected note_saved, got {other:?}"),
         }
     }
 }

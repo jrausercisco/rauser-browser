@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/rausified/rauser-browser/blob/main/protocol/schema.json",
   "title": "Brauser native messaging protocol",
-  "description": "Version 2 messages exchanged by the Chrome extension and native host. Host-owned configuration and consent tokens gate capture and writes.",
+  "description": "Version 3 messages exchanged by the Chrome extension and native host. Host-owned configuration and consent tokens gate capture and writes.",
   "oneOf": [
     {
       "$ref": "#/$defs/Request"
@@ -33,7 +33,10 @@
           "$ref": "#/$defs/RecordVisitRequest"
         },
         {
-          "$ref": "#/$defs/CreatePageNoteRequest"
+          "$ref": "#/$defs/LoadNoteRequest"
+        },
+        {
+          "$ref": "#/$defs/SaveNoteRequest"
         }
       ]
     },
@@ -58,7 +61,13 @@
           "$ref": "#/$defs/VisitRecorded"
         },
         {
-          "$ref": "#/$defs/PageNoteResult"
+          "$ref": "#/$defs/NoteLoaded"
+        },
+        {
+          "$ref": "#/$defs/NoteSaved"
+        },
+        {
+          "$ref": "#/$defs/NoteConflict"
         },
         {
           "$ref": "#/$defs/ErrorResponse"
@@ -79,7 +88,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -102,7 +111,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -129,7 +138,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -187,7 +196,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -229,7 +238,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -272,7 +281,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -306,7 +315,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -428,7 +437,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -454,7 +463,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -498,7 +507,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -510,7 +519,36 @@
         }
       }
     },
-    "CreatePageNoteRequest": {
+    "LoadNoteRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "url"
+      ],
+      "properties": {
+        "type": {
+          "const": "load_note"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 3
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        }
+      }
+    },
+    "SaveNoteRequest": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -519,15 +557,16 @@
         "request_id",
         "url",
         "title",
-        "body"
+        "body",
+        "expected_revision"
       ],
       "properties": {
         "type": {
-          "const": "create_page_note"
+          "const": "save_note"
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -545,7 +584,12 @@
         },
         "body": {
           "type": "string",
-          "maxLength": 262144
+          "maxLength": 1048576
+        },
+        "expected_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
         }
       }
     },
@@ -565,7 +609,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -599,7 +643,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -634,7 +678,7 @@
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -671,7 +715,50 @@
         }
       }
     },
-    "PageNoteResult": {
+    "NoteLoaded": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "exists",
+        "revision",
+        "title",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "note_loaded"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 3
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "exists": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 1048576
+        }
+      }
+    },
+    "NoteSaved": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -679,16 +766,16 @@
         "protocol_version",
         "request_id",
         "outcome",
-        "relative_path",
-        "message"
+        "revision",
+        "relative_path"
       ],
       "properties": {
         "type": {
-          "const": "page_note_result"
+          "const": "note_saved"
         },
         "protocol_version": {
           "type": "integer",
-          "const": 2
+          "const": 3
         },
         "request_id": {
           "type": "string",
@@ -696,27 +783,59 @@
           "maxLength": 128
         },
         "outcome": {
-          "$ref": "#/$defs/PageNoteOutcome"
+          "$ref": "#/$defs/NoteSaveOutcome"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
         },
         "relative_path": {
-          "oneOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "NoteConflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "request_id",
+        "exists",
+        "revision",
+        "title",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "note_conflict"
         },
-        "message": {
-          "oneOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "protocol_version": {
+          "type": "integer",
+          "const": 3
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "exists": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 1048576
         }
       }
     },
@@ -791,13 +910,13 @@
         "retryable"
       ]
     },
-    "PageNoteOutcome": {
+    "NoteSaveOutcome": {
       "type": "string",
       "enum": [
         "created",
-        "already_present",
-        "conflict",
-        "created_with_warning"
+        "replaced",
+        "created_with_warning",
+        "replaced_with_warning"
       ]
     }
   }

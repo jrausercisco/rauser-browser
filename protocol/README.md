@@ -19,8 +19,8 @@ the typed request. A mismatch returns an `error` response with code
 `unsupported_protocol_version` and the host's protocol version. If malformed
 input has no recoverable request ID, an `error` response may use an empty ID.
 
-Protocol version 2 covers host discovery, configuration, consent, visit capture,
-and create-only page notes. `get_config` returns a
+Protocol version 3 covers host discovery, configuration, consent, visit
+capture, and versioned whole-file page notes. `get_config` returns a
 `revision` that the extension must send as `expected_revision` with its full
 `update_config` snapshot. A successful update returns a new `revision`; a stale
 revision returns a `conflict` error. The revision is `missing` when no config
@@ -63,9 +63,26 @@ offset; the host files the visit under that offset's calendar date. The host
 checks the original URL against its confirmed site policy and returns a
 `visit_recorded` outcome of `persisted`, `suppressed`, `rejected`, or
 `retryable`; only the first three are terminal for the extension queue.
-`create_page_note` carries the original URL, title, and user-authored body;
-`page_note_result` distinguishes `created`, `already_present`, `conflict`, and
-`created_with_warning`.
+
+Page notes work on any HTTP(S) page and are not gated by the site allowlist.
+`load_note` carries the page's current URL; the host normalizes it the same
+way as a logged visit and returns `note_loaded` with `exists`, a `revision`
+(`missing` when no note exists yet, otherwise `sha256:` followed by 64
+lowercase hex digits of the file's exact bytes), the note's `title`, and its
+`body`. `save_note` carries the URL, a `title` (used only when the note does
+not exist yet; the host preserves the existing title on every later save,
+since the panel only edits the body), the new `body`, and `expected_revision`
+from the panel's last load or save. A matching revision replaces the note
+whole and returns `note_saved` with a new `revision`, `relative_path`, and an
+`outcome` of `created`, `replaced`, `created_with_warning`, or
+`replaced_with_warning` (the file is in place but a post-publication step,
+such as a directory sync, warned; not a failure and not retried). A stale
+`expected_revision` refuses the write and returns `note_conflict` with the
+note's current `exists`, `revision`, `title`, and `body` instead, so the
+panel can reload the newer note and show the text it could not save. Before
+replacing, the host checks the existing file's recorded canonical URL and
+`brauser:` ownership (absent or `page` `kind`, never `summary`); a mismatch
+is a `conflict` error, and the file is never adopted or overwritten.
 
 The host remains responsible for runtime validation of string lengths,
 absolute paths, site origins and path prefixes, storage confinement, token

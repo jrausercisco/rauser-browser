@@ -213,12 +213,13 @@ async function allowInChrome(press, pid) {
   }), { timeout: 20_000 });
 }
 
-async function hostConfig(wrapper) {
-  const request = Buffer.from(JSON.stringify({
-    type: "get_config", protocol_version: 2, request_id: randomUUID(),
-  }));
+// Spawn a short-lived host process for one framed request, independent of
+// whatever host process is serving the live panel or settings connection.
+// The host's config-file lock (§7) serializes these against each other.
+function hostRequest(wrapper, request) {
+  const body = Buffer.from(JSON.stringify(request));
   const length = Buffer.alloc(4);
-  length.writeUInt32LE(request.length);
+  length.writeUInt32LE(body.length);
   return new Promise((resolve, reject) => {
     const child = spawn(wrapper, ["serve"], { stdio: ["pipe", "pipe", "pipe"] });
     const output = [];
@@ -226,7 +227,7 @@ async function hostConfig(wrapper) {
     let settled = false;
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      finish(new Error("Native host get_config timed out"));
+      finish(new Error(`Native host ${request.type} timed out`));
     }, 10_000);
     function finish(error, value) {
       if (settled) return;
@@ -240,13 +241,13 @@ async function hostConfig(wrapper) {
     child.on("error", (error) => finish(error));
     child.on("close", (code) => {
       try {
-        if (code !== 0) throw new Error(`Native host get_config failed: ${Buffer.concat(errors).toString("utf8").trim()}`);
+        if (code !== 0) throw new Error(`Native host ${request.type} failed: ${Buffer.concat(errors).toString("utf8").trim()}`);
         const frame = Buffer.concat(output);
         if (frame.length < 4 || frame.readUInt32LE(0) !== frame.length - 4) {
           throw new Error("Native host returned an invalid response frame");
         }
         const reply = JSON.parse(frame.subarray(4).toString("utf8"));
-        if (reply.type !== "config_result" || reply.protocol_version !== 2) {
+        if (reply.protocol_version !== 3) {
           throw new Error(`Native host returned ${reply.type ?? "an unknown response"}`);
         }
         finish(null, reply);
@@ -254,8 +255,31 @@ async function hostConfig(wrapper) {
         finish(error);
       }
     });
-    child.stdin.end(Buffer.concat([length, request]));
+    child.stdin.end(Buffer.concat([length, body]));
   });
+}
+
+async function hostConfig(wrapper) {
+  const reply = await hostRequest(wrapper, {
+    type: "get_config", protocol_version: 3, request_id: randomUUID(),
+  });
+  if (reply.type !== "config_result") {
+    throw new Error(`Native host returned ${reply.type ?? "an unknown response"} instead of config_result`);
+  }
+  return reply;
+}
+
+// Simulates a second Brauser window saving this page's note first, so the
+// panel's own next save is refused as stale (§4.4, §5.3).
+async function hostSaveNote(wrapper, url, title, body, expectedRevision) {
+  const reply = await hostRequest(wrapper, {
+    type: "save_note", protocol_version: 3, request_id: randomUUID(),
+    url, title, body, expected_revision: expectedRevision,
+  });
+  if (reply.type !== "note_saved") {
+    throw new Error(`Native host returned ${reply.type ?? "an unknown response"} instead of note_saved`);
+  }
+  return reply;
 }
 
 // One reader for Chrome's DevTools pipe. Replies are matched by id; events
@@ -407,7 +431,7 @@ async function nativeHostPreflight(cdp, extensionId) {
         clearTimeout(timer);
         resolve({ok: false, error: chrome.runtime.lastError?.message ?? "disconnected"});
       });
-      port.postMessage({type: "hello", protocol_version: 2, request_id: "smoke-preflight"});
+      port.postMessage({type: "hello", protocol_version: 3, request_id: "smoke-preflight"});
     })`;
     await cdp.withTarget(target.targetId, async (page) => {
       let lastError = "extension page did not load";
@@ -846,19 +870,21 @@ async function run() {
     }
   }
 
-  async function createNote(expected, body) {
+  async function typeNote(text) {
     await waitFor(() => onPanel(async (page) =>
-      requireCondition(await page.enabled("#create-note"), "Create page note is disabled")));
-    await onPanel(async (page) => {
-      await page.fill("#note-body", body);
-      await page.click("#create-note");
-    });
+      requireCondition(await page.enabled("#note-body"), "The note editor is disabled")));
+    await onPanel((page) => page.fill("#note-body", text));
+  }
+
+  async function waitForNoteStatus(expected) {
     return waitFor(() => onPanel(async (page) => {
-      const result = await page.text("#note-result");
-      requireCondition(await page.enabled("#create-note") && result?.startsWith(expected),
-        `Panel note result: ${result || "(none yet)"}`);
-      return result;
+      const shown = await page.text("#note-status");
+      requireCondition(shown === expected, `Panel note status: ${shown || "(none yet)"}`);
     }), { timeout: 20_000 });
+  }
+
+  function fieldValue(selector) {
+    return onPanel((page) => page.evaluate(`document.getElementById(${JSON.stringify(selector)}).value`));
   }
 
   try {
@@ -903,7 +929,6 @@ async function run() {
     // The panel titles a page note from the tab, so this is the fixture page title.
     const title = `${APP_NAME} smoke /allowed/page`;
     const firstBody = `First note ${caseId}`;
-    const changedBody = `Review note ${caseId}`;
     await writeFile(path.join(runDir, "run-info.json"), `${JSON.stringify({
       origin, allowed, blocked, afterRemoval, notes, profile, testHome, configPath,
       manifest, host: options.host, chrome: options.chrome, siteInput,
@@ -1113,49 +1138,70 @@ async function run() {
         "Allowed visit was duplicated or removed");
     });
 
-    let originalNote;
-    await step("Page note creation", async () => {
+    await step("Note autosave writes the whole note about a second after typing stops", async () => {
       await navigate(origin, allowed);
       await cdp.send("Target.activateTarget", { targetId: (await fixtureTarget(origin)).targetId });
-      await createNote("Page note created", firstBody);
+      await openPanel();
+      await typeNote(firstBody);
+      // Autosave debounces ~1s after typing stops (§5.3); 20s covers that plus
+      // the native round trip with room to spare.
+      await waitForNoteStatus("Saved");
       const files = await markdownFiles(path.join(notesRoot, "pages"));
-      const base = files.filter((file) => !file.path.includes(`.${BINARY_NAME}-review-`));
-      requireCondition(base.length === 1 && files.length === 1, "Expected one page note and no review draft");
-      requireCondition(base[0].text.includes(title) && base[0].text.includes(firstBody) &&
-        base[0].text.includes(allowed), "Page note content does not match the fixture request");
-      originalNote = base[0];
+      requireCondition(files.length === 1, "Expected exactly one page note");
+      requireCondition(files[0].text.includes(title) && files[0].text.includes(firstBody) &&
+        files[0].text.includes(allowed), "Page note content does not match the fixture page");
     });
 
-    await step("Identical page note is idempotent", async () => {
-      await createNote("Page note already exists", firstBody);
+    await step("The note persists and reloads across navigating the page away and back", async () => {
+      const appended = `${firstBody} plus an edit before leaving the page ${caseId}`;
+      await typeNote(appended);
+      await waitForNoteStatus("Saved");
+      // The panel follows the active tab (§5.7): leaving and returning to
+      // the page must flush any edit and load the saved note again.
+      await navigate(origin, blocked);
+      await navigate(origin, allowed);
+      await waitForNoteStatus("Saved");
+      const shown = await fieldValue("note-body");
+      requireCondition(shown === appended, `Note editor shows: ${shown}`);
       const files = await markdownFiles(path.join(notesRoot, "pages"));
-      requireCondition(files.length === 1 && files[0].path === originalNote.path &&
-        files[0].text === originalNote.text, "Identical retry changed the note or created a file");
+      requireCondition(files.length === 1 && files[0].text.includes(appended),
+        "Navigating away and back did not preserve the saved note");
     });
 
-    let reviewNote;
-    let reviewResult;
-    await step("Changed page note creates one review draft", async () => {
-      reviewResult = await createNote("Page note needs review", changedBody);
+    let externalBody;
+    await step("A refused stale save shows the current note and keeps the unsaved text", async () => {
+      const loaded = await hostRequest(wrapper, {
+        type: "load_note", protocol_version: 3, request_id: randomUUID(), url: allowed,
+      });
+      requireCondition(loaded.type === "note_loaded" && loaded.exists,
+        `Expected the note saved above to load; got ${loaded.type}`);
+
+      // Simulate a second Brauser window saving this page's note first, so
+      // the open panel's own revision becomes stale (§4.4).
+      externalBody = `External edit ${caseId}`;
+      await hostSaveNote(wrapper, allowed, title, externalBody, loaded.revision);
+
+      const unsavedLocalEdit = `${firstBody} plus an edit that cannot be saved ${caseId}`;
+      await typeNote(unsavedLocalEdit);
+      await waitFor(() => onPanel(async (page) => {
+        const hidden = await page.hidden("#note-conflict");
+        requireCondition(hidden === false, "The conflict copy-out box did not appear");
+      }), { timeout: 20_000 });
+      const [unsaved, shown] = await Promise.all([fieldValue("note-unsaved"), fieldValue("note-body")]);
+      requireCondition(unsaved === unsavedLocalEdit, `Unsaved copy-out shows: ${unsaved}`);
+      requireCondition(shown === externalBody, `Note editor shows: ${shown}`);
       const files = await markdownFiles(path.join(notesRoot, "pages"));
-      const review = files.filter((file) => file.path.includes(`.${BINARY_NAME}-review-`));
-      const base = files.find((file) => file.path === originalNote.path);
-      requireCondition(files.length === 2 && review.length === 1, "Expected one original note and one sibling review draft");
-      requireCondition(base?.text === originalNote.text, "Original page note was changed");
-      requireCondition(review[0].text.includes(changedBody) &&
-        review[0].text.includes("review_of:") && review[0].text.includes("proposal_id:"),
-      "Review draft does not contain the proposal and ownership metadata");
-      reviewNote = review[0];
+      requireCondition(files.length === 1 && files[0].text.includes(externalBody) &&
+        !files[0].text.includes(unsavedLocalEdit), "The refused save must not have changed the note file");
     });
 
-    await step("Review draft retry is idempotent", async () => {
-      const result = await createNote("Page note needs review", changedBody);
-      requireCondition(result === reviewResult, `Retry reported a different result: ${result}`);
+    await step("Editing again after a conflict saves against the now-current revision", async () => {
+      const recovered = `${externalBody} plus the recovered edit ${caseId}`;
+      await typeNote(recovered);
+      await waitForNoteStatus("Saved");
       const files = await markdownFiles(path.join(notesRoot, "pages"));
-      requireCondition(files.length === 2 &&
-        files.some((file) => file.path === originalNote.path && file.text === originalNote.text) &&
-        files.some((file) => file.path === reviewNote.path && file.text === reviewNote.text),
-      "Review retry changed an existing file or created another draft");
+      requireCondition(files.length === 1 && files[0].text.includes(recovered),
+        "The recovered edit was not saved after the conflict");
     });
 
     await step("Site removal", async () => {

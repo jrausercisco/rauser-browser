@@ -33,3 +33,17 @@ button.icon-button:hover { background: #8883; }
 .setup-warning { border: 1px solid #a3412680; border-radius: 5px; background: #a3412614; margin: 12px 0; padding: 10px; }
 .setup-warning p { margin: 0 0 8px; color: #a34126; }
 footer { border-top: 1px solid #8885; padding-top: 10px; font-size: .85rem; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+#page-area { margin: 12px 0; }
+.page-title { font-weight: 650; margin: 0 0 2px; overflow-wrap: anywhere; }
+.page-url { margin: 0; color: #767676; font-size: .85rem; overflow-wrap: anywhere; }
+.note-header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.note-header h2 { margin: 0; }
+.note-status { font-size: .85rem; color: #767676; }
+.note-status.error { color: #a34126; }
+.capture-strip { border: 1px solid #8885; border-radius: 8px; margin: 14px 0; }
+.capture-strip summary { padding: 10px 14px; cursor: pointer; list-style: none; }
+.capture-strip summary::-webkit-details-marker { display: none; }
+.capture-strip summary::before { content: "▸ "; }
+.capture-strip[open] summary::before { content: "▾ "; }
+.capture-strip-body { padding: 0 14px 14px; }
