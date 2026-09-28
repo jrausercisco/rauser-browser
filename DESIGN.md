@@ -111,7 +111,7 @@ The extension runs in a hostile environment (arbitrary web pages), and the host 
 - Spawned with a cleared environment plus allowlisted variables, a timeout, an output size cap, and cancellation support.
 - Page content goes on stdin inside a delimited block with an explicit instruction that it is untrusted data.
 - For summarization and Q&A, harnesses should be configured in a mode without shell or file-writing tools. The host writes results itself; the agent never writes into the vault directly.
-- The agent denylist (banking, HR, health portals, etc.) blocks content from those domains from ever reaching an agent.
+- The user's agent denylist (§7.3) blocks content from those domains from ever reaching an agent. The host checks it before the extension extracts content and again before spawning the harness.
 
 ## 5. Features
 
@@ -128,7 +128,7 @@ The extension runs in a hostile environment (arbitrary web pages), and the host 
 1. The extension extracts readable content (Readability-style) from the active tab on demand.
 2. The host checks the denylist, then invokes the configured harness with the summary prompt.
 3. Output streams back to the sidebar in chunks, staying under the 1 MB native messaging limit per message.
-4. The final summary is written into the page note's managed block.
+4. The host writes the final summary itself. Until managed-block replacement is proven (§6.4), a page with no note gets a new note containing the summary, and a page with an existing note gets a no-clobber sibling review draft, as M1 page notes do.
 
 ### 5.3 Page notes
 
@@ -386,8 +386,8 @@ The layout above is the planned release layout. M0 currently contains `protocol/
 | Milestone | Scope |
 |---|---|
 | **M0 — Foundation** | Protocol schema, host skeleton, config loading, vault confinement, atomic writes, CI |
-| **M1 — Capture** | Sidebar shell, site logging, URL normalization, daily log, page notes with managed blocks |
-| **M2 — Agent** | Harness adapters, streaming, `/summarize`, denylist enforcement |
+| **M1 — Capture** | Side panel and settings page, site logging, URL normalization, daily log, create-only page notes with review drafts |
+| **M2 — Agent** | Harness setup with native confirmation, content extraction, streaming with cancellation, `/summarize`, denylist enforcement |
 | **M3 — Related** | FTS5 index, related pages, read later, `reindex` |
 | **M4 — Omnibar** | Built-in commands, free text, custom commands |
 | **M5 — Release** | Installers, store listings, signing and provenance, docs; compact durable visit-ID index and migration |
@@ -410,6 +410,21 @@ The plan follows Chrome's current [optional-permission rules](https://developer.
 
 **M1 validation remaining:** The macOS guided run loaded the unpacked extension, completed a Chrome-to-host `hello`, and exercised picker cancellation with config unchanged. The full permission, consent, visit, page-note, and removal flow was stopped before completion after a persistent macOS spinning cursor appeared; it is not a smoke-test pass. Native dialogs now run in a short-lived child process to remove that cause, which still needs confirming in a repeat macOS run; then run the flow on Windows. macOS and Windows CI build and test the branch. A failed append now rolls back its own bytes, and replay tolerates complete visits appended after an intent, so only a crash mid-append followed by further visits still requires manual repair. Confirm the Chrome permission request accepts explicit default and nondefault ports on both operating systems. Automated tests cover host identity/replay recovery and extension repair, pause, policy refresh, re-enable races, title capture, and notice retention. The M1 per-event intent journal grows indefinitely and needs a compact durable replacement before general distribution. Windows currently syncs file content but has no separately validated directory-entry flush, so power-loss durability of a newly created daily log or page-note name remains unverified. Resolve these gaps before the public package is released.
 
+**Settings page (2026-09-28):** Configuration moved from the side panel to a dedicated `options_ui` page. The panel shows a gear button and a setup warning until a folder, a site, and capture are all in place. The page opened from the panel on macOS once Rauser was reloaded in `chrome://extensions`. Chrome keeps an unpacked extension's manifest and service worker from load time but serves rebuilt pages from disk, so a build that changes `manifest.json` or `worker.ts` needs that reload; the panel now says so when the settings page cannot open. `npm run smoke:macos` starts a fresh profile and is unaffected. This is not a smoke-test pass for the flow above.
+
+### 12.2 Next steps
+
+1. **Finish M1 acceptance.** Repeat `npm run smoke:macos` through the full permission, consent, visit, page-note, and removal flow, now driven from the settings page, and confirm the child-process dialogs leave no busy cursor. Add a Windows guided run and complete it. Check an explicit default port and a nondefault port in the Chrome permission request on both operating systems. Record each result here; M1 is accepted only when both runs pass.
+2. **Catch page-load regressions in CI (optional, recommended).** Unit tests import the pages but do not load the built extension. A headless Chrome step that loads `extension/dist/` and opens the panel and settings page would have caught the stale-manifest class of failure before a manual run.
+3. **Settle M2 design before code.** Resolve the M2 questions in §14 and record the answers in §4.5, §5.2, §7.1, and §8.
+4. **Build M2 in this order**, each step reviewed and merged separately:
+   1. Harness setup: the host offers harnesses found on `PATH` and shows a native confirmation of the binary, arguments, and environment allowlist. As with `storage.root`, the extension never supplies a raw binary path; `update_config` requires a single-use token bound to the confirmed harness entry.
+   2. Host invocation: a cleared environment, argv from the template, page content on stdin inside the untrusted-data block, and a timeout, output cap, and process-tree kill. Test with a fake harness binary on both OSes.
+   3. Streaming protocol: the host currently answers one request at a time, so it needs a reader that stays responsive while a harness runs. Add chunk, completion, error, and `cancel` messages correlated by `request_id`, each under the 1 MB native-messaging limit. Closing the panel (stdin EOF) kills the harness.
+   4. Content extraction with a bundled, pinned Readability-style library, and the permissions §14 settles.
+   5. `/summarize` in the panel, with denylist checks and the summary write described in §5.2.
+5. **M3–M5** follow as in the table. The compact visit-ID index and Windows directory-entry durability are release blockers tracked under M5.
+
 ## 13. Platforms and License
 
 - **Browsers:** Google Chrome Stable only; see the release support window in §11. Edge and all other browsers are out of scope for the first release.
@@ -418,4 +433,11 @@ The plan follows Chrome's current [optional-permission rules](https://developer.
 
 ## 14. Open Questions
 
-No open M0 design questions. The release hosting, support, platform, browser, and signing policies are defined in §11; M1 security requirements are recorded in §12.
+No open M0 or M1 design questions. The release hosting, support, platform, browser, and signing policies are defined in §11; M1 security requirements are recorded in §12.
+
+Open for M2:
+
+- **Extraction permissions.** Enabled sites already hold an exact origin grant, so `scripting` alone could extract from them. Summarizing any other page needs `activeTab` or a per-origin request. Verify whether a click in the side panel grants `activeTab`; if not, choose between summarizing enabled sites only and requesting the origin in the click gesture.
+- **Summary destination.** §5.2 proposes a new note or a sibling review draft. The alternative is to build the displaced-byte backup (§6.4) first so summaries can replace the managed block. Recommended: ship drafts first.
+- **Harness modes.** Confirm, against current Claude Code and Codex documentation, the arguments that run each harness without shell or file-writing tools (§4.5) before shipping their templates.
+- **Denylist setup.** §7.3 starts the denylist empty. Decide whether the first harness setup requires the user to review it before any AI command runs.
