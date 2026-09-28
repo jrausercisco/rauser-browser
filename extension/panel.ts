@@ -472,13 +472,19 @@ void (async () => {
   busy = true;
   updateControls();
   let initialized = false;
+  let reachedHost = false;
   try {
     const hello = await session.hello();
+    reachedHost = true;
     await reloadConfig();
     if (hello.config_issue) show(hello.config_issue, true);
     initialized = true;
   } catch (error) {
-    show(`Native host unavailable: ${describe(error)}. Install or register the development host, then reopen the panel.`, true);
+    // Only a failed hello means the host is missing; later failures come from
+    // a host that answered, so reinstalling it would not help.
+    show(reachedHost
+      ? `Could not read the host settings: ${describe(error)}. Open settings to check the configuration, then reopen the panel.`
+      : `Native host unavailable: ${describe(error)}. Install or register the development host, then reopen the panel.`, true);
   } finally {
     busy = false;
     await session.refreshStatus().catch(() => undefined);
