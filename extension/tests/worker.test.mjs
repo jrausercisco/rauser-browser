@@ -555,3 +555,107 @@ test("a retry notice clears once nothing is left to retry, and on dismissal", as
   assert.equal(dismissed.queued, 1);
   assert.equal(dismissed.retry_error, null);
 });
+
+function helloResult(requestId) {
+  return {
+    type: "hello_result", protocol_version: PROTOCOL_VERSION, request_id: requestId,
+    host_version: "0.0.0", configured: true, config_issue: null,
+  };
+}
+
+function hello() {
+  return {
+    type: "hello", protocol_version: PROTOCOL_VERSION, request_id: crypto.randomUUID(),
+  };
+}
+
+test("a host client reconnects lazily after the host exits", async () => {
+  ports.length = 0;
+  const client = new HostClient();
+  let changes = 0;
+  client.onStateChange(() => { changes += 1; });
+  const first = ports[0];
+  const answered = client.call(hello(), "hello_result");
+  first.reply(helloResult(first.sent[0].request_id));
+  await answered;
+  assert.equal(client.connected, true);
+
+  const inFlight = client.call(hello(), "hello_result");
+  first.drop();
+  await assert.rejects(inFlight, (error) => error instanceof HostError && error.code === "disconnected");
+  // The next call starts a fresh host, so the page is still usable.
+  assert.equal(client.connected, true);
+
+  const retried = client.call(hello(), "hello_result");
+  assert.equal(ports.length, 2);
+  const second = ports[1];
+  // A late frame on the dead port must not settle the new request.
+  first.reply({ ...helloResult(second.sent[0].request_id), host_version: "stale" });
+  second.reply(helloResult(second.sent[0].request_id));
+  assert.equal((await retried).host_version, "0.0.0");
+  assert.equal(client.connected, true);
+  assert.ok(changes >= 1);
+
+  client.disconnect();
+  assert.equal(client.connected, false);
+  await assert.rejects(client.call(hello(), "hello_result"),
+    (error) => error instanceof HostError && error.code === "disconnected");
+  assert.equal(ports.length, 2, "an explicitly closed client stays closed");
+});
+
+test("a host that cannot be started reports the session disconnected", async () => {
+  ports.length = 0;
+  let changes = 0;
+  const session = new ConfigSession(() => { changes += 1; });
+  session.config = {
+    storage: null, capture_enabled: false, sites: [], strip_params: [], near_repeat_secs: 0,
+  };
+  session.revision = "r1";
+  assert.equal(session.connected, true);
+
+  // The host was removed, so Chrome drops the port before any reply.
+  const pending = session.hello();
+  ports[0].drop();
+  await assert.rejects(pending, (error) => error instanceof HostError && error.code === "disconnected");
+  assert.equal(session.connected, false);
+  assert.ok(changes >= 1, "the page is told to redraw its controls");
+
+  // Once the host is back, the next call reconnects and the session recovers.
+  const recovered = session.hello();
+  const port = ports.at(-1);
+  port.reply(helloResult(port.sent[0].request_id));
+  await recovered;
+  assert.equal(session.connected, true);
+  session.host.disconnect();
+});
+
+test("unaddressed host errors and version mismatches reach the caller", async () => {
+  ports.length = 0;
+  const client = new HostClient();
+  const port = ports[0];
+
+  const skewed = client.call(hello(), "hello_result");
+  port.reply({
+    type: "error", protocol_version: PROTOCOL_VERSION + 1, request_id: port.sent[0].request_id,
+    code: "unsupported_protocol_version", message: "extension and host protocol versions differ",
+  });
+  await assert.rejects(skewed,
+    (error) => error instanceof HostError && error.code === "unsupported_protocol_version");
+
+  const skewedResult = client.call(hello(), "hello_result");
+  port.reply({ ...helloResult(port.sent[1].request_id), protocol_version: PROTOCOL_VERSION + 1 });
+  await assert.rejects(skewedResult,
+    (error) => error instanceof HostError && error.code === "invalid_response");
+
+  // The host cannot read an oversized frame's request_id, so it answers with
+  // an empty one and closes the connection.
+  const oversized = client.call(hello(), "hello_result");
+  port.reply({
+    type: "error", protocol_version: PROTOCOL_VERSION, request_id: "",
+    code: "message_too_large", message: "native message exceeds the 4 MiB inbound limit",
+  });
+  port.drop();
+  await assert.rejects(oversized,
+    (error) => error instanceof HostError && error.code === "message_too_large");
+  client.disconnect();
+});
