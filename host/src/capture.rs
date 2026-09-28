@@ -851,8 +851,17 @@ fn scan_log(
     at: i64,
     near_repeat_secs: u64,
 ) -> Result<ScanResult> {
-    let mut lines = BufReader::new(file).lines();
-    if lines.next().transpose()?.as_deref() != Some(LOG_HEADER) {
+    // Split on bytes: a crash can leave the log cut inside a multibyte
+    // character, and that must not stop the scan or the resume after it.
+    let mut lines = BufReader::new(file).split(b'\n').map(|line| {
+        line.map(|mut line| {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            line
+        })
+    });
+    if lines.next().transpose()?.as_deref() != Some(LOG_HEADER.as_bytes()) {
         bail!("daily log exists without {APP_NAME} ownership marker");
     }
     let mut result = ScanResult {
@@ -860,7 +869,11 @@ fn scan_log(
         near_repeat: false,
     };
     for line in lines {
-        if let Some((id, url, previous_at)) = parse_marker(&line?) {
+        let line = line?;
+        let Ok(line) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        if let Some((id, url, previous_at)) = parse_marker(line) {
             if id == event_hash {
                 result.duplicate = true;
             }
@@ -1120,6 +1133,52 @@ mod tests {
         assert!(matches!(
             record(&store, &first),
             CaptureOutcome::Suppressed { .. }
+        ));
+    }
+
+    #[test]
+    fn entry_torn_inside_a_multibyte_character_resumes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store =
+            CaptureStore::open_at(&storage(root.path(), "log"), None, state.path()).unwrap();
+        let visit = event();
+        let CaptureOutcome::Persisted { relative_path } = record(&store, &visit) else {
+            panic!("expected persisted visit");
+        };
+        let hash = sha256_hex(visit.event_id.as_bytes());
+        let intent = read_intent(&store.journal_path(&hash)).unwrap().unwrap();
+        let log = root.path().join(relative_path);
+        let original = fs::read(&log).unwrap();
+        let entry = &original[intent.offset as usize..];
+        let dash = entry
+            .windows("—".len())
+            .position(|window| window == "—".as_bytes())
+            .unwrap();
+        // Cut after the em dash's first byte, leaving invalid UTF-8 at the end.
+        let torn = intent.offset + dash as u64 + 1;
+        let truncate = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&log)
+                .unwrap()
+                .set_len(torn)
+                .unwrap();
+            assert!(std::str::from_utf8(&fs::read(&log).unwrap()).is_err());
+        };
+
+        truncate();
+        assert!(matches!(
+            record(&store, &visit),
+            CaptureOutcome::Persisted { .. }
+        ));
+        assert_eq!(fs::read(&log).unwrap(), original);
+
+        // A different visit that day must not be blocked by the torn tail.
+        truncate();
+        assert!(matches!(
+            record(&store, &event()),
+            CaptureOutcome::Persisted { .. }
         ));
     }
 
