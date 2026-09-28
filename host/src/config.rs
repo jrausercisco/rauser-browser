@@ -24,6 +24,8 @@ const MAX_SITES: usize = 128;
 const MAX_STRIP_PARAMS: usize = 64;
 const MAX_RULE_BYTES: usize = 64;
 const MISSING_REVISION: &str = "missing";
+/// Never a real revision, so no update can be based on an unreadable file.
+const UNREADABLE_REVISION: &str = "unreadable";
 /// Hash at most this much of an oversized config. Past it, the revision
 /// also covers the length so a growing file still changes revision.
 const MAX_HASHED_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
@@ -60,18 +62,35 @@ impl ConfigStore {
     }
 
     pub fn load() -> Result<Self> {
-        let path = Self::default_path()?;
-        let state = read_disk_state(&path)?;
+        Ok(Self::load_from(Self::default_path()?))
+    }
+
+    fn load_from(path: PathBuf) -> Self {
         // The folder may have moved since setup. Keep the config available for
         // repair through update_config, but never use it for vault I/O until a
         // fresh validation succeeds.
-        Ok(Self {
-            path,
-            config: state.config,
-            revision: state.revision,
-            issue: state.issue,
-            root_identity: state.root_identity,
-        })
+        match read_disk_state(&path) {
+            Ok(state) => Self {
+                path,
+                config: state.config,
+                revision: state.revision,
+                issue: state.issue,
+                root_identity: state.root_identity,
+            },
+            // Exiting here would show the extension only a disconnect. Start
+            // inert instead; each request refreshes, fails the same way, and
+            // answers invalid_config until the file is readable again.
+            Err(error) => {
+                eprintln!("{NAMESPACE}: warning: configuration is unreadable: {error:#}");
+                Self {
+                    path,
+                    config: empty_config(),
+                    revision: UNREADABLE_REVISION.into(),
+                    issue: Some("The configuration file cannot be read or is not a regular file. Fix or remove it, then reload this page.".into()),
+                    root_identity: None,
+                }
+            }
+        }
     }
 
     pub fn snapshot(&self) -> &ConfigSnapshot {
@@ -927,6 +946,20 @@ mod tests {
         assert!(store.configured());
         assert_eq!(fs::read(&path).unwrap(), saved);
         assert_eq!(backup_count(base.path()), 0);
+    }
+
+    #[test]
+    fn unreadable_config_degrades_to_an_issue_at_startup() {
+        // A directory (or FIFO, or unreadable file) at the config path must
+        // not stop the host: it serves invalid_config errors instead.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.toml");
+        fs::create_dir(&path).unwrap();
+        let mut store = ConfigStore::load_from(path);
+        assert!(store.config_issue().is_some());
+        assert!(!store.configured());
+        assert_eq!(store.snapshot(), &empty_config());
+        assert!(store.refresh().is_err());
     }
 
     #[test]
