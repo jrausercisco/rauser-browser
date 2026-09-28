@@ -752,7 +752,7 @@ No open M0 or M1 design questions. The release hosting, support, platform, brows
 
 Artifact decisions (2026-09-28):
 
-- **Sequencing.** M2 step 1 (harness setup, protocol v4) finishes first, then all of M1.5 (protocol v5), then M2 steps 2–5. Harness setup is already underway, and M1.5 needs no agent until Tier 2 (step 7.9), which waits for M2 step 5.2 anyway.
+- **Sequencing.** M2 step 1 (harness setup, protocol v4) finishes first, then all of M1.5 (protocol v5), then M2 steps 2–5. Harness setup is already underway, and M1.5 needs no agent. The one exception is Tier 2 drafting (step 7.9), which is deferred until after M2 step 5.2 (host invocation); M1.5 ships without it.
 - **Artifacts replace per-site logging.** Automatic capture records only URLs an enabled adapter recognizes as an artifact (§5.1, §7.2). Per-site "log every page" is not offered alongside it. `/log` remains the explicit one-off exception.
 - **Log is the source of truth; artifact files are derived.** The daily log stays append-only. Artifact files and the index tables are rebuildable from it, so replacing an artifact file whole is safe under the same ownership rules as summaries (§4.4).
 - **Measured, not inferred.** Attention is recorded as focused and background minutes, with no "glanced" or "worked on" labels. The idle detection interval is 5 minutes, so a long read without input still counts (§5.1).
