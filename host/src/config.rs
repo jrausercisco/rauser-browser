@@ -14,7 +14,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::brand::{APP_NAME, NAMESPACE};
-use crate::vault::{Vault, selected_root_identity};
+use crate::vault::{STALE_TEMPORARY_AGE, Vault, is_generated_temporary, selected_root_identity};
 
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_ROOT_PATH_BYTES: usize = 4 * 1024;
@@ -90,6 +90,28 @@ impl ConfigStore {
                     root_identity: None,
                 }
             }
+        }
+    }
+
+    /// Best-effort startup cleanup of temporaries a killed host left behind,
+    /// in the config directory and, once the folder is trusted, the page
+    /// notes directory. Failures are logged; they never block serving.
+    pub fn sweep_stale_temporaries(&self) {
+        if let Some(parent) = self.path.parent()
+            && let Err(error) = sweep_config_temporaries(parent)
+        {
+            eprintln!("{NAMESPACE}: warning: could not sweep config temporaries: {error:#}");
+        }
+        if !self.configured() {
+            return;
+        }
+        let Some(storage) = self.config.storage.as_ref() else {
+            return;
+        };
+        if let Err(error) = Vault::open_checked(storage, self.root_identity())
+            .and_then(|vault| vault.sweep_stale_temporaries())
+        {
+            eprintln!("{NAMESPACE}: warning: could not sweep page-note temporaries: {error:#}");
         }
     }
 
@@ -446,6 +468,42 @@ fn backup_invalid(parent: &Path, source_path: &Path, expected_revision: &str) ->
     sync_parent(parent).context("syncing config backup directory")?;
     cleanup.disarm();
     Ok(())
+}
+
+/// Remove `.config-<uuid>.tmp` files old enough that no live update can still
+/// own them. Symlinks and anything not exactly that name are left alone.
+fn sweep_config_temporaries(parent: &Path) -> Result<usize> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("listing {}", parent.display()));
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("listing {}", parent.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_generated_temporary(name, ".config-") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = metadata.is_file()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|elapsed| elapsed >= STALE_TEMPORARY_AGE);
+        if stale && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn revision_for(contents: &[u8]) -> String {
@@ -1052,6 +1110,35 @@ mod tests {
             later_dir: "later".into(),
         };
         assert!(validate_storage(&storage).is_err());
+    }
+
+    #[test]
+    fn startup_sweep_removes_only_stale_config_temporaries() {
+        use crate::vault::tests::age_file;
+        use std::time::Duration;
+
+        let folder = tempfile::tempdir().unwrap();
+        let old = STALE_TEMPORARY_AGE + Duration::from_secs(60);
+        let stale = folder
+            .path()
+            .join(format!(".config-{}.tmp", Uuid::new_v4()));
+        let fresh = folder
+            .path()
+            .join(format!(".config-{}.tmp", Uuid::new_v4()));
+        let other = folder.path().join(".config-existing.tmp");
+        let config = folder.path().join("config.toml");
+        for path in [&stale, &fresh, &other, &config] {
+            fs::write(path, "content").unwrap();
+        }
+        for path in [&stale, &other, &config] {
+            age_file(path, old);
+        }
+        let store = ConfigStore::for_test(config.clone());
+        store.sweep_stale_temporaries();
+        assert!(!stale.exists());
+        for path in [&fresh, &other, &config] {
+            assert!(path.exists(), "{} was removed", path.display());
+        }
     }
 
     #[test]
