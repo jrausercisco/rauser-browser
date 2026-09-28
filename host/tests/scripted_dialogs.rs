@@ -187,9 +187,9 @@ fn harness_confirmation_text_round_trips() {
     use brauser_protocol::{AgentConfig, ConfigSnapshot, HarnessAdapter, StorageConfig};
 
     let folder = tempfile::tempdir().unwrap();
-    // Quotes and non-ASCII survive the child's stdin and shown.jsonl.
+    // Quotes and non-ASCII survive the child's stdin and shown.jsonl. The
+    // folder is only shown, never created: Windows forbids `"` in names.
     let notes = folder.path().join("notes \"é\"");
-    std::fs::create_dir(&notes).unwrap();
     let storage = |summaries: Option<&str>| StorageConfig {
         root: notes.to_string_lossy().into_owned(),
         profile: "neutral".into(),
