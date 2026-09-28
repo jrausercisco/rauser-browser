@@ -3,6 +3,10 @@ import type { SiteConfig, VisitEvent, VisitOutcome } from "../protocol/ts/genera
 export const POLICY_LEASE_MS = 24 * 60 * 60 * 1_000;
 export const MAX_QUEUED_VISITS = 256;
 export const MAX_QUEUE_BYTES = 512 * 1_024;
+// Extension pages watch this key to notice config saved by another page.
+export const POLICY_STORAGE_KEY = "rauser_policy_v1";
+// The only extension pages whose messages the worker accepts.
+export const TRUSTED_PAGES = ["panel.html", "options.html"] as const;
 
 export interface PolicyLease {
   revision: string;

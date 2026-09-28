@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rauser settings</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Rauser settings</h1>
+        <p class="eyebrow">M1 development build · Chrome</p>
+      </header>
+
+      <div id="status" class="status" role="status" aria-live="polite">Connecting to native host…</div>
+
+      <section aria-labelledby="setup-heading">
+        <h2 id="setup-heading">Private capture setup</h2>
+        <p>Choose a notes folder and one site to log. Rauser stays off until Chrome grants access and you confirm the host policy.</p>
+
+        <div class="field">
+          <label>Notes folder</label>
+          <output id="folder-path">None selected</output>
+          <button id="choose-folder" type="button" disabled>Choose folder…</button>
+        </div>
+
+        <p>Notes use neutral Markdown in M1. An Obsidian-specific profile is planned for a later milestone.</p>
+
+        <div class="field">
+          <label for="site-url">Site URL</label>
+          <input id="site-url" type="url" placeholder="https://example.com/" autocomplete="off" spellcheck="false" />
+          <small>Enter a scheme and host, with a port if needed, such as https://example.com. Wildcards are not accepted.</small>
+        </div>
+
+        <div class="field">
+          <label for="site-path">Allowed path prefix</label>
+          <input id="site-path" type="text" value="/" spellcheck="false" />
+          <small>The host checks this path; Chrome's permission covers the chosen scheme, host, and port across all paths.</small>
+        </div>
+
+        <button id="enable-site" type="button" disabled>Enable this site</button>
+        <button id="pause-capture" type="button" class="secondary" disabled>Pause capture and clear pending visits</button>
+
+        <div class="field">
+          <h3>Enabled sites</h3>
+          <ul id="sites-list" class="plain-list"><li>None</li></ul>
+        </div>
+      </section>
+
+      <footer>
+        <p>Rauser runs locally. Pending visits and page notes are in the Rauser side panel.</p>
+      </footer>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

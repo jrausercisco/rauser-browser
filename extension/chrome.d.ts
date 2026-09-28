@@ -44,6 +44,8 @@ interface ChromeApi {
     id: string;
     getURL(path: string): string;
     reload(): void;
+    openOptionsPage(): Promise<void>;
+    getManifest(): { options_ui?: { page: string } };
     connectNative(name: string): ChromePort;
     sendMessage<T = unknown>(message: unknown): Promise<T>;
     lastError?: { message: string };
@@ -73,6 +75,14 @@ interface ChromeApi {
       set(items: Record<string, unknown>): Promise<void>;
       remove(keys: string | string[]): Promise<void>;
       setAccessLevel(options: { accessLevel: "TRUSTED_CONTEXTS" }): Promise<void>;
+    };
+    onChanged: {
+      addListener(
+        listener: (
+          changes: Record<string, { oldValue?: unknown; newValue?: unknown }>,
+          areaName: string,
+        ) => void,
+      ): void;
     };
   };
   tabs: {

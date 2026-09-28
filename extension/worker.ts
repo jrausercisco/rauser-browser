@@ -2,6 +2,8 @@ import type { VisitEvent } from "../protocol/ts/generated.js";
 import {
   MAX_QUEUE_BYTES,
   MAX_QUEUED_VISITS,
+  POLICY_STORAGE_KEY,
+  TRUSTED_PAGES,
   emptyQueue,
   exactOriginPattern,
   isPolicyLease,
@@ -18,7 +20,7 @@ import {
 } from "./model.js";
 
 const QUEUE_KEY = "rauser_queue_v1";
-const POLICY_KEY = "rauser_policy_v1";
+const POLICY_KEY = POLICY_STORAGE_KEY;
 const REVOCATIONS_KEY = "rauser_revocations_v1";
 const PAUSE_KEY = "rauser_pause_pending_v1";
 const PAUSE_TOKEN_KEY = "rauser_pause_token_v1";
@@ -555,7 +557,8 @@ function isWorkerRequest(value: unknown): value is WorkerRequest {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL("panel.html")) {
+  if (sender.id !== chrome.runtime.id ||
+      !TRUSTED_PAGES.some((page) => sender.url === chrome.runtime.getURL(page))) {
     return false;
   }
   if (!isWorkerRequest(message)) {

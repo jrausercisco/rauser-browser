@@ -424,3 +424,26 @@ test("visit timestamps use local time with a numeric UTC offset", () => {
     else process.env.TZ = previous;
   }
 });
+
+test("worker accepts messages only from the side panel and settings page", async () => {
+  for (const page of ["panel.html", "options.html"]) {
+    const reply = await new Promise((resolve) => {
+      const accepted = onMessage({ kind: "get_status" }, {
+        id: chrome.runtime.id, url: chrome.runtime.getURL(page),
+      }, resolve);
+      assert.equal(accepted, true, page);
+    });
+    assert.equal(reply.ok, true, page);
+  }
+  for (const sender of [
+    { id: chrome.runtime.id, url: chrome.runtime.getURL("other.html") },
+    { id: chrome.runtime.id, url: "https://example.com/options.html" },
+    { id: "another-extension", url: "chrome-extension://another-extension/options.html" },
+    { id: chrome.runtime.id },
+  ]) {
+    let responded = false;
+    const accepted = onMessage({ kind: "get_status" }, sender, () => { responded = true; });
+    assert.equal(accepted, false, JSON.stringify(sender));
+    assert.equal(responded, false, JSON.stringify(sender));
+  }
+});
