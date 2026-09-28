@@ -9,7 +9,15 @@ macro_rules! namespace {
     };
 }
 
-pub const APP_NAME: &str = "Brauser";
+/// The user-facing product name, as a macro for compile-time messages.
+#[macro_export]
+macro_rules! app_name {
+    () => {
+        "Brauser"
+    };
+}
+
+pub const APP_NAME: &str = app_name!();
 pub const NAMESPACE: &str = namespace!();
 pub const BLOCK_START: &str = concat!("<!-- ", namespace!(), ":start -->");
 pub const BLOCK_END: &str = concat!("<!-- ", namespace!(), ":end -->");

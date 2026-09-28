@@ -2,7 +2,7 @@
 // Each page owns one session; the config mutation lock serializes changes
 // across every open page, and the worker's policy lease tells a page when
 // another page has saved a different revision.
-import type { ConfigSnapshot, SiteConfig } from "../protocol/ts/generated.js";
+import type { AgentStatus, ConfigSnapshot, HarnessOffer, SiteConfig } from "../protocol/ts/generated.js";
 import {
   POLICY_LEASE_MS,
   POLICY_STORAGE_KEY,
@@ -74,6 +74,7 @@ export class ConfigSession {
   config: ConfigSnapshot | null = null;
   revision: string | null = null;
   configIssue: string | null = null;
+  agentStatus: AgentStatus | null = null;
   status: WorkerStatus | null = null;
   // While this page pauses, the worker clears the lease before the host
   // commits. That null lease is this page's own write, not another page's.
@@ -116,7 +117,20 @@ export class ConfigSession {
     this.config = response.config;
     this.setRevision(response.revision);
     this.configIssue = response.config_issue;
+    this.agentStatus = response.agent_status;
     this.onChange();
+  }
+
+  /** config_updated carries no agent status, so read it after a save. A
+   * newer revision belongs to another page, whose lease change reloads.
+   * The save itself has committed, so a failed read only blanks the status. */
+  private async refreshAgentStatus(): Promise<void> {
+    try {
+      const latest = await this.readHostConfig();
+      if (latest.revision === this.revision) this.agentStatus = latest.agent_status;
+    } catch {
+      this.agentStatus = null;
+    }
   }
 
   async applyHostConfig(response: Awaited<ReturnType<ConfigSession["readHostConfig"]>>): Promise<void> {
@@ -187,6 +201,8 @@ export class ConfigSession {
       config: next,
       picker_token: pickerToken,
       consent_token: confirmed.consent_token,
+      // Only native harness setup mints a harness grant (§7.3).
+      harness_token: null,
     }, "config_updated");
     this.config = updated.config;
     this.setRevision(updated.revision);
@@ -194,6 +210,66 @@ export class ConfigSession {
     onCommitted?.();
     this.onChange();
     await this.installHostPolicy(resumeAfterConfirmation, resumeAfterPauseToken);
+    await this.refreshAgentStatus();
+    await this.refreshStatus();
+  }
+
+  /** The harnesses the host found, each offer bound to this revision. */
+  async discoverHarnesses(): Promise<HarnessOffer[]> {
+    if (!this.revision) throw new Error("Host configuration has not loaded");
+    const reply = await this.host.call({
+      type: "discover_harnesses",
+      protocol_version: PROTOCOL_VERSION,
+      request_id: newRequestId(),
+      expected_revision: this.revision,
+    }, "harnesses_discovered", 60_000);
+    return reply.offers;
+  }
+
+  /**
+   * Native harness setup (§7.3). The host builds the whole new config from
+   * the offer, shows its own confirmation, and runs one test prompt; its
+   * single-use token authorizes exactly that config. The extension never
+   * sends a harness path or arguments. Call while holding the config
+   * mutation lock.
+   */
+  async setupHarness(
+    offerId: string,
+    envNames: string[],
+    denylist: string[],
+    summariesDir: string | null,
+  ): Promise<void> {
+    if (!this.revision) throw new Error("Host configuration has not loaded");
+    const expectedRevision = this.revision;
+    // The host closes its dialog at 270 seconds (host/src/dialog.rs), then
+    // runs a test prompt of up to 60 seconds, so wait past both.
+    const confirmed = await this.host.call({
+      type: "confirm_harness_setup",
+      protocol_version: PROTOCOL_VERSION,
+      request_id: newRequestId(),
+      expected_revision: expectedRevision,
+      offer_id: offerId,
+      env_names: envNames,
+      agent_denylist: denylist,
+      summaries_dir: summariesDir,
+    }, "harness_setup_confirmed", 6 * 60_000);
+    // The harness dialog was this change's consent, so no confirm_config.
+    const updated = await this.host.call({
+      type: "update_config",
+      protocol_version: PROTOCOL_VERSION,
+      request_id: newRequestId(),
+      expected_revision: expectedRevision,
+      config: confirmed.config,
+      picker_token: null,
+      consent_token: null,
+      harness_token: confirmed.harness_token,
+    }, "config_updated");
+    this.config = updated.config;
+    this.setRevision(updated.revision);
+    this.configIssue = null;
+    this.onChange();
+    await this.installHostPolicy();
+    await this.refreshAgentStatus();
     await this.refreshStatus();
   }
 

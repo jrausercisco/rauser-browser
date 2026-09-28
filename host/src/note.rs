@@ -354,6 +354,7 @@ mod tests {
             log_dir: "log".into(),
             pages_dir: "pages".into(),
             later_dir: "later".into(),
+            summaries_dir: None,
         };
         let vault = Vault::open(&storage).unwrap();
         (root, vault)

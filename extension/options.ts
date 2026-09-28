@@ -1,4 +1,6 @@
-import type { ConfigSnapshot, SiteConfig, StorageConfig } from "../protocol/ts/generated.js";
+import type {
+  ConfigSnapshot, HarnessAdapter, HarnessOffer, SiteConfig, StorageConfig,
+} from "../protocol/ts/generated.js";
 import { exactOriginPattern, isHttpUrl, type WorkerStatus } from "./model.js";
 import {
   ConfigSession,
@@ -11,6 +13,16 @@ import {
 } from "./settings.js";
 import { HostError, PROTOCOL_VERSION, newRequestId } from "./native.js";
 import { APP_NAME } from "./brand.js";
+import {
+  SUGGESTED_EXCLUSIONS,
+  addDenylistEntry,
+  agentStateText,
+  denylistEditsLive,
+  harnessFoundText,
+  harnessOfferNote,
+  previewDenylistEntry,
+  removeDenylistEntry,
+} from "./agent.js";
 import { forgetNoteOrigin, noteOrigins, pruneNoteOrigins } from "./grants.js";
 
 const status = element<HTMLDivElement>("status");
@@ -21,6 +33,18 @@ const sitePath = element<HTMLInputElement>("site-path");
 const enableButton = element<HTMLButtonElement>("enable-site");
 const pauseButton = element<HTMLButtonElement>("pause-capture");
 const sitesList = element<HTMLUListElement>("sites-list");
+const agentState = element<HTMLParagraphElement>("agent-state");
+const detectButton = element<HTMLButtonElement>("detect-harnesses");
+const offersList = element<HTMLUListElement>("harness-offers");
+const envList = element<HTMLUListElement>("harness-env");
+const summariesInput = element<HTMLInputElement>("summaries-dir");
+const denylistInput = element<HTMLInputElement>("denylist-input");
+const denylistPreview = element<HTMLOutputElement>("denylist-preview");
+const denylistAddButton = element<HTMLButtonElement>("denylist-add");
+const denylistSuggestions = element<HTMLDivElement>("denylist-suggestions");
+const denylistList = element<HTMLUListElement>("denylist-list");
+const setupButton = element<HTMLButtonElement>("setup-harness");
+const removeHarnessButton = element<HTMLButtonElement>("remove-harness");
 
 let picker: { path: string; token: string } | null = null;
 let busy = false;
@@ -32,19 +56,38 @@ let preflight: {
   apiGranted: boolean;
   originGranted: boolean;
 } | null = null;
+// Harness offers are single-use and bound to the revision they were found at.
+let offers: HarnessOffer[] = [];
+let selectedOfferId: string | null = null;
+const envChoices = new Map<string, boolean>();
+// Until setup confirms the list, exclusion edits stay on this page and are
+// sent with the setup request, which shows them in the native confirmation.
+let pendingDenylist: string[] | null = null;
+let summariesEdited = false;
 
-// The host binds a folder selection to the revision it was chosen at, so any
-// save, from this page or another, makes a pending selection unusable.
-const session = new ConfigSession(renderConfig, () => { picker = null; });
-
-// A folder selection's token lives only in the host process that issued it.
-// After that process exits, the next call starts a new one that would refuse
-// the token, so the folder must be chosen again.
-session.host.onHostExit(() => {
-  if (!picker) return;
+// The host binds a folder selection and each harness offer to the revision it
+// was made at, so any save, from this page or another, makes them unusable.
+const session = new ConfigSession(renderConfig, () => {
   picker = null;
+  clearOffers();
+});
+
+// A folder selection's token and harness offers live only in the host process
+// that issued them. After that process exits, the next call starts a new one
+// that would refuse them, so the folder must be chosen, or harnesses
+// detected, again.
+session.host.onHostExit(() => {
+  const hadPicker = picker !== null;
+  const hadOffers = offers.length > 0;
+  if (!hadPicker && !hadOffers) return;
+  picker = null;
+  clearOffers();
   renderConfig();
-  show("The native host restarted, so the folder selection was lost. Choose the folder again.", true);
+  const lost = [
+    ...(hadPicker ? ["the folder selection was lost. Choose the folder again."] : []),
+    ...(hadOffers ? ["the detected harnesses were lost. Detect harnesses again."] : []),
+  ];
+  show(`The native host restarted, so ${lost.join(" Also, ")}`, true);
 });
 
 function show(message: string, warning = false): void {
@@ -80,6 +123,151 @@ function updateControls(): void {
   for (const button of sitesList.querySelectorAll("button")) {
     button.disabled = !connected || busy || repairing;
   }
+  const idle = connected && !busy;
+  detectButton.disabled = !idle || session.configIssue !== null;
+  setupButton.disabled = !idle || !session.config?.storage || selectedOffer() === null;
+  removeHarnessButton.disabled = !idle || !session.config?.agent;
+  denylistAddButton.disabled = !idle || !addDenylistEntry(shownDenylist(), denylistInput.value).ok;
+  for (const control of denylistList.querySelectorAll("button")) control.disabled = !idle;
+  for (const input of offersList.querySelectorAll<HTMLInputElement>("input")) {
+    input.disabled = !idle || input.dataset.ready !== "true";
+  }
+  for (const input of envList.querySelectorAll<HTMLInputElement>("input")) {
+    input.disabled = !idle || input.dataset.required === "true";
+  }
+}
+
+function harnessName(adapter: HarnessAdapter): string {
+  return adapter === "claude_code" ? "Claude Code" : "Codex";
+}
+
+function clearOffers(): void {
+  offers = [];
+  selectedOfferId = null;
+  envChoices.clear();
+}
+
+function selectedOffer(): HarnessOffer | null {
+  return offers.find((offer) => offer.offer_id !== null && offer.refusal === null &&
+    offer.offer_id === selectedOfferId) ?? null;
+}
+
+function selectOffer(offerId: string | null): void {
+  selectedOfferId = offerId;
+  envChoices.clear();
+  // Credentials the host has are proposed; the user can untick any of them.
+  for (const env of selectedOffer()?.env_optional ?? []) envChoices.set(env.name, env.present);
+}
+
+function denylistLive(): boolean {
+  return denylistEditsLive(session.config);
+}
+
+function shownDenylist(): string[] {
+  if (denylistLive()) return session.config!.agent_denylist;
+  return pendingDenylist ?? session.config?.agent_denylist ?? [];
+}
+
+function renderAgent(): void {
+  const config = session.config;
+  const state = [agentStateText(session.agentStatus)];
+  if (config?.agent) state.push(`Harness: ${config.agent.binary}.`);
+  if (config?.storage?.summaries_dir) state.push(`Summaries folder: ${config.storage.summaries_dir}.`);
+  agentState.textContent = state.join(" ");
+  if (!summariesEdited) summariesInput.value = config?.storage?.summaries_dir ?? "summaries";
+
+  offersList.replaceChildren();
+  if (!offers.length) {
+    const item = document.createElement("li");
+    item.textContent = "Not detected yet.";
+    offersList.append(item);
+  }
+  for (const [index, offer] of offers.entries()) {
+    const ready = offer.offer_id !== null && offer.refusal === null;
+    const item = document.createElement("li");
+    item.dataset.adapter = offer.adapter;
+    item.dataset.ready = String(ready);
+    if (offer.real_path !== null) item.dataset.realPath = offer.real_path;
+    const label = document.createElement("label");
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "harness-offer";
+    radio.id = `harness-offer-${index}`;
+    radio.value = offer.offer_id ?? "";
+    radio.dataset.ready = String(ready);
+    radio.checked = ready && offer.offer_id === selectedOfferId;
+    radio.addEventListener("change", () => {
+      selectOffer(offer.offer_id);
+      renderConfig();
+    });
+    const version = offer.version ? ` ${offer.version}` : "";
+    const runs = offer.real_path && offer.real_path !== offer.binary ? ` (runs ${offer.real_path})` : "";
+    const text = document.createElement("span");
+    text.textContent = `${harnessName(offer.adapter)}${version}: ${offer.binary}${runs}`;
+    label.append(radio, text);
+    item.append(label);
+    const note = document.createElement("small");
+    note.textContent = ` ${harnessOfferNote(offer)}`;
+    item.append(note);
+    offersList.append(item);
+  }
+
+  envList.replaceChildren();
+  const offer = selectedOffer();
+  if (!offer) {
+    const item = document.createElement("li");
+    item.textContent = "Detect a harness first.";
+    envList.append(item);
+  } else {
+    const names = [
+      ...offer.env_required.map((name) => ({ name, required: true, present: true })),
+      ...offer.env_optional.map((env) => ({ name: env.name, required: false, present: env.present })),
+    ];
+    for (const env of names) {
+      const item = document.createElement("li");
+      const label = document.createElement("label");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.dataset.env = env.name;
+      box.dataset.required = String(env.required);
+      box.checked = env.required || envChoices.get(env.name) === true;
+      box.addEventListener("change", () => { envChoices.set(env.name, box.checked); });
+      const text = document.createElement("span");
+      text.textContent = env.required
+        ? `${env.name} (always passed)`
+        : `${env.name} (${env.present ? "set" : "not set"} in the native host)`;
+      label.append(box, text);
+      item.append(label);
+      envList.append(item);
+    }
+  }
+
+  denylistList.replaceChildren();
+  const list = shownDenylist();
+  if (!list.length) {
+    const item = document.createElement("li");
+    item.textContent = "No domains excluded.";
+    denylistList.append(item);
+  }
+  for (const entry of list) {
+    const item = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = entry;
+    item.append(label);
+    if (!denylistLive() && !(config?.agent_denylist.includes(entry) ?? false)) {
+      const pending = document.createElement("small");
+      pending.textContent = " Saved when you set up a harness.";
+      item.append(pending);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "secondary";
+    remove.textContent = "Remove";
+    remove.setAttribute("aria-label", `Remove ${entry}`);
+    remove.addEventListener("click", () => void removeExclusion(entry));
+    item.append(remove);
+    denylistList.append(item);
+  }
 }
 
 function renderConfig(): void {
@@ -111,6 +299,7 @@ function renderConfig(): void {
       sitesList.append(item);
     }
   }
+  renderAgent();
   updateControls();
 }
 
@@ -292,6 +481,7 @@ function enableSite(): void {
               log_dir: config.storage?.log_dir ?? "log",
               pages_dir: config.storage?.pages_dir ?? "pages",
               later_dir: config.storage?.later_dir ?? "later",
+              summaries_dir: config.storage?.summaries_dir ?? null,
             }
           : { ...config.storage!, profile: "neutral" };
         const sites = config.sites.filter((site) => !sameSite(site, parsed.site));
@@ -472,6 +662,165 @@ async function removeSite(site: SiteConfig): Promise<void> {
   }
 }
 
+async function detectHarnesses(): Promise<void> {
+  if (busy || !session.connected) return;
+  busy = true;
+  updateControls();
+  try {
+    offers = await session.discoverHarnesses();
+    const ready = offers.find((offer) => offer.offer_id !== null && offer.refusal === null);
+    selectOffer(ready?.offer_id ?? null);
+    if (ready) {
+      show(harnessFoundText(harnessName(ready.adapter), ready.version, !!session.config?.storage));
+    } else {
+      show(offers.length
+        ? "No harness found here can be set up yet; see the reasons below."
+        : "No supported harness was found on the native host's PATH.", true);
+    }
+  } catch (error) {
+    clearOffers();
+    show(`Could not detect harnesses: ${describe(error)}`, true);
+    if (error instanceof HostError && error.code === "conflict") await reloadConfig().catch(() => undefined);
+  } finally {
+    busy = false;
+    renderConfig();
+  }
+}
+
+async function setupHarness(): Promise<void> {
+  const offer = selectedOffer();
+  if (busy || !offer?.offer_id) return;
+  if (!session.config?.storage) {
+    show("Choose a notes folder first.", true);
+    return;
+  }
+  const summaries = summariesInput.value.trim();
+  if (!summaries) {
+    show("Enter a summaries folder name.", true);
+    return;
+  }
+  const envNames = offer.env_optional.filter((env) => envChoices.get(env.name)).map((env) => env.name);
+  const denylist = [...shownDenylist()];
+  busy = true;
+  updateControls();
+  try {
+    await withConfigMutationLock(() =>
+      session.setupHarness(offer.offer_id!, envNames, denylist, summaries));
+    pendingDenylist = null;
+    summariesEdited = false;
+    show(`${harnessName(offer.adapter)} is set up. ${agentStateText(session.agentStatus)}`);
+  } catch (error) {
+    show(`Harness setup did not finish: ${describe(error)}`, true);
+    if (error instanceof HostError && error.code === "conflict") await reloadConfig().catch(() => undefined);
+  } finally {
+    // The host spends an offer on every attempt, including a cancel.
+    clearOffers();
+    busy = false;
+    renderConfig();
+  }
+}
+
+async function removeHarness(): Promise<void> {
+  if (busy || !session.config?.agent) return;
+  busy = true;
+  updateControls();
+  try {
+    await withConfigMutationLock(() => session.saveConfig({ ...session.config!, agent: null }, null));
+    show("Harness removed. AI commands are off.");
+  } catch (error) {
+    show(`Could not remove the harness: ${describe(error)}`, true);
+    if (error instanceof HostError && error.code === "conflict") await reloadConfig().catch(() => undefined);
+  } finally {
+    busy = false;
+    renderConfig();
+  }
+}
+
+/** The host decides whether a change needs its dialog: none to add an
+ * exclusion, one to remove it. */
+async function saveDenylist(list: string[], done: string): Promise<void> {
+  busy = true;
+  updateControls();
+  try {
+    await withConfigMutationLock(() =>
+      session.saveConfig({ ...session.config!, agent_denylist: list }, null));
+    show(done);
+  } catch (error) {
+    show(`Could not change AI privacy exclusions: ${describe(error)}`, true);
+    if (error instanceof HostError && error.code === "conflict") await reloadConfig().catch(() => undefined);
+  } finally {
+    busy = false;
+    renderConfig();
+  }
+}
+
+async function addExclusion(): Promise<void> {
+  if (busy || !session.connected) return;
+  const edit = addDenylistEntry(shownDenylist(), denylistInput.value);
+  if (!edit.ok) {
+    show(edit.error, true);
+    return;
+  }
+  const entry = edit.list[edit.list.length - 1]!;
+  denylistInput.value = "";
+  denylistPreview.textContent = "";
+  if (denylistLive()) {
+    await saveDenylist(edit.list, `AI commands now exclude ${entry} and its subdomains.`);
+  } else {
+    pendingDenylist = edit.list;
+    show(`${entry} will be excluded; harness setup asks you to confirm the list.`);
+    renderConfig();
+  }
+}
+
+async function removeExclusion(entry: string): Promise<void> {
+  if (busy || !session.connected) return;
+  const list = removeDenylistEntry(shownDenylist(), entry);
+  if (denylistLive()) {
+    await saveDenylist(list, `AI commands may now read pages on ${entry}.`);
+  } else {
+    pendingDenylist = list;
+    show(`${entry} removed from the list harness setup will confirm.`);
+    renderConfig();
+  }
+}
+
+function refreshDenylistPreview(): void {
+  const raw = denylistInput.value;
+  if (!raw.trim()) {
+    denylistPreview.textContent = "";
+  } else {
+    const preview = previewDenylistEntry(raw);
+    denylistPreview.textContent = preview.ok
+      ? `Excludes ${preview.normalized} and its subdomains.`
+      : preview.error;
+  }
+  updateControls();
+}
+
+for (const suggestion of SUGGESTED_EXCLUSIONS) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "secondary";
+  button.textContent = `${suggestion.label}, e.g. ${suggestion.example}`;
+  // Only fills the box; the user edits it and chooses Add.
+  button.addEventListener("click", () => {
+    denylistInput.value = suggestion.example;
+    refreshDenylistPreview();
+    denylistInput.focus();
+  });
+  denylistSuggestions.append(button);
+}
+
+detectButton.addEventListener("click", () => void detectHarnesses());
+setupButton.addEventListener("click", () => void setupHarness());
+removeHarnessButton.addEventListener("click", () => void removeHarness());
+denylistAddButton.addEventListener("click", () => void addExclusion());
+denylistInput.addEventListener("input", refreshDenylistPreview);
+denylistInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") void addExclusion();
+});
+summariesInput.addEventListener("input", () => { summariesEdited = true; });
 chooseFolderButton.addEventListener("click", () => void chooseFolder());
 enableButton.addEventListener("click", enableSite);
 pauseButton.addEventListener("click", () => void pauseCapture());

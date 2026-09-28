@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "{{FULL_NAME}} (M1 development)",
+  "name": "{{FULL_NAME}} (M2 development)",
   "version": "0.1.0",
   "description": "Private, local browsing notes. Development build; requires a registered {{APP_NAME}} native host.",
   "minimum_chrome_version": "116",

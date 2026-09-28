@@ -1,4 +1,5 @@
-/target/
+# Any cargo target directory, including one made by building from host/.
+target/
 /node_modules/
 /dist/
 /coverage/

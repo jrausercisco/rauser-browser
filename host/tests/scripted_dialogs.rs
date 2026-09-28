@@ -180,3 +180,85 @@ fn killing_the_host_closes_its_open_dialog() {
     assert!(answer.exists(), "the dialog outlived the host");
     drop(stdin);
 }
+
+#[test]
+fn harness_confirmation_text_round_trips() {
+    use brauser_host::harness::{self, Adapter, BinaryIdentity, Candidate};
+    use brauser_protocol::{AgentConfig, ConfigSnapshot, HarnessAdapter, StorageConfig};
+
+    let folder = tempfile::tempdir().unwrap();
+    // Quotes and non-ASCII survive the child's stdin and shown.jsonl. The
+    // folder is only shown, never created: Windows forbids `"` in names.
+    let notes = folder.path().join("notes \"é\"");
+    let storage = |summaries: Option<&str>| StorageConfig {
+        root: notes.to_string_lossy().into_owned(),
+        profile: "neutral".into(),
+        log_dir: "log".into(),
+        pages_dir: "pages".into(),
+        later_dir: "later".into(),
+        summaries_dir: summaries.map(str::to_owned),
+    };
+    let current = ConfigSnapshot {
+        storage: Some(storage(None)),
+        capture_enabled: false,
+        sites: Vec::new(),
+        strip_params: Vec::new(),
+        near_repeat_secs: 300,
+        agent_denylist: vec!["bank.example".into(), "mail.example".into()],
+        agent_denylist_confirmed: false,
+        log_incognito: false,
+        agent: None,
+    };
+    let after = ConfigSnapshot {
+        storage: Some(storage(Some("summaries"))),
+        agent_denylist: vec!["bank.example".into()],
+        agent_denylist_confirmed: true,
+        agent: Some(AgentConfig {
+            harness_id: "claude-code".into(),
+            adapter: HarnessAdapter::ClaudeCode,
+            binary: "/usr/local/bin/claude".into(),
+            args: harness::template_args(Adapter::ClaudeCode),
+            env_allow: vec!["HOME".into(), "PATH".into()],
+            timeout_secs: 120,
+        }),
+        ..current.clone()
+    };
+    let candidate = Candidate {
+        adapter: Adapter::ClaudeCode,
+        harness_id: "claude-code".into(),
+        found_at: "/usr/local/bin/claude".into(),
+        identity: Some(BinaryIdentity {
+            real_path: "/opt/claude/versions/2.1.284/claude".into(),
+            size: 1,
+            mtime_ns: "1".into(),
+            file_id: None,
+        }),
+        version: Some("2.1.284".into()),
+        args: harness::template_args(Adapter::ClaudeCode),
+        env_names: Vec::new(),
+        help_sha256: Some("0".repeat(64)),
+        confirmed_flags: Vec::new(),
+        refusal: None,
+    };
+    let (title, body) =
+        brauser_host::consent::harness_confirmation_text(&candidate, &after, &current).unwrap();
+    assert!(body.contains("\"mail.example\" and its subdomains"));
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("answer"),
+        r#"{"dialog":"confirm","reply":"confirmed"}"#,
+    )
+    .unwrap();
+    let text = format!("{title}\n{body}");
+    let output = run_dialog("__dialog-confirm", directory.path(), &text);
+    assert!(output.status.success());
+    let shown = std::fs::read_to_string(directory.path().join("shown.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = shown
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["dialog"], "confirm");
+    assert_eq!(lines[0]["text"].as_str(), Some(text.as_str()));
+}

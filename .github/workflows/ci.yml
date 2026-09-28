@@ -31,10 +31,12 @@ jobs:
         run: cargo test --locked --workspace
       - name: Check Rust lints
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Test and lint the scripted-dialogs test build
-        run: |
-          cargo test --locked -p brauser --features scripted-dialogs --target-dir target/scripted-dialogs
-          cargo clippy --locked -p brauser --all-targets --features scripted-dialogs --target-dir target/scripted-dialogs -- -D warnings
+      # One command per step: Windows runs `run` in PowerShell, which does
+      # not stop when an earlier native command fails.
+      - name: Test the scripted-dialogs test build
+        run: cargo test --locked -p brauser --features scripted-dialogs --target-dir target/scripted-dialogs
+      - name: Lint the scripted-dialogs test build
+        run: cargo clippy --locked -p brauser --all-targets --features scripted-dialogs --target-dir target/scripted-dialogs -- -D warnings
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.14.0"

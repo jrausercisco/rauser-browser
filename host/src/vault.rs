@@ -53,6 +53,9 @@ impl Vault {
         let pages_dir = checked_relative_dir(&storage.pages_dir)?;
         checked_relative_dir(&storage.log_dir)?;
         checked_relative_dir(&storage.later_dir)?;
+        if let Some(summaries_dir) = &storage.summaries_dir {
+            checked_relative_dir(summaries_dir)?;
+        }
         let (root, _) = open_selected_root(chosen, expected_identity)?;
         Ok(Self { root, pages_dir })
     }
@@ -400,6 +403,7 @@ pub(crate) mod tests {
             log_dir: "log".into(),
             pages_dir: pages_dir.into(),
             later_dir: "later".into(),
+            summaries_dir: None,
         }
     }
 

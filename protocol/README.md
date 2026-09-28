@@ -19,8 +19,8 @@ the typed request. A mismatch returns an `error` response with code
 `unsupported_protocol_version` and the host's protocol version. If malformed
 input has no recoverable request ID, an `error` response may use an empty ID.
 
-Protocol version 3 covers host discovery, configuration, consent, visit
-capture, and versioned whole-file page notes. `get_config` returns a
+Protocol version 4 covers host discovery, configuration, consent, visit
+capture, versioned whole-file page notes, and the AI-harness readiness gate. `get_config` returns a
 `revision` that the extension must send as `expected_revision` with its full
 `update_config` snapshot. A successful update returns a new `revision`; a stale
 revision returns a `conflict` error. The revision is `missing` when no config
@@ -38,6 +38,45 @@ site list, `utm_*`/`fbclid`/`gclid` stripping, and a 300-second repeat window.
 An M0 file with a notes root but no native-picker provenance is returned as an
 inert repair state. The user must reselect the folder; the host backs up the
 old file before saving the M1 config. M1 accepts the neutral profile only.
+
+Version 4 adds `StorageConfig.summaries_dir` (required, `null` until a
+summaries folder is chosen) and four required `ConfigSnapshot` keys:
+`agent_denylist` (normalized hostnames), `agent_denylist_confirmed`,
+`log_incognito` (always `false`), and `agent` (the harness entry or `null`).
+`config_result` also reports `agent_status`, the host's view of whether AI
+commands may run. `update_config` requires `harness_token`; only native
+harness setup mints one, and it is the only way to set
+`agent_denylist_confirmed` or a harness entry. The extension may echo both
+unchanged, or remove the harness, which keeps the confirmation. Adding a
+denylist entry needs no confirmation; removing or replacing one needs a
+`confirm_config` token. `check_agent` runs the readiness gate every AI command
+uses and, for a non-null `url`, reports whether the denylist allows that
+page; `agent_checked` is its only success response. Every refusal is an
+`error`, `not_configured` naming settings. An M1 TOML file loads with
+`summaries_dir` null and the denylist unconfirmed.
+
+Native harness setup is two messages. `discover_harnesses` takes
+`expected_revision` and returns `harnesses_discovered` with at most eight
+offers. Each offer has the binary the host found, its resolved `real_path`,
+`version`, argument template, the environment names it requires, and optional
+names with a `present` flag; values are never sent. A usable offer carries a
+five-minute, single-use `offer_id` bound to the revision. A refused offer
+(Codex, for now, or an unsafe path) has a `null` `offer_id` and a `refusal`.
+`confirm_harness_setup` names an `offer_id`, the optional environment names
+to pass through, the denylist, and `summaries_dir` (`null` keeps the current
+folder or uses `summaries`). The host spends the offer, re-checks the
+binary's identity, shows a native confirmation listing the program, arguments,
+environment names, summaries folder, and every denylist entry, then runs one
+short test prompt. Only when the test passes does it return
+`harness_setup_confirmed` with the proposed `config`, the confirmed
+`summary`, and a single-use `harness_token`. That token authorizes exactly
+that `config` at that revision in `update_config`, cannot be combined with a
+picker or consent token, and is refused if the binary changed since. A
+canceled dialog is `cancelled`; a failed test run is `invalid_config`, and
+neither mints a token. The extension never supplies a binary path. The
+settings page sends that `config` in `update_config` right away, with the
+`harness_token` and null picker and consent tokens; it never sends it through
+`confirm_config`.
 
 `choose_folder` opens the native OS directory picker. A successful
 `folder_chosen` returns a canonical path and a five-minute, single-use
