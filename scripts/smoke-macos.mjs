@@ -796,7 +796,7 @@ async function run() {
   }
 
   // --headless: every Chrome and host process must stay invisible, with no
-  // on-screen window and no Dock or menu-bar presence.
+  // on-screen window (menu-bar items included) and no Dock presence.
   async function nothingOnScreen() {
     const listed = await Promise.all([
       commandOutput("/usr/bin/pgrep", ["-g", String(chrome.pid)]).catch(() => ""),
@@ -805,7 +805,8 @@ async function run() {
     const pids = [...new Set(listed.join("\n").split("\n").filter(Boolean))];
     const seen = JSON.parse(await commandOutput(windowCheck, pids));
     requireCondition(seen.windows === 0 && seen.apps === 0,
-      `A test process is visible: ${seen.windows} on-screen windows, ${seen.apps} Dock or menu-bar apps`);
+      `A test process is visible: ${seen.windows} on-screen windows, ${seen.apps} Dock apps ` +
+      `(${JSON.stringify(seen.visible)})`);
   }
 
   // --headless: the host's dialog child records each dialog in shown.jsonl
