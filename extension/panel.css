@@ -31,7 +31,7 @@ header.panel-header { display: flex; align-items: flex-start; justify-content: s
 button.icon-button { display: inline-grid; place-items: center; background: transparent; color: inherit; padding: 6px; margin: 0; }
 button.icon-button:hover { background: #8883; }
 .setup-warning { border: 1px solid #a3412680; border-radius: 5px; background: #a3412614; margin: 12px 0; padding: 10px; }
-.setup-warning p { margin: 0 0 8px; color: #a34126; }
+.setup-warning p { margin: 0 0 8px; color: #a34126; overflow-wrap: anywhere; }
 footer { border-top: 1px solid #8885; padding-top: 10px; font-size: .85rem; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 #page-area { margin: 12px 0; }

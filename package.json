@@ -5,7 +5,7 @@
   "description": "Development tooling for the Brauser browser extension and shared protocol",
   "scripts": {
     "build:extension": "node extension/build.mjs",
-    "test:extension": "node --test extension/tests/worker.test.mjs",
+    "test:extension": "node --test extension/tests/worker.test.mjs extension/tests/note-editor.test.mjs",
     "smoke:macos": "node scripts/smoke-macos.mjs",
     "smoke:macos:headless": "node scripts/smoke-macos.mjs --headless",
     "typecheck": "tsc --noEmit",
