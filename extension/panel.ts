@@ -9,6 +9,7 @@ import {
 import { ConfigSession, describe, element, setupProblem, worker } from "./settings.js";
 import { PROTOCOL_VERSION, newRequestId } from "./native.js";
 import { APP_NAME } from "./brand.js";
+import { recordNoteOrigin } from "./grants.js";
 
 const status = element<HTMLDivElement>("status");
 const settingsButton = element<HTMLButtonElement>("open-settings");
@@ -355,6 +356,8 @@ function requestNoteOrigin(): void {
     if (ok) {
       grantOrigin = null;
       noteGrantOrigin.hidden = true;
+      // Removing a logging site for this origin must not revoke the grant.
+      return recordNoteOrigin(origin);
     } else {
       showNoteStatus("Chrome access was declined.", true);
     }
