@@ -10,6 +10,7 @@ use brauser_protocol::{
     VisitOutcome, VisitRecorded,
 };
 
+use crate::brand::NAMESPACE;
 use crate::capture::{CaptureOutcome, CapturePolicy, CaptureStore};
 use crate::config::{self, ConfigStore};
 use crate::consent::ConsentAuthority;
@@ -18,8 +19,9 @@ use crate::vault::Vault;
 
 const MAX_INBOUND_BYTES: usize = 4 * 1024 * 1024;
 // Chrome limits host-to-extension messages to 1 MiB. Leave room for the
-// framing prefix and future envelope fields.
-const MAX_OUTBOUND_BYTES: usize = 900 * 1024;
+// framing prefix and future envelope fields. Note limits (`note.rs`) are
+// derived from this so a saved note can always be loaded again.
+pub(crate) const MAX_OUTBOUND_BYTES: usize = 900 * 1024;
 const MAX_REQUEST_ID_CHARS: usize = 128;
 
 pub fn serve(config: ConfigStore) -> Result<()> {
@@ -270,11 +272,17 @@ fn dispatch(
                     ErrorCode::Cancelled,
                     "folder selection was canceled",
                 ),
-                Err(_) => error(
-                    &value.request_id,
-                    ErrorCode::Internal,
-                    "could not open the folder picker",
-                ),
+                Err(choose_error) => {
+                    // The failure may come from the picker itself or from
+                    // checking the folder the user picked (for example one
+                    // macOS privacy settings protect); keep the cause.
+                    eprintln!("{NAMESPACE}: folder selection failed: {choose_error:#}");
+                    error(
+                        &value.request_id,
+                        ErrorCode::Internal,
+                        "could not open the folder picker or use the selected folder",
+                    )
+                }
             }
         }
         Request::ConfirmConfig(value) => {
@@ -426,8 +434,8 @@ fn note_vault(
 
 fn note_error(request_id: &str, error_value: note::NoteRequestError) -> Response {
     match error_value {
-        note::NoteRequestError::Invalid(message) => {
-            error(request_id, ErrorCode::InvalidRequest, &message)
+        note::NoteRequestError::TooLarge(message) => {
+            error(request_id, ErrorCode::MessageTooLarge, &message)
         }
         note::NoteRequestError::Conflict(note::OwnershipConflict(message)) => {
             error(request_id, ErrorCode::Conflict, &message)
@@ -546,9 +554,17 @@ fn read_frame<R: Read>(input: &mut R) -> std::result::Result<Option<Vec<u8>>, Fr
 }
 
 fn write_frame<W: Write>(output: &mut W, response: &Response) -> Result<()> {
-    let body = serde_json::to_vec(response).context("serializing native response")?;
+    let mut body = serde_json::to_vec(response).context("serializing native response")?;
     if body.len() > MAX_OUTBOUND_BYTES {
-        bail!("native response exceeds host-to-extension size limit");
+        // One oversized answer must not end the connection: that would drop
+        // every other in-flight request and show the extension only a
+        // disconnect. Answer the same request with a small error instead.
+        let fallback = error(
+            response.request_id(),
+            ErrorCode::MessageTooLarge,
+            "response exceeds the host-to-extension size limit",
+        );
+        body = serde_json::to_vec(&fallback).context("serializing native response")?;
     }
     let size = u32::try_from(body.len()).context("native response length overflow")?;
     output.write_all(&size.to_ne_bytes())?;
@@ -750,6 +766,140 @@ mod tests {
                 assert_eq!(value.revision, "missing");
             }
             other => panic!("expected note_loaded, got {other:?}"),
+        }
+    }
+
+    fn responses_from(output: Vec<u8>) -> Vec<Response> {
+        let mut reader = Cursor::new(output);
+        let mut responses = Vec::new();
+        while let Some(body) = read_frame(&mut reader).unwrap() {
+            responses.push(serde_json::from_slice::<Response>(&body).unwrap());
+        }
+        responses
+    }
+
+    fn save_request(id: &str, body: &str, revision: &str) -> Request {
+        Request::SaveNote(brauser_protocol::SaveNoteRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: id.into(),
+            url: "https://example.com/a".into(),
+            title: "A Title".into(),
+            body: body.into(),
+            expected_revision: revision.into(),
+        })
+    }
+
+    fn load_request(id: &str) -> Request {
+        Request::LoadNote(brauser_protocol::LoadNoteRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: id.into(),
+            url: "https://example.com/a".into(),
+        })
+    }
+
+    fn hello_request(id: &str) -> Request {
+        Request::Hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: id.into(),
+        })
+    }
+
+    #[test]
+    fn the_largest_valid_note_round_trips_without_ending_the_serve_loop() {
+        let folder = tempfile::tempdir().unwrap();
+        let notes = folder.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let config = configured_store(&notes);
+        // 384 KiB of quotes: the byte limit, and twice that once escaped.
+        let body = "\"".repeat(384 * 1024);
+        let requests = [
+            save_request("save-1", &body, "missing"),
+            load_request("load-1"),
+            // A stale save echoes the whole note back.
+            save_request("save-stale", "other", "missing"),
+            hello_request("hello-1"),
+        ];
+        let input: Vec<u8> = requests.into_iter().flat_map(encoded_request).collect();
+        let mut output = Vec::new();
+        serve_with_io(Cursor::new(input), &mut output, config).unwrap();
+
+        let responses = responses_from(output);
+        assert_eq!(responses.len(), 4);
+        assert!(matches!(&responses[0], Response::NoteSaved(_)));
+        match &responses[1] {
+            Response::NoteLoaded(value) => assert_eq!(value.body, body),
+            other => panic!("expected note_loaded, got {other:?}"),
+        }
+        match &responses[2] {
+            Response::NoteConflict(value) => assert_eq!(value.body, body),
+            other => panic!("expected note_conflict, got {other:?}"),
+        }
+        assert!(matches!(&responses[3], Response::HelloResult(_)));
+    }
+
+    #[test]
+    fn a_note_too_large_to_return_gets_a_correlated_error_and_serving_continues() {
+        let folder = tempfile::tempdir().unwrap();
+        let notes = folder.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let mut config = configured_store(&notes);
+        let saved = match dispatch(
+            save_request("save-1", "small", "missing"),
+            &mut config,
+            &mut ConsentAuthority::new(),
+        ) {
+            Response::NoteSaved(value) => value,
+            other => panic!("expected note_saved, got {other:?}"),
+        };
+        // The note grows outside the panel (for example in Obsidian) past
+        // what one response can carry, while staying under the read limit.
+        let path = notes.join(&saved.relative_path);
+        let grown = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("small", &"x".repeat(MAX_OUTBOUND_BYTES));
+        std::fs::write(&path, grown).unwrap();
+
+        let requests = [
+            load_request("load-1"),
+            save_request("save-stale", "new", "missing"),
+            hello_request("hello-1"),
+        ];
+        let input: Vec<u8> = requests.into_iter().flat_map(encoded_request).collect();
+        let mut output = Vec::new();
+        serve_with_io(Cursor::new(input), &mut output, config).unwrap();
+
+        let responses = responses_from(output);
+        assert_eq!(responses.len(), 3);
+        for (response, id) in responses[..2].iter().zip(["load-1", "save-stale"]) {
+            match response {
+                Response::Error(value) => {
+                    assert_eq!(value.code, ErrorCode::MessageTooLarge);
+                    assert_eq!(value.request_id, id);
+                }
+                other => panic!("expected message_too_large, got {other:?}"),
+            }
+        }
+        assert!(matches!(&responses[2], Response::HelloResult(_)));
+    }
+
+    #[test]
+    fn an_oversized_response_becomes_a_correlated_error_frame() {
+        let response = Response::NoteLoaded(NoteLoaded {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "load-big".into(),
+            exists: true,
+            revision: "missing".into(),
+            title: String::new(),
+            body: "x".repeat(MAX_OUTBOUND_BYTES + 1),
+        });
+        let mut output = Vec::new();
+        write_frame(&mut output, &response).unwrap();
+        match decoded_response(output) {
+            Response::Error(value) => {
+                assert_eq!(value.code, ErrorCode::MessageTooLarge);
+                assert_eq!(value.request_id, "load-big");
+            }
+            other => panic!("expected message_too_large, got {other:?}"),
         }
     }
 
