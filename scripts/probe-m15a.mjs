@@ -9,7 +9,11 @@
 // from scripts/smoke-macos.mjs rather than imported, because that script runs
 // its whole flow on import.
 //
-//   node scripts/probe-m15a.mjs [--only <name>[,<name>]] [--json <file>] [--keep-profile]
+//   node scripts/probe-m15a.mjs [--only <name>[,<name>]] [--json <file>] [--keep-profile] [--chrome <path>]
+//
+// --chrome runs another Chrome build, such as Chrome for Testing, which still
+// honors --load-extension (branded Chrome 154 ignores it); restore-order needs
+// that to keep the recorder loaded from browser startup.
 //
 // Each scripts/probes/*.mjs module exports { name, title, async run(ctx) } and
 // returns findings: [{ claim, expected, observed, matches, inconclusive?, note?, ...extra }].
@@ -34,6 +38,9 @@
 //                                  targets(), events, onEvent(listener) -> unsubscribe
 //     ctx.chrome                   current Chrome child process
 //     ctx.chromeVersion            Browser.getVersion reply
+//     ctx.chromePath               the Chrome binary this run launches
+//     ctx.launchedAt               Date.now() just before the current Chrome was spawned
+//     ctx.recorderMode             "cdp" (Extensions.loadUnpacked) or "flag" (--load-extension)
 //     ctx.runDir, ctx.profile      temp run directory and its chrome-profile
 //     ctx.extensionId              recorder ID (the same after a relaunch)
 //     ctx.homeTargetId             a plain tab the runner keeps open (about:blank at start)
@@ -86,10 +93,13 @@
 //     ctx.loadExtension(dir)       copy dir into runDir and load it unpacked -> { id, dir }
 //     ctx.extensionsInfo()         developerPrivate.getExtensionsInfo summaries
 //   Browser lifecycle:
-//     ctx.relaunch({ restoreSession = false, args = [], beforeLaunch }) close Chrome gracefully
-//                                  (so the session is saved), run beforeLaunch, relaunch on the
-//                                  same profile, and reload the recorder, which
+//     ctx.relaunch({ restoreSession = false, args = [], beforeLaunch, recorder = "cdp" }) close
+//                                  Chrome gracefully (so the session is saved), run beforeLaunch,
+//                                  relaunch on the same profile, and reload the recorder, which
 //                                  Extensions.loadUnpacked loads for one browser session only.
+//                                  recorder: "flag" instead names it with --load-extension, so it
+//                                  is loaded at startup; the runner then neither loads it nor
+//                                  waits for its worker, and throws if Chrome ignored the switch.
 //                                  Other loaded extensions must be reloaded by the probe.
 //                                  -> { pageTargets } as seen before the reload
 //   Helpers: ctx.delay(ms), ctx.waitFor(check, { timeout, interval }),
@@ -107,21 +117,22 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const REPO = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PROBES = path.join(REPO, "scripts", "probes");
 const RECORDER = path.join(PROBES, "recorder-extension");
-const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const EXTENSION_ID = /^[a-p]{32}$/;
 const EXTENSION_ID_ALPHABET = "abcdefghijklmnop";
 // Runs first when selected, so a broken harness fails before any real probe.
 const FIRST_PROBE = "self-check";
 
 function usage() {
-  console.log("Usage: node scripts/probe-m15a.mjs [--only <name>[,<name>]] [--json <file>] [--keep-profile]");
+  console.log("Usage: node scripts/probe-m15a.mjs [--only <name>[,<name>]] [--json <file>] [--keep-profile] [--chrome <path>]");
   console.log("  --only          Run only these probes (module names in scripts/probes/).");
   console.log("  --json          Also write the report to this file.");
   console.log("  --keep-profile  Keep the temporary Chrome profile after the run.");
+  console.log("  --chrome        Chrome binary to run (default: branded Google Chrome).");
 }
 
 function argumentsForRun(args) {
-  const options = { only: null, json: null, keepProfile: false };
+  const options = { only: null, json: null, keepProfile: false, chrome: DEFAULT_CHROME };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--help" || arg === "-h") {
@@ -129,11 +140,12 @@ function argumentsForRun(args) {
       return null;
     }
     if (arg === "--keep-profile") options.keepProfile = true;
-    else if (arg === "--only" || arg === "--json") {
+    else if (arg === "--only" || arg === "--json" || arg === "--chrome") {
       const value = args[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`${arg} needs a value`);
       index += 1;
       if (arg === "--only") options.only = value.split(",").map((name) => name.trim()).filter(Boolean);
+      else if (arg === "--chrome") options.chrome = path.resolve(value);
       else options.json = path.resolve(value);
     } else {
       throw new Error(`Unknown argument ${arg}`);
@@ -443,10 +455,13 @@ function unpackedExtensionId(directory) {
 }
 
 // Always headless, always this run's own profile. Headless Chrome takes one
-// start page; a session restore passes none.
-async function launchChrome(profile, args, startUrl) {
-  const chrome = spawn(CHROME, [
-    "--headless=new", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check",
+// start page; a session restore passes none. --use-mock-keychain keeps Chrome
+// out of the login keychain: an ad hoc signed build such as Chrome for Testing
+// otherwise stalls every cookie-store read, and so every page load, waiting on
+// a keychain prompt.
+async function launchChrome(binary, profile, args, startUrl) {
+  const chrome = spawn(binary, [
+    "--headless=new", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--use-mock-keychain",
     "--remote-debugging-pipe", "--enable-unsafe-extension-debugging", ...args,
     ...(startUrl ? [startUrl] : []),
   ], { detached: true, stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
@@ -460,7 +475,8 @@ async function launchChrome(profile, args, startUrl) {
 const WORKER_LOG = "probe.flush().then(() => chrome.storage.local.get('log')).then((r) => r.log ?? [])";
 
 class ProbeContext {
-  constructor({ runDir, profile, port, fixture, signal }) {
+  constructor({ chromePath, runDir, profile, port, fixture, signal }) {
+    this.chromePath = chromePath;
     this.runDir = runDir;
     this.profile = profile;
     this.signal = signal;
@@ -481,6 +497,8 @@ class ProbeContext {
     this.chrome = null;
     this.cdp = null;
     this.chromeVersion = null;
+    this.launchedAt = null;
+    this.recorderMode = "cdp";
     this.extensionId = null;
     this.recorderDir = null;
     this.homeTargetId = null;
@@ -494,12 +512,20 @@ class ProbeContext {
     console.log("   ", ...parts);
   }
 
-  async launch({ args = [], startUrl = "about:blank" } = {}) {
-    this.chrome = await launchChrome(this.profile, args, startUrl);
+  async launch({ args = [], startUrl = "about:blank", recorder = "cdp" } = {}) {
+    requireCondition(recorder === "cdp" || this.recorderDir, "--load-extension needs the recorder copied by an earlier launch");
+    this.recorderMode = recorder;
+    this.launchedAt = Date.now();
+    // The feature override is what once re-enabled the switch in branded
+    // Chrome; 154 ignores the switch either way.
+    const recorderArgs = recorder === "flag"
+      ? [`--load-extension=${this.recorderDir}`, "--disable-features=DisableLoadExtensionCommandLineSwitch"] : [];
+    this.chrome = await launchChrome(this.chromePath, this.profile, [...args, ...recorderArgs], startUrl);
     this.cdp = new Cdp(this.chrome);
     this.chromeVersion = await this.cdp.send("Browser.getVersion");
     const restored = await this.pageTargets();
-    await this.loadRecorder();
+    if (recorder === "flag") await this.openControl();
+    else await this.loadRecorder();
     this.homeTargetId = (await this.pageTargets()).find((target) => !this.isControl(target))?.targetId
       ?? await this.openTab("about:blank");
     return { pageTargets: restored };
@@ -516,10 +542,19 @@ class ProbeContext {
     requireCondition(this.extensionId === null || this.extensionId === id, "Recorder ID changed after relaunch");
     this.extensionId = id;
     await this.waitForWorker();
+    await this.openControl();
+  }
+
+  // For a --load-extension recorder this is the only step, so the runner
+  // leaves its worker to start on its own.
+  async openControl() {
     this.controlTargetId = await this.openTab(this.controlUrl(), { wait: false });
     await this.withPage(this.controlTargetId, (page) => this.waitFor(() =>
       page.evaluate("typeof chrome.tabs?.query === 'function' || Promise.reject(new Error('loading'))", { timeout: 2_000 }),
-    { interval: 200 }));
+    { interval: 200 })).catch((error) => {
+      if (this.recorderMode !== "flag") throw error;
+      throw new Error(`The recorder's control page did not load; ${this.chromeVersion?.product ?? "Chrome"} probably ignored --load-extension (${error.message})`);
+    });
   }
 
   controlUrl() {
@@ -748,7 +783,7 @@ class ProbeContext {
 
   // The control tab is closed first so it is not part of the saved session;
   // the recorder is unloaded until loadRecorder runs again.
-  async relaunch({ restoreSession = false, args = [], beforeLaunch = null } = {}) {
+  async relaunch({ restoreSession = false, args = [], beforeLaunch = null, recorder = "cdp" } = {}) {
     await this.closeTab(this.controlTargetId).catch(() => undefined);
     const chrome = this.chrome;
     const exited = chrome.exitCode !== null ? Promise.resolve() : new Promise((resolve) => chrome.once("exit", resolve));
@@ -763,6 +798,7 @@ class ProbeContext {
     return this.launch({
       args: [...(restoreSession ? ["--restore-last-session"] : []), ...args],
       startUrl: restoreSession ? null : "about:blank",
+      recorder,
     });
   }
 
@@ -771,12 +807,7 @@ class ProbeContext {
   async reset() {
     const targets = await this.pageTargets();
     if (!targets.some((target) => target.targetId === this.homeTargetId)) this.homeTargetId = await this.openTab("about:blank");
-    if (!targets.some((target) => target.targetId === this.controlTargetId)) {
-      this.controlTargetId = await this.openTab(this.controlUrl(), { wait: false });
-      await this.withPage(this.controlTargetId, (page) => this.waitFor(() =>
-        page.evaluate("typeof chrome.tabs?.query === 'function' || Promise.reject(new Error('loading'))", { timeout: 2_000 }),
-      { interval: 200 }));
-    }
+    if (!targets.some((target) => target.targetId === this.controlTargetId)) await this.openControl();
     for (const target of await this.pageTargets()) {
       if (target.targetId !== this.homeTargetId && target.targetId !== this.controlTargetId) await this.closeTab(target.targetId).catch(() => undefined);
     }
@@ -834,7 +865,7 @@ async function run() {
   const options = argumentsForRun(process.argv.slice(2));
   if (!options) return;
   if (process.platform !== "darwin") throw new Error("This probe runner supports macOS only");
-  await access(CHROME, constants.X_OK);
+  await access(options.chrome, constants.X_OK);
   const probes = await loadProbes(options.only);
 
   const runDir = await mkdtemp(path.join(os.tmpdir(), "brauser-probe-m15a-"));
@@ -849,11 +880,11 @@ async function run() {
   let ctx = null;
   let failed = false;
   const results = [];
-  const report = { startedAt: new Date().toISOString(), runDir, chrome: null, extensionId: null, extensions: null, probes: results };
+  const report = { startedAt: new Date().toISOString(), runDir, chromePath: options.chrome, chrome: null, extensionId: null, extensions: null, probes: results };
 
   try {
     const port = await startServer(server);
-    ctx = new ProbeContext({ runDir, profile, port, fixture, signal: abort.signal });
+    ctx = new ProbeContext({ chromePath: options.chrome, runDir, profile, port, fixture, signal: abort.signal });
     state.otherOrigin = ctx.otherOrigin;
     console.log(`Run directory: ${runDir}`);
     console.log(`Fixture: ${ctx.origin} (ungranted twin ${ctx.otherOrigin})`);
