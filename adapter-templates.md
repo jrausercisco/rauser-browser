@@ -1,6 +1,6 @@
 # Adapter Templates — Specification
 
-> Status: Accepted (2026-09-28) · Replaced the regular-expression patterns in DESIGN.md §7.2 (DESIGN.md updated 2026-09-28; §14 below is applied) · Target: M1.5a, built in DESIGN.md §12.2 step 6.2 · Format version 1
+> Status: Accepted (2026-09-28) · Replaced the regular-expression patterns in DESIGN.md §7.2 (DESIGN.md updated 2026-09-28; §14 below is applied) · Amended 2026-09-28: fixed-shape captures anchor a template (§4.1), and drafts come from the Create adapter flow as well as the agent (§10.4) · Target: M1.5a, built in DESIGN.md §12.2 step 6.2 · Format version 1
 
 ## 1. Purpose
 
@@ -102,7 +102,7 @@ Structural rules, checked when config loads:
 
 - `{*}` may appear only as the last segment.
 - Optional segments may appear only after every required segment, and only before `{*}` if one is present.
-- A template must contain at least one literal or alternation segment. `/` alone and `/{*}` are invalid.
+- A template must contain at least one required **anchor** segment. An anchor is a literal segment, an alternation segment (captured or not), or a fixed-shape capture. A fixed-shape capture is a `uuid` capture or a `hex` capture whose bounds fix its length at exactly 32 or more, such as `hex(32)` or `hex(40)`, with or without `@tail`. An optional segment never counts as the anchor, because the template also matches without it. `/` alone, `/{*}`, `/{a:name}/{b:token}`, `/{h:hex(16)}`, `/{h:hex(32,40)}`, and `/{a:name}/{t?:(tasks)}` are invalid. A fixed-shape value is as distinctive as a route word, so it anchors a tool whose URLs have no fixed words, such as Notion's `/<workspace>/<Title>-<32 hex>` (§11). An `int`, `token`, `name`, or `jira_key` capture is never an anchor, because ordinary pages have segments of those shapes too.
 - Capture names are unique within a rule.
 - At most 32 segments, 16 alternatives per alternation, 64 characters per literal, and 512 characters per template.
 - `bounds` may only narrow a type's default length range (§7). `hex(32)` means exactly 32; `token(20,64)` means 20 to 64.
@@ -181,6 +181,8 @@ A capture named `mode` is never used in an ID. A capture named `mode` whose type
 Some origins host many unrelated tenants: every GitHub organization, every Google account in a Chrome profile, every Notion workspace. An adapter recognizes artifacts by URL shape, and shape alone cannot tell work from personal. Scope closes that gap.
 
 The host owns a list of **shared origins**. Format version 1 lists `https://github.com`, `https://docs.google.com`, `https://www.notion.so`, `https://www.figma.com`, and `https://linear.app`. The list is host-owned config and can grow in later releases.
+
+For drafting (§10.4), each entry also records where the URL names the tenant, if it does: `owner` in the first path segment on GitHub, and `workspace` in the first path segment on Notion and Linear. Google Docs and Figma record none, so drafts there can only be `unscoped`. An entry can also mark account-index positions, such as Google's `/u/<n>/`, which a draft never captures.
 
 An adapter on a shared origin must have one of:
 
@@ -312,22 +314,22 @@ The host remains authoritative. The worker's copy only prefilters, so a worker b
 
 When config loads, the host checks every rule in §4.1, §5, §6, §7, §8, and §9 and reports the first error with the adapter, rule, and character position. Limits: at most 64 adapters, 16 rules per adapter.
 
-Because the language has no free-form patterns, the host can decide whether two rules could match the same URL. It compares them segment by segment: literals against literals, literals against type membership, types against types by alphabet and length range, with optional segments and rests expressed as length ranges. The comparison is conservative: it treats `@tail`, `jira_key`'s structure, and query conditions by their alphabets and length ranges, so it can report an overlap that no URL actually produces, but it never misses one. Messages therefore say "may overlap". The host uses this to:
+Because the language has no free-form patterns, the host can decide whether two rules could match the same URL. It compares them segment by segment: literals against literals, literals against type membership, types against types by alphabet and length range, with optional segments and rests expressed as length ranges. The comparison is conservative: it treats `@tail`, `jira_key`'s structure, and query conditions by their alphabets and length ranges, so it can report an overlap that no URL actually produces, but it never misses one. A fixed-shape `@tail` capture anchors a template (§4.1), but overlap still compares its whole segment as a range: any segment long enough to end in the capture. Messages therefore say "may overlap". The host uses this to:
 
 - warn when two user-written adapters on one origin overlap, naming the rule that would win;
-- reject a Tier 2 draft that overlaps an existing adapter on its origin;
+- drop each Tier 2 draft rule that overlaps an existing adapter on its origin;
 - list, in the match preview, which already-recognized artifacts a change would re-map.
 
 ### 10.4 Tier 2 drafts
 
-A drafted adapter is written in this language, and the structural rules replace most of the regex-inspection rules in DESIGN.md §5.1:
+A drafted adapter is written in this language, whether the host's structural drafter or the configured agent produced it (DESIGN.md §5.1), and the structural rules replace most of the regex-inspection rules in DESIGN.md §5.1:
 
-- A draft may not use `title`, `scope`, `unscoped`, `alias`, `fields`, or `path_case`. The agent never sees a title (DESIGN.md §5.1), so a drafted title template would be a guess. On a shared origin, the host copies the scope of the origin's existing scoped adapter into the draft. If the origin has several scoped adapters and their scopes differ, or none, the draft is rejected, and the user can write the adapter by hand.
-- Every rule must have at least one literal segment before its first capture, and its ID must use at least one capture whose type is not an alternation.
+- A drafter's output may not use `title`, `scope`, `unscoped`, `alias`, `fields`, or `path_case`. Neither drafter sees a title (DESIGN.md §5.1), so a drafted title template would be a guess. On a shared origin, the host supplies scope. It turns the tenant position recorded in the shared-origin list (§6) into a capture with the recorded name, and the ID includes it. When the origin's existing scoped adapters all scope that capture name to the same values, the host copies that scope; otherwise scope is pending. A draft with pending scope cannot be enabled until the user chooses a scope or `unscoped` in the review (DESIGN.md §5.1). That choice, and a title entry the user adds in the review, are part of drafting, not user edits: the rules stay drafts and keep every check in this section.
+- Every rule must have at least one literal segment before its first **identifier capture**, and its ID must use at least one identifier capture. An identifier capture is a capture of type `int`, `hex`, `uuid`, `jira_key`, or `token`. A `name` capture, such as the host-supplied tenant or a namespace like a GitHub repository, is not an identifier, and neither is a capture of an alternation. This is stricter than §4.1: a fixed-shape capture or an alternation anchors a hand-written adapter but not a draft, because a draft's inputs are page-controlled. Checks apply per rule: a rule that fails is dropped with a reason, and the draft fails only when no rule is left. A rule the user edits becomes user-written and is held to §4.1 through §9 only.
 - `{*}` may not directly follow the first segment. (A rule of literals, `{*}`, and `absent` conditions alone already fails validation, because every rule must bind the ID's captures, §8.1.)
-- The host still rejects drafts that match the origin root or any probe URL, and still shows the match preview before the native confirmation.
+- The host drops each rule that matches the origin root or any probe URL, and still shows the match preview before the native confirmation. A rule whose only identifier capture is a `token` starts unchecked in the review (DESIGN.md §5.1).
 
-The instruction to the agent includes this specification's grammar, and the host parses the draft with the same parser as any config. A draft that does not parse is discarded without being shown.
+The instruction to the agent includes this specification's grammar, and the host parses every draft, from either drafter, with the same parser as any config. A draft that does not parse is discarded without being shown.
 
 ## 11. Starter adapters
 
@@ -387,7 +389,8 @@ id     = "github.pr:{host}/{owner}/{repo}/{number}"
 title  = "{title} by {~} · Pull Request #{number:int} · {owner:name}/{repo:name} · GitHub"
 refs   = [{ type = "jira.issue", find = "jira_key" }]
 
-# Notion: ID at the end of a slugged segment; scoped to a workspace.
+# Notion: ID at the end of a slugged segment; scoped to a workspace. No literal segment:
+# the fixed-shape hex(32) capture is the anchor (§4.1).
 [[artifacts]]
 type   = "notion.page"
 origin = "https://www.notion.so"
@@ -432,6 +435,8 @@ Every sample on the page is also a shared test vector (§12). CI fails when a st
 - **Bounds tests.** Inputs at every cap (2048-character URL, 64 segments, 512-character title, longest type values) complete within a fixed time budget in both engines.
 - **Title lists.** The first matching entry wins, a list of more than 4 is a validation error, an invalid entry fails validation even when an earlier entry is valid, and a prefixed and an unprefixed title of one artifact give the same title.
 - **Adapter documentation.** Each starter adapter has its page, and every sample on it is a vector (§11.1).
+- **Anchors.** The §11 Notion adapter validates; `/{a:name}/{b:token}`, `/{n:int}`, `/{k:jira_key}`, and `/{h:hex(8,40)}` fail with no anchor; `/{h:hex(16)}`, `/{h:hex(32,40)}`, and `/{a:name}/{t?:(tasks)}` fail because the only candidate anchor is too short, variable, or optional; `/{u:uuid}`, `/{h:hex(32)}`, `/{h:hex(32)@tail}`, and `/{m:(edit|view)}/{n:int}` validate; a draft rule whose only anchor is a fixed-shape capture is dropped while the draft's other rules survive (§10.4); and a draft on a shared origin with pending scope cannot be enabled, but choosing scope leaves it a draft.
+- **Drafts.** `/{owner:name|lower}/{repo:name}/pull/{n:int}` passes the draft rules on `github.com`, because `name` captures are not identifiers and `pull` comes before `{n}`. `/(issues|pulls)/{n:int}` and `/{d:token}/{n:int}` are dropped, with no literal before the first identifier. A rule whose ID uses only `name` captures is dropped. A draft that copies an existing scope keys it by the shared-origin list's capture name, and a pending scope blocks enabling without making the rule user-written.
 - **Scope tests.** For each shared origin: a URL outside the scope, a case variant of a scoped value, and a scoped capture missing from one rule (a validation error).
 
 ## 13. Open questions
@@ -449,3 +454,4 @@ Every sample on the page is also a shared test vector (§12). CI fails when a st
 - **§6.2** — Add that an `id` template change is a migration (§8.2).
 - **§12.2 step 6.2** (now split into step 6.2, the engine, and step 6.3, config and lease) — Replace the regex tests (pathological pattern, nested quantifier, two-engine conformance corpus) with §12 of this specification.
 - **§14** — Record the decision: adapter templates replace regular expressions in format version 1, with no raw-regex escape hatch.
+- **Amendment, 2026-09-28** — Record that required fixed-shape captures (`uuid`, `hex` of exact length 32 or more) anchor a template (§4.1); that drafts come from the Create adapter flow as well as the agent, with per-rule checks, identifier captures, and host-supplied scope from tenant positions now recorded in the shared-origin list (§6, §10.4); and that the §12 anchor tests cover these cases. DESIGN.md §5.1, §5.7, §8, §12.2 steps 7.6 and 7.7, and §14 are updated.
