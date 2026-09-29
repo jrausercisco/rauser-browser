@@ -123,6 +123,7 @@ function install({ sites = [SITE], grants = [], storage = {}, host = {}, workerS
         return { type: "config_confirmed", consent_token: "consent", summary: "summary" };
       case "update_config":
         state.config = request.config;
+        state.configIssue = null;
         state.revision += 1;
         return { type: "config_updated", revision: String(state.revision), config: state.config };
       default:
@@ -325,7 +326,7 @@ test("the panel's recorded notes origins survive until Chrome drops the grant", 
 
 const FOLDER_ISSUE = "The selected notes folder is unavailable or changed. Choose it again.";
 
-test("a kept config with a folder issue needs a new folder pick before any save", async () => {
+test("a kept config with a folder issue needs a new folder pick, which repairs it", async () => {
   const state = install({ grants: ["webNavigation", PATTERN] });
   state.configIssue = FOLDER_ISSUE;
   await openSettings();
@@ -339,8 +340,29 @@ test("a kept config with a folder issue needs a new folder pick before any save"
   assert.equal(env.elements.get("enable-site").disabled, true);
 
   env.elements.get("choose-folder").click();
-  await until(() => statusText().startsWith("Folder selected") && idle(), "the folder pick");
-  await until(() => !env.elements.get("enable-site").disabled, "Enable after the folder pick");
+  await until(() => state.config.storage?.root === "/vault" && idle(), "the repair to be saved");
+  assert.match(statusText(), /^Capture is enabled for the listed sites/);
+  assert.deepEqual(state.config.sites, [SITE]);
+  await until(() => !env.elements.get("enable-site").disabled, "Enable after the repair");
+});
+
+test("choosing a folder saves it at once, leaving sites and capture as they were", async () => {
+  const saves = [];
+  const state = install({
+    sites: [],
+    host: { update_config: (request) => { saves.push(request); return null; } },
+  });
+  state.config = { ...state.config, storage: null };
+  await openSettings();
+  env.elements.get("choose-folder").click();
+  await until(() => state.config.storage?.root === "/vault" && idle(), "the folder to be saved");
+  assert.equal(saves.length, 1);
+  assert.equal(saves[0].picker_token, "picker-1");
+  assert.equal(saves[0].consent_token, "consent");
+  assert.equal(state.config.capture_enabled, false);
+  assert.deepEqual(state.config.sites, []);
+  assert.equal(env.elements.get("folder-path").textContent, "/vault");
+  assert.match(statusText(), /^No sites are enabled for capture\. Enable a site to begin\./);
 });
 
 test("a canceled repair still rolls back the Chrome grants it added", async () => {
@@ -353,7 +375,8 @@ test("a canceled repair still rolls back the Chrome grants it added", async () =
   state.configIssue = FOLDER_ISSUE;
   await openSettings();
   env.elements.get("choose-folder").click();
-  await until(() => statusText().startsWith("Folder selected") && idle(), "the folder pick");
+  // The declined repair keeps the selection for the site's own confirmation.
+  await until(() => statusText().startsWith("Canceled. /vault was not saved") && idle(), "the folder pick");
   await typeSite("https://b.com");
   env.elements.get("enable-site").click();
   await until(() => statusText().startsWith("Setup failed") && idle(), "the canceled setup");
@@ -366,7 +389,12 @@ test("a host restart drops a folder selection only the old host knew", async () 
   const state = install({
     sites: [],
     host: {
-      update_config: (request, current) => request.picker_token !== `picker-${current.connects}`
+      // The first folder save is declined, so the selection stays on the page.
+      confirm_config: (_request, current) => current.connects === 1
+        ? { type: "error", code: "cancelled", message: "The user canceled" }
+        : null,
+      update_config: (request, current) =>
+        request.picker_token !== null && request.picker_token !== `picker-${current.connects}`
         ? { type: "error", code: "unauthorized", message: "folder selection token is unknown" }
         : null,
     },
@@ -374,7 +402,7 @@ test("a host restart drops a folder selection only the old host knew", async () 
   state.config = { ...state.config, storage: null };
   await openSettings();
   env.elements.get("choose-folder").click();
-  await until(() => statusText().startsWith("Folder selected") && idle(), "the folder pick");
+  await until(() => statusText().startsWith("Canceled. /vault was not saved") && idle(), "the folder pick");
   await typeSite("https://a.com");
 
   state.exitHost();
@@ -383,7 +411,7 @@ test("a host restart drops a folder selection only the old host knew", async () 
   assert.equal(env.elements.get("enable-site").disabled, true);
 
   env.elements.get("choose-folder").click();
-  await until(() => statusText().startsWith("Folder selected") && idle(), "the second folder pick");
+  await until(() => state.config.storage?.root === "/vault" && idle(), "the second folder pick to be saved");
   await until(() => !env.elements.get("enable-site").disabled, "Enable after the second pick");
   env.elements.get("enable-site").click();
   await until(() => statusText().startsWith("Capture enabled") && idle(), "setup to finish");
