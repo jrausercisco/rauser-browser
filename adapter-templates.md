@@ -234,6 +234,7 @@ id_literal  = ( lower | digit | "." | "_" | "-" ) , { lower | digit | "." | "_" 
 - `{host}` is the adapter origin's host, lowercased, with the port appended as `:port` only when it is not the scheme's default.
 - Every `{name}` must be a capture that **every** rule of the adapter binds, and never an optional capture. Every rule must bind exactly the captures the ID uses, plus optionally `mode` and scoped captures; any other named capture is a validation error. Use `{_}` for segments that are matched but not used.
 - A built ID is at most 512 bytes.
+- The scheme `web` and the adapter type `web.page` are reserved for Brauser's own IDs for pages no adapter recognizes (`web:<host>/<url_id>`, DESIGN.md §6.2). A template using either is a validation error.
 
 Because no capture type admits `/` or `:`, an `artifact_id` splits back into its parts unambiguously.
 
