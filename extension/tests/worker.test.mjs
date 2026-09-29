@@ -18,6 +18,9 @@ let onMessage;
 let onCommitted;
 let onHistoryStateUpdated;
 let onTabUpdated;
+let onAlarm;
+let onStartup;
+const alarms = new Map();
 // Every native port the code under test opened, newest last.
 const ports = [];
 
@@ -52,7 +55,13 @@ globalThis.chrome = {
     getURL: (path) => `chrome-extension://test-extension/${path}`,
     onMessage: { addListener(listener) { onMessage = listener; } },
     onInstalled: { addListener() {} },
+    onStartup: { addListener(listener) { onStartup = listener; } },
     connectNative: () => fakePort(),
+  },
+  alarms: {
+    async create(name, info) { alarms.set(name, { name, ...info }); },
+    async get(name) { return alarms.get(name); },
+    onAlarm: { addListener(listener) { onAlarm = listener; } },
   },
   commands: { onCommand: { addListener() {} } },
   contextMenus: {
@@ -733,4 +742,214 @@ test("host config shape requires every v4 privacy and agent key", () => {
     delete without[key];
     assert.equal(isResponseShape(without), false, key);
   }
+});
+
+// --- Background sync: the worker, not the panel, starts the host -----------
+
+const { BINARY_NAME } = await import("../dist/brand.js");
+const SYNC_ALARM = `${BINARY_NAME}-sync`;
+const DELIVER_ALARM = `${BINARY_NAME}-deliver`;
+const HOUR_MS = 60 * 60_000;
+
+async function until(check, label) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const value = await check();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
+const sentOn = (port, count) => until(() => port.sent.length >= count && port.sent[count - 1], `host request ${count}`);
+
+function recorded(request, outcome = "persisted", reason = null) {
+  return {
+    type: "visit_recorded", protocol_version: PROTOCOL_VERSION, request_id: request.request_id,
+    event_id: request.event.event_id, outcome, reason, relative_path: outcome === "persisted" ? "log/day.md" : null,
+  };
+}
+
+function configResult(request, origin, overrides = {}) {
+  return {
+    type: "config_result", protocol_version: PROTOCOL_VERSION, request_id: request.request_id,
+    revision: "host-revision",
+    config: {
+      storage: {
+        root: "/notes", profile: "neutral", log_dir: "log", pages_dir: "pages", later_dir: "later",
+        summaries_dir: null,
+      },
+      capture_enabled: true, sites: [{ origin, path_prefix: "/" }], strip_params: [], near_repeat_secs: 300,
+      agent_denylist: [], agent_denylist_confirmed: false, log_incognito: false, agent: null,
+    },
+    config_issue: null,
+    agent_status: { state: "not_set_up", harness_version: null, message: "Set up" },
+    ...overrides,
+  };
+}
+
+function resetSync(origin, expiresIn) {
+  values.clear();
+  grants.clear();
+  tabs.clear();
+  alarms.clear();
+  ports.length = 0;
+  grants.set(exactPattern(origin), true);
+  values.set(storageKey("policy_v1"), { ...lease(origin), expires_at: Date.now() + expiresIn });
+}
+
+function exactPattern(origin) {
+  return `${origin}:443/*`;
+}
+
+function queueWith(...items) {
+  values.set(storageKey("queue_v1"), {
+    version: 1, items, overflow_count: 0, rejected_count: 0, last_error: null, retry_error: null,
+  });
+}
+
+test("the worker registers its periodic sync alarm and syncs on browser startup", () => {
+  assert.equal(typeof onAlarm, "function");
+  assert.equal(typeof onStartup, "function");
+});
+
+test("with no extension page open, the worker delivers a captured visit itself", async () => {
+  const origin = "https://background.example";
+  resetSync(origin, 2 * HOUR_MS);
+  tabs.set(9, { id: 9, url: `${origin}/issue`, title: "Issue", incognito: false });
+  onCommitted({
+    tabId: 9, frameId: 0, documentId: "doc-bg", documentLifecycle: "active",
+    url: `${origin}/issue`, timeStamp: Date.now(),
+  });
+  await flush();
+  assert.ok(alarms.has(DELIVER_ALARM), "a capture schedules a delivery");
+  assert.equal(ports.length, 0, "the title grace period passes before any host starts");
+
+  const queue = values.get(storageKey("queue_v1"));
+  queue.items[0].retry_after = 0;
+  values.set(storageKey("queue_v1"), queue);
+  onAlarm({ name: DELIVER_ALARM });
+  const port = await until(() => ports[0], "the worker to start the host");
+  const request = await sentOn(port, 1);
+  assert.equal(request.type, "record_visit");
+  assert.equal(request.event.url, `${origin}/issue`);
+  port.reply(recorded(request));
+  await until(() => values.get(storageKey("queue_v1")).items.length === 0, "the queue to drain");
+  await until(() => port.closed, "the host connection to close");
+  assert.equal((await send({ kind: "get_status" })).host_error, null);
+});
+
+test("the worker leaves the host alone when there is nothing to send or renew", async () => {
+  const origin = "https://idle.example";
+  resetSync(origin, 2 * HOUR_MS);
+  onAlarm({ name: SYNC_ALARM });
+  await send({ kind: "sync_now" });
+  assert.equal(ports.length, 0);
+});
+
+test("the worker renews a lease near expiry from the host config", async () => {
+  const origin = "https://renew.example";
+  resetSync(origin, 60_000);
+  onAlarm({ name: SYNC_ALARM });
+  const port = await until(() => ports[0], "the worker to start the host");
+  const request = await sentOn(port, 1);
+  assert.equal(request.type, "get_config");
+  port.reply(configResult(request, origin));
+  const renewed = await until(() => {
+    const policy = values.get(storageKey("policy_v1"));
+    return policy.expires_at > Date.now() + 23 * HOUR_MS && policy;
+  }, "a renewed lease");
+  assert.deepEqual(renewed.sites, [{ origin, path_prefix: "/" }]);
+  await until(() => port.closed, "the host connection to close");
+});
+
+test("a renewal that finds a host config issue suspends capture but keeps visits", async () => {
+  const origin = "https://issue.example";
+  resetSync(origin, 60_000);
+  queueWith({ ...visit("kept", `${origin}/a`), retry_after: Date.now() + HOUR_MS });
+  onAlarm({ name: SYNC_ALARM });
+  const port = await until(() => ports[0], "the worker to start the host");
+  port.reply(configResult(await sentOn(port, 1), origin, { config_issue: "config.toml is newer" }));
+  await until(() => values.get(storageKey("policy_v1")) === null, "the lease to be suspended");
+  assert.equal(values.get(storageKey("queue_v1")).items.length, 1);
+});
+
+test("a host that cannot start is reported, and visits wait to retry", async () => {
+  const origin = "https://down.example";
+  resetSync(origin, 60_000);
+  queueWith(visit("waiting", `${origin}/a`));
+  onAlarm({ name: SYNC_ALARM });
+  const first = await until(() => ports[0], "the worker to start the host");
+  await sentOn(first, 1);
+  first.drop();
+  // The lease is still valid, so delivery is tried on a fresh host process.
+  const second = await until(() => ports[1], "a second host process");
+  await sentOn(second, 1);
+  second.drop();
+  const status = await until(async () => {
+    const current = await send({ kind: "get_status" });
+    return current.host_error && current;
+  }, "the host error");
+  assert.match(status.host_error, /disconnected/i);
+  assert.equal(status.queued, 1);
+  const [item] = values.get(storageKey("queue_v1")).items;
+  assert.equal(item.attempts, 1);
+  assert.ok(item.retry_after > Date.now(), "the failed visit backs off");
+  assert.match(status.retry_error, /disconnected/i);
+});
+
+test("a delivery the host never answers is reported even when no renewal was due", async () => {
+  const origin = "https://gone.example";
+  resetSync(origin, 12 * HOUR_MS);
+  queueWith(visit("unsent", `${origin}/a`));
+  onAlarm({ name: SYNC_ALARM });
+  const port = await until(() => ports[0], "the worker to start the host");
+  assert.equal((await sentOn(port, 1)).type, "record_visit");
+  port.drop();
+  const status = await until(async () => {
+    const current = await send({ kind: "get_status" });
+    return current.host_error && current;
+  }, "the host error");
+  // Joining the sync lets it finish before the next test starts one.
+  await send({ kind: "sync_now" });
+  assert.match(status.host_error, /disconnected/i);
+  assert.equal(ports.length, 1, "no renewal was due, so only delivery started the host");
+});
+
+test("after the lease lapsed, browsing sites that are not enabled starts no host", async () => {
+  const origin = "https://enabled.example";
+  resetSync(origin, -1_000);
+  tabs.set(12, { id: 12, url: "https://elsewhere.example/", title: "Elsewhere", incognito: false });
+  onCommitted({
+    tabId: 12, frameId: 0, documentId: "doc-elsewhere", documentLifecycle: "active",
+    url: "https://elsewhere.example/", timeStamp: Date.now(),
+  });
+  await flush();
+  assert.equal(ports.length, 0);
+});
+
+test("after the lease lapsed, the first navigation renews it and is still captured", async () => {
+  const origin = "https://morning.example";
+  resetSync(origin, -1_000);
+  tabs.set(11, { id: 11, url: `${origin}/first`, title: "First", incognito: false });
+  onCommitted({
+    tabId: 11, frameId: 0, documentId: "doc-morning", documentLifecycle: "active",
+    url: `${origin}/first`, timeStamp: Date.now(),
+  });
+  const port = await until(() => ports[0], "the worker to start the host");
+  const request = await sentOn(port, 1);
+  assert.equal(request.type, "get_config");
+  port.reply(configResult(request, origin));
+  await until(() => values.get(storageKey("queue_v1"))?.items.length === 1, "the visit to be buffered");
+  assert.equal(values.get(storageKey("queue_v1")).items[0].event.url, `${origin}/first`);
+});
+
+test("the panel's send-now request waits for the worker's delivery", async () => {
+  const origin = "https://now.example";
+  resetSync(origin, 2 * HOUR_MS);
+  queueWith(visit("now", `${origin}/a`));
+  const answered = send({ kind: "sync_now" });
+  const port = await until(() => ports[0], "the worker to start the host");
+  port.reply(recorded(await sentOn(port, 1)));
+  const status = await answered;
+  assert.equal(status.queued, 0);
 });

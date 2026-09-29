@@ -1,4 +1,4 @@
-import type { VisitEvent } from "../protocol/ts/generated.js";
+import type { VisitEvent, VisitOutcome } from "../protocol/ts/generated.js";
 import {
   MAX_QUEUE_BYTES,
   MAX_QUEUED_VISITS,
@@ -19,6 +19,9 @@ import {
   type WorkerStatus,
 } from "./model.js";
 import { APP_NAME, BINARY_NAME, storageKey } from "./brand.js";
+import { withLatestHostState } from "./coordination.js";
+import { HostClient, PROTOCOL_VERSION, newRequestId } from "./native.js";
+import { leaseFor, withConfigMutationLock } from "./settings.js";
 
 const QUEUE_KEY = storageKey("queue_v1");
 const POLICY_KEY = POLICY_STORAGE_KEY;
@@ -26,6 +29,7 @@ const REVOCATIONS_KEY = storageKey("revocations_v1");
 const PAUSE_KEY = storageKey("pause_pending_v1");
 const PAUSE_TOKEN_KEY = storageKey("pause_token_v1");
 const REMOVED_SITES_KEY = storageKey("locally_removed_sites_v1");
+const HOST_ERROR_KEY = storageKey("host_error_v1");
 // Matches MAX_URL_BYTES in host/src/capture.rs, so the host never rejects a
 // visit the worker chose to buffer.
 const MAX_VISIT_URL_BYTES = 8_192;
@@ -34,6 +38,16 @@ const DEDUPE_WINDOW_MS = 2_000;
 // Hold a new visit briefly so tabs.onUpdated can supply its title before an
 // open panel sends, and thereby freezes, the event.
 const TITLE_GRACE_MS = 3_000;
+// The worker, not the panel, starts the host to deliver visits and renew the
+// policy lease, so capture keeps working while no extension page is open.
+// The alarm wakes the worker to retry deliveries and renew the lease in time.
+const SYNC_ALARM = `${BINARY_NAME}-sync`;
+const SYNC_PERIOD_MINUTES = 5;
+// A one-shot sync soon after a capture. Chrome runs alarms no sooner than 30
+// seconds out, which also covers the title grace period.
+const DELIVER_ALARM = `${BINARY_NAME}-deliver`;
+const DELIVER_DELAY_MINUTES = 0.5;
+const LEASE_RENEW_WINDOW_MS = 60 * 60_000;
 const encoder = new TextEncoder();
 
 let storageReady: Promise<void> | null = null;
@@ -263,32 +277,33 @@ function withoutHash(rawUrl: string): string | null {
   }
 }
 
+/** Buffer a qualifying navigation; true when a visit joined the queue. */
 async function captureNavigation(
   details: ChromeNavigationDetails,
   useCurrentTitle: boolean,
-): Promise<void> {
+): Promise<boolean> {
   if (details.frameId !== 0 || details.documentLifecycle !== "active" || details.tabId < 0) {
-    return;
+    return false;
   }
   await ensureTrustedStorage();
   // Most navigations are for sites the user never enabled. Check the cached
   // lease first so they cost one storage read, not a full grant reconcile.
   const cached = await readPolicy();
-  if (!cached || !matchingSite(cached, details.url)) return;
+  if (!cached || !matchingSite(cached, details.url)) return false;
   const lease = await reconcileGrants();
-  if (!lease || !matchingSite(lease, details.url)) return;
-  if (encoder.encode(details.url).length > MAX_VISIT_URL_BYTES) return;
+  if (!lease || !matchingSite(lease, details.url)) return false;
+  if (encoder.encode(details.url).length > MAX_VISIT_URL_BYTES) return false;
 
   let tab: ChromeTab;
   try {
     tab = await chrome.tabs.get(details.tabId);
   } catch {
-    return;
+    return false;
   }
-  if (tab.incognito !== false) return;
+  if (tab.incognito !== false) return false;
 
   const visitedAt = new Date(details.timeStamp);
-  if (!Number.isFinite(visitedAt.getTime())) return;
+  if (!Number.isFinite(visitedAt.getTime())) return false;
   const occurred_at = localTimestamp(visitedAt);
   // At commit, the tab still shows the previous document's title. The title
   // arrives later through tabs.onUpdated. A same-document history update
@@ -312,7 +327,7 @@ async function captureNavigation(
   };
   const queue = await readQueue();
   const key = dedupeKey(details);
-  if (queue.items.some((item) => item.dedupe_key === key)) return;
+  if (queue.items.some((item) => item.dedupe_key === key)) return false;
   const item: QueuedVisit = {
     event,
     dedupe_key: key,
@@ -333,6 +348,7 @@ async function captureNavigation(
     queue.items = nextItems;
   }
   await writeQueue(queue);
+  return true;
 }
 
 async function patchTitle(tabId: number, rawTitle: string, tab: ChromeTab): Promise<void> {
@@ -422,7 +438,179 @@ async function currentStatus(
     pause_token: await readPauseToken(),
     navigation_ready: navigationReady,
     locally_removed_sites: await readLocallyRemovedSites(),
+    host_error: await readHostError(),
   };
+}
+
+/** The visits ready to send now, frozen so no later title patch changes them. */
+async function takeReady(): Promise<QueuedVisit[]> {
+  const lease = await reconcileGrants();
+  if (!lease || lease.expires_at <= Date.now() || !lease.capture_enabled) return [];
+  const queue = await readQueue();
+  const ready = queue.items.filter(
+    (item) =>
+      item.retry_after <= Date.now() && matchingSite(lease, item.event.url) !== null,
+  );
+  // Freeze these events before they are sent to the host.
+  if (ready.some((item) => item.dispatched !== true)) {
+    for (const item of ready) item.dispatched = true;
+    await writeQueue(queue);
+  }
+  return ready;
+}
+
+async function ackVisit(
+  eventId: string,
+  outcome: VisitOutcome,
+  reason: string | null,
+): Promise<WorkerStatus> {
+  const queue = await readQueue();
+  const item = queue.items.find((entry) => entry.event.event_id === eventId);
+  if (!item) return currentStatus(null, queue);
+  if (outcome === "retryable") {
+    item.attempts += 1;
+    item.retry_after = Date.now() + Math.min(60 * 60_000, 5_000 * 2 ** Math.min(item.attempts, 10));
+    queue.retry_error = reason ?? "The host could not save this visit yet";
+  } else {
+    queue.items = queue.items.filter((entry) => entry.event.event_id !== eventId);
+    if (outcome === "rejected") {
+      queue.rejected_count += 1;
+      queue.last_error = reason ?? "A visit was rejected by host policy";
+    }
+    // last_error holds purge, overflow, and rejection notices. Only the
+    // user dismisses those; retry_error lapses with the last retrying visit.
+    if (!queue.items.some((entry) => entry.attempts > 0)) queue.retry_error = null;
+  }
+  await writeQueue(queue);
+  return currentStatus(null, queue);
+}
+
+async function suspendPolicy(): Promise<WorkerStatus> {
+  // A repairable host config issue is not a user revocation. Remove the
+  // capture lease immediately, but leave queued visits and an explicit
+  // local pause untouched until a valid host policy can reconcile them.
+  await chrome.storage.local.set({ [POLICY_KEY]: null });
+  await reconcileGrants();
+  return currentStatus();
+}
+
+// --- Background sync with the host -----------------------------------------
+// Everything below runs outside `serialize`, because it waits on the host and
+// on the config lock; each storage step inside it is serialized on its own.
+
+interface SyncNeeds {
+  renew: boolean;
+  deliver: boolean;
+}
+
+async function syncNeeds(): Promise<SyncNeeds> {
+  const lease = await readPolicy();
+  if (!lease || !lease.capture_enabled || await pausePending()) {
+    return { renew: false, deliver: false };
+  }
+  const now = Date.now();
+  const renew = lease.expires_at - now <= LEASE_RENEW_WINDOW_MS;
+  const queue = await readQueue();
+  const deliver = queue.items.some((item) => item.retry_after <= now);
+  return { renew, deliver };
+}
+
+/** Whether this URL would be captured but for an expired lease. */
+async function leaseExpiredFor(url: string): Promise<boolean> {
+  const lease = await readPolicy();
+  if (!lease || !lease.capture_enabled || lease.expires_at > Date.now()) return false;
+  // matchingSite refuses every URL once the lease lapses, so ask it as if
+  // the lease were still current.
+  if (!matchingSite({ ...lease, expires_at: Infinity }, url)) return false;
+  return !await pausePending();
+}
+
+/** Read the host config and publish it as the lease, as a page's reload does. */
+async function renewPolicy(host: HostClient): Promise<void> {
+  await withLatestHostState(
+    withConfigMutationLock,
+    () => host.call({
+      type: "get_config", protocol_version: PROTOCOL_VERSION, request_id: newRequestId(),
+    }, "config_result"),
+    async (response) => {
+      const config = response.config;
+      if (response.config_issue || (!config.storage && config.capture_enabled)) {
+        await serialize(suspendPolicy);
+        return;
+      }
+      await serialize(() => installPolicy(
+        leaseFor(config, response.revision), !config.capture_enabled, null));
+    },
+  );
+}
+
+/** Send due visits; returns why the host could not be reached, if it could not. */
+async function deliverPending(host: HostClient): Promise<string | null> {
+  for (let processed = 0; processed < MAX_QUEUED_VISITS; processed += 1) {
+    // Re-read eligibility before each send so a site removal or Chrome grant
+    // revocation cannot keep draining a stale pending snapshot.
+    const [item] = await serialize(takeReady);
+    if (!item) return null;
+    let outcome: VisitOutcome;
+    let reason: string | null;
+    let failure: string | null = null;
+    try {
+      const response = await host.call({
+        type: "record_visit",
+        protocol_version: PROTOCOL_VERSION,
+        request_id: newRequestId(),
+        event: item.event,
+      }, "visit_recorded");
+      if (response.event_id !== item.event.event_id) {
+        throw new Error("Host acknowledged a different visit ID");
+      }
+      outcome = response.outcome;
+      reason = response.reason;
+    } catch (error) {
+      outcome = "retryable";
+      reason = failure = describe(error);
+    }
+    await serialize(() => ackVisit(item.event.event_id, outcome, reason));
+    if (outcome === "retryable") return failure;
+  }
+  return null;
+}
+
+async function runSync(): Promise<void> {
+  await ensureTrustedStorage();
+  const needs = await serialize(syncNeeds);
+  if (!needs.renew && !needs.deliver) return;
+  // One host process per sync; it exits when this port closes.
+  const host = new HostClient();
+  let failure: string | null = null;
+  try {
+    // A failed renewal still leaves the current lease, if it has not
+    // expired, good enough to deliver under.
+    if (needs.renew) await renewPolicy(host).catch((error: unknown) => { failure = describe(error); });
+    const undelivered = await deliverPending(host);
+    failure ??= undelivered;
+  } catch (error) {
+    failure ??= describe(error);
+  } finally {
+    host.disconnect();
+    await chrome.storage.local.set({ [HOST_ERROR_KEY]: failure });
+  }
+}
+
+let syncing: Promise<void> | null = null;
+
+/** Start a sync, or join the one already running. Never rejects. */
+function syncWithHost(): Promise<void> {
+  syncing ??= runSync()
+    .catch((error: unknown) => console.warn(`${APP_NAME} host sync failed:`, describe(error)))
+    .finally(() => { syncing = null; });
+  return syncing;
+}
+
+async function readHostError(): Promise<string | null> {
+  const stored = await chrome.storage.local.get(HOST_ERROR_KEY);
+  const value = stored[HOST_ERROR_KEY];
+  return typeof value === "string" ? value : null;
 }
 
 async function handleMessage(message: WorkerRequest): Promise<unknown> {
@@ -433,12 +621,7 @@ async function handleMessage(message: WorkerRequest): Promise<unknown> {
       return installPolicy(message.lease, message.resume_after_confirmation,
         message.resume_after_pause_token);
     case "suspend_policy":
-      // A repairable host config issue is not a user revocation. Remove the
-      // capture lease immediately, but leave queued visits and an explicit
-      // local pause untouched until a valid host policy can reconcile them.
-      await chrome.storage.local.set({ [POLICY_KEY]: null });
-      await reconcileGrants();
-      return currentStatus();
+      return suspendPolicy();
     case "pause_capture": {
       const queue = await readQueue().catch(() => emptyQueue());
       queue.items = [];
@@ -481,43 +664,13 @@ async function handleMessage(message: WorkerRequest): Promise<unknown> {
       });
       return currentStatus(null, queue);
     }
-    case "get_pending": {
-      const lease = await reconcileGrants();
-      if (!lease || lease.expires_at <= Date.now() || !lease.capture_enabled) return [];
-      const queue = await readQueue();
-      const ready = queue.items.filter(
-        (item) =>
-          item.retry_after <= Date.now() && matchingSite(lease, item.event.url) !== null,
-      );
-      // Freeze these events before the panel can send them to the host.
-      if (ready.some((item) => item.dispatched !== true)) {
-        for (const item of ready) item.dispatched = true;
-        await writeQueue(queue);
-      }
-      return ready;
-    }
-    case "ack_visit": {
-      const queue = await readQueue();
-      const item = queue.items.find((entry) => entry.event.event_id === message.event_id);
-      if (!item) return currentStatus(null, queue);
-      if (message.outcome === "retryable") {
-        item.attempts += 1;
-        item.retry_after = Date.now() + Math.min(60 * 60_000, 5_000 * 2 ** Math.min(item.attempts, 10));
-        queue.retry_error = message.reason ?? "The host could not save this visit yet";
-      } else {
-        queue.items = queue.items.filter((entry) => entry.event.event_id !== message.event_id);
-        if (message.outcome === "rejected") {
-          queue.rejected_count += 1;
-          queue.last_error = message.reason ?? "A visit was rejected by host policy";
-        }
-        // last_error holds purge, overflow, and rejection notices. Only the
-        // user dismisses those; retry_error lapses with the last retrying visit.
-        if (!queue.items.some((entry) => entry.attempts > 0)) queue.retry_error = null;
-      }
-      await writeQueue(queue);
-      return currentStatus(null, queue);
-    }
+    case "get_pending":
+      return takeReady();
+    case "ack_visit":
+      return ackVisit(message.event_id, message.outcome, message.reason);
     case "get_status":
+    case "sync_now":
+      // sync_now is answered in the message listener, after the sync finishes.
       await reconcileGrants();
       return currentStatus();
     case "clear_notices": {
@@ -570,7 +723,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: false, value: null, error: "Unknown worker request" } satisfies WorkerReply<null>);
     return false;
   }
-  void serialize(() => handleMessage(message))
+  // A sync waits on the host and the config lock, so it must not hold the
+  // serialized chain that other messages and navigation capture share.
+  const before = message.kind === "sync_now" ? syncWithHost() : Promise.resolve();
+  void before.then(() => serialize(() => handleMessage(message)))
     .then((value) => sendResponse({ ok: true, value, error: null } satisfies WorkerReply<unknown>))
     .catch((error: unknown) =>
       sendResponse({ ok: false, value: null, error: describe(error) } satisfies WorkerReply<null>),
@@ -578,14 +734,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
+async function captureAndDeliver(details: ChromeNavigationDetails, useCurrentTitle: boolean): Promise<void> {
+  if (details.frameId !== 0 || details.documentLifecycle !== "active" || details.tabId < 0) return;
+  // After Chrome was closed past the lease, renew before capturing, so the
+  // first visits of the day are not dropped for want of a fresh lease.
+  const capture = async (): Promise<boolean | "expired"> => {
+    await ensureTrustedStorage();
+    return await leaseExpiredFor(details.url) ? "expired" : captureNavigation(details, useCurrentTitle);
+  };
+  let captured = await serialize(capture);
+  if (captured === "expired") {
+    await syncWithHost();
+    captured = await serialize(() => captureNavigation(details, useCurrentTitle));
+  }
+  if (!captured) return;
+  // Deliver after tabs.onUpdated has had time to supply the title. Keep an
+  // existing alarm, so steady browsing cannot keep pushing delivery back.
+  if (!await chrome.alarms.get(DELIVER_ALARM)) {
+    await chrome.alarms.create(DELIVER_ALARM, { delayInMinutes: DELIVER_DELAY_MINUTES });
+  }
+}
+
 const onCommitted = (details: ChromeNavigationDetails): void => {
-  void serialize(() => captureNavigation(details, false)).catch((error: unknown) => {
+  void captureAndDeliver(details, false).catch((error: unknown) => {
     console.warn(`${APP_NAME} navigation capture paused:`, describe(error));
   });
 };
 
 const onHistoryStateUpdated = (details: ChromeNavigationDetails): void => {
-  void serialize(() => captureNavigation(details, true)).catch((error: unknown) => {
+  void captureAndDeliver(details, true).catch((error: unknown) => {
     console.warn(`${APP_NAME} SPA capture paused:`, describe(error));
   });
 };
@@ -626,6 +803,18 @@ chrome.permissions.onRemoved.addListener(() => {
     console.warn(`${APP_NAME} permission reconciliation failed:`, describe(error));
   });
 });
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === SYNC_ALARM || alarm.name === DELIVER_ALARM) void syncWithHost();
+});
+
+chrome.runtime.onStartup.addListener(() => void syncWithHost());
+
+// Registering the alarm again would restart its period on every wake.
+void chrome.alarms.get(SYNC_ALARM).then(async (existing) => {
+  if (!existing) await chrome.alarms.create(SYNC_ALARM, { periodInMinutes: SYNC_PERIOD_MINUTES });
+})
+  .catch((error: unknown) => console.warn(`${APP_NAME} sync alarm setup failed:`, describe(error)));
 
 void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch((error: unknown) => {
   console.warn(`${APP_NAME} side panel setup failed:`, describe(error));
