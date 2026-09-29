@@ -1,6 +1,6 @@
 # Adapter Templates — Specification
 
-> Status: Draft for review · Replaced the regular-expression patterns in DESIGN.md §7.2 (DESIGN.md updated 2026-09-28; §14 below is applied) · Target: M1.5a, built in DESIGN.md §12.2 step 7.2 · Format version 1
+> Status: Draft for review · Replaced the regular-expression patterns in DESIGN.md §7.2 (DESIGN.md updated 2026-09-28; §14 below is applied) · Target: M1.5a, built in DESIGN.md §12.2 step 6.2 · Format version 1
 
 ## 1. Purpose
 
@@ -424,5 +424,5 @@ Known limits these examples show: Notion URLs with no workspace segment do not m
 - **§5.1 Aliases** — Title and meta aliases become suggested until confirmed or corroborated (§9.3).
 - **§4.1** — Replace the "Hostile adapter patterns" row: templates are linear by construction in both engines, captures cannot form paths or ambiguous IDs, and scope limits shared origins. Add a row for personal activity on shared origins, mitigated by scope and the unscoped acknowledgment.
 - **§6.2** — Add that an `id` template change is a migration (§8.2).
-- **§12.2 step 7.2** (now split into step 7.2, the engine, and step 7.3, config and lease) — Replace the regex tests (pathological pattern, nested quantifier, two-engine conformance corpus) with §12 of this specification.
+- **§12.2 step 6.2** (now split into step 6.2, the engine, and step 6.3, config and lease) — Replace the regex tests (pathological pattern, nested quantifier, two-engine conformance corpus) with §12 of this specification.
 - **§14** — Record the decision: adapter templates replace regular expressions in format version 1, with no raw-regex escape hatch.
