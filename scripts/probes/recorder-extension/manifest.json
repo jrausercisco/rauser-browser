@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "M1.5a probe recorder",
+  "version": "0.0.1",
+  "description": "Records the webNavigation, tabs, windows, and idle events Chrome delivers to a worker with Brauser's M1.5a permissions. Test-only; loaded by scripts/probe-m15a.mjs.",
+  "incognito": "not_allowed",
+  "permissions": ["webNavigation", "idle", "storage", "alarms", "activeTab", "contextMenus"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "worker.js", "type": "module" }
+}

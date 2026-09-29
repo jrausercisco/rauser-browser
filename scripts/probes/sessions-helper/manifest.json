@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "M1.5a probe sessions helper",
+  "version": "0.0.1",
+  "description": "Closes a tab and reopens it with chrome.sessions.restore for the discard-restore probe, so the recorder keeps Brauser's permissions. Test-only; loaded by scripts/probes/discard-restore.mjs.",
+  "incognito": "not_allowed",
+  "permissions": ["sessions", "tabs"],
+  "background": { "service_worker": "worker.js" }
+}
