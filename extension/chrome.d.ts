@@ -69,6 +69,12 @@ interface ChromeApi {
       ): void;
     };
     onInstalled: { addListener(listener: () => void): void };
+    onStartup: { addListener(listener: () => void): void };
+  };
+  alarms: {
+    create(name: string, info: { delayInMinutes?: number; periodInMinutes?: number }): Promise<void>;
+    get(name: string): Promise<{ name: string } | undefined>;
+    onAlarm: { addListener(listener: (alarm: { name: string }) => void): void };
   };
   sidePanel: {
     setPanelBehavior(options: { openPanelOnActionClick: boolean }): Promise<void>;

@@ -1282,19 +1282,21 @@ async function run() {
       return { files, rows: files.flatMap((file) => file.text.split("\n").filter((line) => line.startsWith("- "))) };
     };
 
-    await step("Allowed and blocked visit replay", async () => {
+    await step("The worker delivers allowed visits with the panel closed", async () => {
       await closePanel();
       await navigate(origin, allowed);
       await navigate(origin, blocked);
-      await openPanel();
-      await pendingVisitsCleared();
+      // The panel is closed, so the service worker starts the host itself
+      // from its delivery alarm, about 30 seconds after the capture.
       await waitFor(async () => {
         const { files, rows } = await logRows();
         requireCondition(rows.filter((line) => line.includes(`<${allowed}>`)).length === 1,
           "Expected exactly one allowed visit in the daily log");
         requireCondition(!files.some((file) => file.text.includes(blocked)),
           "Blocked-path visit appeared in the daily log");
-      });
+      }, { timeout: 120_000, interval: 1_000 });
+      await openPanel();
+      await pendingVisitsCleared();
     });
 
     await step("Panel reopen does not duplicate the visit", async () => {
