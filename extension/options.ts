@@ -98,7 +98,9 @@ function show(message: string, warning = false): void {
 function showConfigState(): void {
   const problem = setupProblem(session.config, session.configIssue);
   if (session.configIssue) show(problem!, true);
-  else if (problem) show(`${problem} Choose a folder and enable a site to begin.`);
+  else if (problem) {
+    show(`${problem} ${session.config?.storage ? "Enable" : "Choose a folder and enable"} a site to begin.`);
+  }
   else show("Capture is enabled for the listed sites.");
 }
 
@@ -378,22 +380,52 @@ async function refreshPreflight(): Promise<void> {
   }
 }
 
+/** The storage settings for a folder chosen through the native picker. */
+function storageFor(root: string, current: StorageConfig | null): StorageConfig {
+  return {
+    root,
+    profile: "neutral",
+    log_dir: current?.log_dir ?? "log",
+    pages_dir: current?.pages_dir ?? "pages",
+    later_dir: current?.later_dir ?? "later",
+    summaries_dir: current?.summaries_dir ?? null,
+  };
+}
+
 async function chooseFolder(): Promise<void> {
   busy = true;
   updateControls();
+  let selection: typeof picker = null;
   try {
     const response = await session.host.call({
       type: "choose_folder", protocol_version: PROTOCOL_VERSION, request_id: newRequestId(),
     }, "folder_chosen", 5 * 60_000);
-    picker = { path: response.path, token: response.picker_token };
+    selection = { path: response.path, token: response.picker_token };
+    picker = selection;
     folderPath.textContent = response.path;
     updateControls();
-    show(`Folder selected: ${response.path}. Enable a site to save it.`);
+    // Save the folder now, so setup is not lost with this page and the side
+    // panel stops asking for one. Sites and the capture switch stay as they are.
+    await withConfigMutationLock(() => session.saveConfig({
+      ...session.config!, storage: storageFor(response.path, session.config!.storage),
+    }, response.picker_token));
+    picker = null;
+    showConfigState();
   } catch (error) {
-    show(describe(error), true);
+    if (selection && picker === selection && error instanceof HostError && error.code === "cancelled") {
+      // A declined confirmation leaves the selection usable: the first site
+      // enabled on this page saves it, behind that site's own confirmation.
+      show(`Canceled. ${selection.path} was not saved; enabling a site saves it too.`);
+    } else {
+      show(describe(error), true);
+      if (error instanceof HostError && error.code === "conflict") {
+        picker = null;
+        await reloadConfig().catch(() => undefined);
+      }
+    }
   } finally {
     busy = false;
-    updateControls();
+    renderConfig();
   }
 }
 
@@ -475,14 +507,7 @@ function enableSite(): void {
         if (!stillGranted) throw new Error("Chrome access changed during setup; click Enable again");
         const config = session.config!;
         const storage: StorageConfig = selection
-          ? {
-              root: selection.path,
-              profile: "neutral",
-              log_dir: config.storage?.log_dir ?? "log",
-              pages_dir: config.storage?.pages_dir ?? "pages",
-              later_dir: config.storage?.later_dir ?? "later",
-              summaries_dir: config.storage?.summaries_dir ?? null,
-            }
+          ? storageFor(selection.path, config.storage)
           : { ...config.storage!, profile: "neutral" };
         const sites = config.sites.filter((site) => !sameSite(site, parsed.site));
         sites.push(parsed.site);

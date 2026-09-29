@@ -959,6 +959,14 @@ async function run() {
       text.includes("Turn on automatic visit logging."),
     `The confirmation does not describe the change: ${JSON.stringify(text)}`);
   }
+  // The confirmation for saving a newly chosen folder on its own.
+  async function answerFolderConfirmation(button) {
+    if (!options.headless) return answerAlert(button);
+    const text = await scriptedDialog("confirm", button === "Yes" ? "confirmed" : "canceled");
+    requireCondition(text.includes('Set visit log folder to "log".') &&
+      !text.includes("Allow visit logging") && !text.includes("Turn on automatic visit logging."),
+    `The folder confirmation does not describe only the folder: ${JSON.stringify(text)}`);
+  }
 
   // --headless: Chrome's permission prompt is browser UI that no command-line
   // switch or DevTools method can answer, so grant the access ahead of time
@@ -1131,7 +1139,7 @@ async function run() {
       await inSettings((page) => page.click("#choose-folder"));
       await userAction("In the macOS folder picker, click Cancel.", async () => {
         const status = await settingsStatus();
-        if (status?.startsWith("Folder selected")) {
+        if (await onSettings((page) => page.text("#folder-path")) !== "None selected") {
           throw Object.assign(new Error("A folder was chosen, but this step needs Cancel. Rerun the smoke test."), { fatal: true });
         }
         requireCondition(status?.startsWith("Canceled"), `Settings page says: ${status}`);
@@ -1150,7 +1158,7 @@ async function run() {
       // The clipboard is the user's; only a person choosing by hand needs it.
       if (!options.headless) await commandOutput("/bin/sh", ["-c", `printf %s ${shellQuote(notes)} | pbcopy`]);
       await inSettings((page) => page.click("#choose-folder"));
-      await userAction(`In the folder picker, choose any empty folder. The suggested one's path is on the clipboard: press Cmd+Shift+G, clear the box, paste, press Return, then click Open.\n  Path: ${notes}`,
+      await userAction(`In the folder picker, choose any empty folder. The suggested one's path is on the clipboard: press Cmd+Shift+G, clear the box, paste, press Return, then click Open. Then click No in ${APP_NAME}'s confirmation dialog.\n  Path: ${notes}`,
         () => onSettings(async (page) => {
           const shown = await page.text("#folder-path");
           requireCondition(shown && shown !== "None selected", "No folder is selected yet");
@@ -1159,9 +1167,18 @@ async function run() {
           if (entries.length) {
             throw Object.assign(new Error(`${chosen} is not empty; rerun and choose an empty folder`), { fatal: true });
           }
+          const status = await page.text("#status");
+          requireCondition(status?.startsWith("Canceled.") && status.includes("was not saved"),
+            `Settings page says: ${status}`);
           notesRoot = chosen;
-        }), () => pickFolder(notes));
+        }), async () => {
+          await pickFolder(notes);
+          await answerFolderConfirmation("No");
+        });
       console.log(`  Using notes folder ${notesRoot}`);
+      const declined = await hostConfig(wrapper);
+      requireCondition(declined.config.storage === null && !(await maybeLstat(configPath)),
+        "The folder was saved even though its confirmation was declined");
       await onSettings(async (page) => {
         await page.fill("#site-url", siteInput);
         await page.fill("#site-path", "/allowed");
@@ -1188,6 +1205,27 @@ async function run() {
       // correctly keeps it; site removal later must revoke it.
       requireCondition(!grants.origin && grants.api === options.headless,
         "Chrome access granted for the declined change was not removed");
+    });
+
+    await step("Choosing a folder saves it before any site", async () => {
+      await inSettings((page) => page.click("#choose-folder"));
+      await userAction(`In the folder picker, choose ${notesRoot} again, then click Yes in ${APP_NAME}'s confirmation dialog.`,
+        async () => {
+          const reply = await hostConfig(wrapper);
+          requireCondition(await sameFolder(reply.config.storage?.root),
+            `Expected ${notesRoot}; host has ${reply.config.storage?.root ?? "none"}`);
+          requireCondition(!reply.config.capture_enabled && reply.config.sites.length === 0,
+            "Saving the folder changed sites or the capture switch");
+          const status = await settingsStatus();
+          requireCondition(status?.startsWith("No sites are enabled for capture."), `Settings page says: ${status}`);
+        }, async () => {
+          await pickFolder(notesRoot);
+          await answerFolderConfirmation("Yes");
+        });
+      await waitFor(() => onPanel(async (page) => {
+        const reason = await page.text("#setup-reason");
+        requireCondition(reason === "No sites are enabled for capture.", `Setup warning says: ${reason}`);
+      }));
     });
 
     await step("Confirmed setup", async () => {
@@ -1642,7 +1680,7 @@ async function run() {
         const pids = (await commandOutput("/usr/bin/pgrep", ["-f", `${options.host} __dialog-`]).catch(() => ""))
           .split("\n").filter(Boolean);
         requireCondition(pids.length === 0, "A dialog process is still running");
-        requireCondition(dialogsShown === 10, `Expected ten scripted dialogs; answered ${dialogsShown}`);
+        requireCondition(dialogsShown === 13, `Expected thirteen scripted dialogs; answered ${dialogsShown}`);
         requireCondition(!(await maybeLstat(path.join(dialogs, "answer"))), "An unused scripted answer remains");
         await nothingOnScreen();
       });
