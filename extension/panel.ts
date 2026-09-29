@@ -1,9 +1,6 @@
-import type { VisitOutcome } from "../protocol/ts/generated.js";
 import {
-  MAX_QUEUED_VISITS,
   exactOriginPattern,
   isHttpUrl,
-  type QueuedVisit,
   type WorkerStatus,
 } from "./model.js";
 import { ConfigSession, describe, element, setupProblem, worker } from "./settings.js";
@@ -41,13 +38,12 @@ const copyUnsavedButton = element<HTMLButtonElement>("copy-unsaved");
 const session = new ConfigSession(render);
 let busy = false;
 let replaying = false;
-let renewing = false;
 let tickRunning = false;
 let closed = false;
-let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let reloadTimer: ReturnType<typeof setTimeout> | null = null;
-const RETRY_POLL_MS = 30_000;
-const LEASE_RENEW_WINDOW_MS = 60 * 60_000;
+// The worker delivers visits and renews its lease on its own; the panel only
+// polls to show the queue and to settle Chrome grant revocations.
+const STATUS_POLL_MS = 30_000;
 const NOTE_SAVE_DEBOUNCE_MS = 1_000;
 
 // --- Page area (§5.3, §5.7) --------------------------------------------------
@@ -68,7 +64,7 @@ function showNoteStatus(message: string, warning = false): void {
 }
 
 function changing(): boolean {
-  return busy || replaying || renewing || tickRunning;
+  return busy || replaying || tickRunning;
 }
 
 function updateControls(): void {
@@ -103,6 +99,7 @@ function renderQueue(state: WorkerStatus): void {
   if (state.rejected_count) messages.push(`${state.rejected_count} visits were rejected by host policy.`);
   if (state.last_error) messages.push(state.last_error);
   if (state.retry_error) messages.push(`Retrying: ${state.retry_error}`);
+  if (state.host_error) messages.push(`The native host could not be reached in the background: ${state.host_error}`);
   if (state.pause_pending && session.config?.capture_enabled) {
     messages.push("A local pause is active until the host confirms capture is off.");
   }
@@ -119,23 +116,8 @@ function renderQueue(state: WorkerStatus): void {
 
 function render(): void {
   renderSetupWarning();
-  if (session.status) {
-    renderQueue(session.status);
-    scheduleReplay(session.status);
-  }
+  if (session.status) renderQueue(session.status);
   updateControls();
-}
-
-function scheduleReplay(state: WorkerStatus): void {
-  if (retryTimer !== null) clearTimeout(retryTimer);
-  retryTimer = null;
-  if (closed || changing() || !session.config?.capture_enabled ||
-      state.pause_pending || state.next_retry_at === null) return;
-  const delay = Math.max(0, state.next_retry_at - Date.now());
-  retryTimer = setTimeout(() => {
-    retryTimer = null;
-    void replayVisits();
-  }, delay);
 }
 
 function openSettings(): void {
@@ -178,7 +160,6 @@ function scheduleReload(): void {
       .catch((error: unknown) => show(`Could not refresh settings: ${describe(error)}`, true))
       .finally(() => {
         busy = false;
-        if (session.status) scheduleReplay(session.status);
         updateControls();
         // A note that could not load before (say, no folder yet) may load now.
         void notes.retry();
@@ -186,63 +167,17 @@ function scheduleReload(): void {
   }, 250);
 }
 
+/** Ask the worker to send pending visits now instead of at its next sync. */
 async function replayVisits(): Promise<void> {
-  if (closed || changing() || !session.config?.capture_enabled || session.configIssue) return;
+  if (closed || changing()) return;
   replaying = true;
   updateControls();
   try {
-    for (let processed = 0; processed < MAX_QUEUED_VISITS; processed += 1) {
-      // Re-read eligibility before each send so a site removal or Chrome grant
-      // revocation cannot keep draining a stale pending snapshot.
-      const [item] = await worker<QueuedVisit[]>({ kind: "get_pending" });
-      if (!item) break;
-      let outcome: VisitOutcome;
-      let reason: string | null;
-      try {
-        const response = await session.host.call({
-          type: "record_visit",
-          protocol_version: PROTOCOL_VERSION,
-          request_id: newRequestId(),
-          event: item.event,
-        }, "visit_recorded");
-        if (response.event_id !== item.event.event_id) {
-          throw new Error("Host acknowledged a different visit ID");
-        }
-        outcome = response.outcome;
-        reason = response.reason;
-      } catch (error) {
-        outcome = "retryable";
-        reason = describe(error);
-      }
-      await worker<WorkerStatus>({
-        kind: "ack_visit", event_id: item.event.event_id, outcome, reason,
-      });
-      if (outcome === "retryable") break;
-    }
+    await worker<WorkerStatus>({ kind: "sync_now" });
   } catch (error) {
     show(`Visit replay stopped: ${describe(error)}`, true);
   } finally {
     replaying = false;
-    await session.refreshStatus().catch((error: unknown) => show(describe(error), true));
-    updateControls();
-  }
-}
-
-async function renewHostPolicy(): Promise<void> {
-  if (closed || busy || replaying || renewing || !session.config?.capture_enabled) return;
-  renewing = true;
-  updateControls();
-  try {
-    const response = await session.reload();
-    if (response.config_issue) {
-      show(response.config_issue, true);
-    } else if (!session.config!.capture_enabled) {
-      show("Capture is off in the host configuration.");
-    }
-  } catch (error) {
-    show(`Cannot renew the host policy lease: ${describe(error)}. Capture stops when the current lease expires.`, true);
-  } finally {
-    renewing = false;
     await session.refreshStatus().catch((error: unknown) => show(describe(error), true));
     updateControls();
   }
@@ -255,15 +190,10 @@ async function panelTick(): Promise<void> {
   try {
     const state = await session.refreshStatus();
     if (state.revoked_origins.length) await session.reconcileRevocations();
-    if (state.policy_expires_at !== null &&
-        state.policy_expires_at - Date.now() <= LEASE_RENEW_WINDOW_MS) {
-      await renewHostPolicy();
-    }
   } catch (error) {
     show(`Panel refresh failed: ${describe(error)}`, true);
   } finally {
     tickRunning = false;
-    if (session.status) scheduleReplay(session.status);
     updateControls();
   }
 }
@@ -464,11 +394,10 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
     void refreshActiveTab();
   }
 });
-const pollTimer = setInterval(() => void panelTick(), RETRY_POLL_MS);
+const pollTimer = setInterval(() => void panelTick(), STATUS_POLL_MS);
 window.addEventListener("pagehide", () => {
   closed = true;
   clearInterval(pollTimer);
-  if (retryTimer !== null) clearTimeout(retryTimer);
   if (reloadTimer !== null) clearTimeout(reloadTimer);
   // Best effort: MV3 gives no guarantee this completes before teardown.
   void notes.flush();
@@ -498,5 +427,6 @@ void (async () => {
     updateControls();
   }
   await refreshActiveTab();
+  // Opening the panel is a natural moment to catch up; the worker does it.
   if (initialized) await replayVisits();
 })();

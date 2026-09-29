@@ -53,6 +53,9 @@ export interface WorkerStatus {
   pause_token: string | null;
   navigation_ready: boolean;
   locally_removed_sites: SiteConfig[];
+  // Why the worker's last background exchange with the host failed, or null
+  // once one succeeds.
+  host_error: string | null;
 }
 
 export type WorkerRequest =
@@ -65,6 +68,7 @@ export type WorkerRequest =
   | { kind: "get_pending" }
   | { kind: "ack_visit"; event_id: string; outcome: VisitOutcome; reason: string | null }
   | { kind: "get_status" }
+  | { kind: "sync_now" }
   | { kind: "clear_notices" }
   | { kind: "ack_reenabled_origin"; origin: string; revision: string }
   | { kind: "ack_revocations"; origins: string[] };

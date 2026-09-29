@@ -5,7 +5,7 @@
   "description": "Private, local browsing notes. Development build; requires a registered {{APP_NAME}} native host.",
   "minimum_chrome_version": "116",
   "incognito": "not_allowed",
-  "permissions": ["sidePanel", "nativeMessaging", "storage", "activeTab", "contextMenus"],
+  "permissions": ["sidePanel", "nativeMessaging", "storage", "activeTab", "contextMenus", "alarms"],
   "optional_permissions": ["webNavigation"],
   "optional_host_permissions": ["http://*/*", "https://*/*"],
   "action": {
