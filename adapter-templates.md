@@ -1,6 +1,6 @@
 # Adapter Templates — Specification
 
-> Status: Draft for review · Replaced the regular-expression patterns in DESIGN.md §7.2 (DESIGN.md updated 2026-09-28; §14 below is applied) · Target: M1.5a, built in DESIGN.md §12.2 step 6.2 · Format version 1
+> Status: Accepted (2026-09-28) · Replaced the regular-expression patterns in DESIGN.md §7.2 (DESIGN.md updated 2026-09-28; §14 below is applied) · Target: M1.5a, built in DESIGN.md §12.2 step 6.2 · Format version 1
 
 ## 1. Purpose
 
@@ -51,7 +51,7 @@ match    = [                   # one or more rules, tried in order
   { path = "/jira/{*}", query = { selectedIssue = "{key:jira_key}" } },
 ]
 id       = "jira:{host}/{key}"
-title    = "[{key:jira_key}] {title} - Jira"      # optional
+title    = "[{key:jira_key}] {title} - Jira"      # optional; one template or a list (§9.1)
 alias    = { from = "tab_title", capture = "key" } # optional (§9)
 refs     = [{ type = "jira.issue", find = "jira_key" }] # optional (§8)
 modes    = { }                 # optional (§5.4)
@@ -234,6 +234,7 @@ id_literal  = ( lower | digit | "." | "_" | "-" ) , { lower | digit | "." | "_" 
 - `{host}` is the adapter origin's host, lowercased, with the port appended as `:port` only when it is not the scheme's default.
 - Every `{name}` must be a capture that **every** rule of the adapter binds, and never an optional capture. Every rule must bind exactly the captures the ID uses, plus optionally `mode` and scoped captures; any other named capture is a validation error. Use `{_}` for segments that are matched but not used.
 - A built ID is at most 512 bytes.
+- The scheme `web` and the adapter type `web.page` are reserved for Brauser's own IDs for pages no adapter recognizes (`web:<host>/<url_id>`, DESIGN.md §6.2). A template using either is a validation error.
 
 Because no capture type admits `/` or `:`, an `artifact_id` splits back into its parts unambiguously.
 
@@ -243,7 +244,7 @@ Because no capture type admits `/` or `:`, an `artifact_id` splits back into its
 
 - The `format` number versions this language. A future format may add types or segment kinds, but it never changes how an existing template in an older format builds an ID.
 - Changing the `id` template of an adapter that has recorded activity is a **migration**, not an edit. The host shows how many artifacts are affected, and on confirmation writes one `alias` event from each old ID to its new one (DESIGN.md §5.1), so no history, note, or summary is orphaned.
-- A starter adapter's ID template is frozen once it ships. The ID scheme alignment question in DESIGN.md §14 must be settled before the first starter adapters ship.
+- A starter adapter's ID template is frozen once it ships. Starter adapters use Brauser's own ID scheme, not another tool's (DESIGN.md §14).
 
 ## 9. Title templates
 
@@ -264,7 +265,15 @@ A title template has exactly one `{title}` placeholder, which splits it into a p
 
 Validation requires a literal between any two captures or skips, and between a capture or skip and `{title}`, so every capture is bounded by a literal. The literal that bounds a typed capture must not be swallowed by it: in `P`, the literal after a capture must start with a character outside the capture type's alphabet, and in `Q`, the literal before a capture must end with such a character. For example, `{key:jira_key}-…` is invalid, because `-` is in the `jira_key` alphabet.
 
-If the template does not match, Brauser records the whole tab title, as today. A typed capture with the same name as a path or query capture must use the same type, and it is canonicalized with that capture's bounds and case modifier (so a title `{owner:name}` is lowercased when the path has `{owner:name|lower}`). The two values must then agree; if they do not, the template counts as not matching, except when an `alias` rule names that capture (§9.3). Title captures with any other name are validation errors: use `{~}` to skip text you do not need.
+`title` is one template or an ordered list of at most 4. Each entry is validated on its own, and the first entry that matches is used. If none matches, Brauser records the whole tab title, as today. A typed capture with the same name as a path or query capture must use the same type, and it is canonicalized with that capture's bounds and case modifier (so a title `{owner:name}` is lowercased when the path has `{owner:name|lower}`). The two values must then agree; if they do not, the template counts as not matching, except when an `alias` rule names that capture (§9.3). Title captures with any other name are validation errors: use `{~}` to skip text you do not need.
+
+Title preparation removes nothing from the tab title. A tool that varies its titles, for example by adding an unread-count prefix such as `(3) ` while notifications are pending, is handled by that tool's adapter, which lists the varied form first:
+
+```toml
+title = ["({~}) {title} - Mail", "{title} - Mail"]
+```
+
+The first entry also matches a real title that begins with a parenthesized word, such as `(Draft) Plan - Mail`, and drops that word. An adapter that uses a prefix entry records this trade-off in its documentation (§11.1).
 
 Literals compare by Unicode scalar value with no normalization, so GitHub's `·` (U+00B7) is written as itself. Before matching, the worker converts the title to well-formed Unicode (`String.prototype.toWellFormed()`, replacing lone surrogates with U+FFFD) and caps it at 512 scalar values. The host applies the same steps. Both engines count and compare in scalar values, never in UTF-16 code units.
 
@@ -401,6 +410,19 @@ id        = "sharepoint:{host}/{doc}"
 
 Known limits these examples show: Notion URLs with no workspace segment do not match a scoped Notion adapter; the Jira board-modal rule matches any Jira page carrying `selectedIssue`; and Google Docs cannot be scoped by URL.
 
+### 11.1 Adapter documentation
+
+Every starter adapter ships with a documentation page, `docs/adapters/<type>.md`, reviewed with the adapter and updated in the same change whenever the adapter changes. The page records:
+
+- the tool, and the date its URL and title formats were checked against the live tool;
+- real sample URLs and tab titles for every rule, mode, and title entry, including any unread-count or notification prefix the tool adds and when it appears;
+- in plain words, what each `match` rule and title entry covers, and what the adapter deliberately does not record;
+- the `id` template and why it identifies the artifact, since it is frozen once shipped (§8.2);
+- on a shared origin, how to set `scope`;
+- known limits and trade-offs, such as a prefix entry that also drops a parenthesized first word (§9.1).
+
+Every sample on the page is also a shared test vector (§12). CI fails when a starter adapter has no page, or when a page's sample is missing from the vectors. User-written adapters need no page.
+
 ## 12. Implementation and testing
 
 - **Two implementations.** A Rust crate in the host workspace and a TypeScript module in the extension, each implementing the parser, validation for what the worker needs, and evaluation. Neither uses a regular-expression engine. Each is expected to be a few hundred lines.
@@ -408,13 +430,14 @@ Known limits these examples show: Notion URLs with no workspace segment do not m
 - **Differential property tests.** A generator produces random valid templates and URLs and titles derived from them, including near misses (one character changed, a segment added or removed, encoded characters). A host CLI (`brauser adapters eval`) and a Node harness evaluate each case, and any difference fails CI.
 - **Fuzzing.** `cargo-fuzz` targets the template parser, URL preparation (§5.1), and title matching.
 - **Bounds tests.** Inputs at every cap (2048-character URL, 64 segments, 512-character title, longest type values) complete within a fixed time budget in both engines.
+- **Title lists.** The first matching entry wins, a list of more than 4 is a validation error, an invalid entry fails validation even when an earlier entry is valid, and a prefixed and an unprefixed title of one artifact give the same title.
+- **Adapter documentation.** Each starter adapter has its page, and every sample on it is a vector (§11.1).
 - **Scope tests.** For each shared origin: a URL outside the scope, a case variant of a scoped value, and a scoped capture missing from one rule (a validation error).
 
 ## 13. Open questions
 
 - **Hash-routed apps.** Fragments are ignored. Supporting `/#/…` routes would mean matching the fragment as a second path, which is easy to add in a later format if a real tool needs it.
 - **Notion without a workspace segment.** Should a scoped Notion adapter fall back to Tier 1 (reading the workspace from the page), or should those pages simply go unrecorded?
-- **Unread-count prefixes.** Some tools prefix titles with `(3) `. Should title preparation strip a leading `(<int>) ` for every adapter, or should each title template handle it?
 - **Shared-origin list.** Which further origins belong on it at release (for example Atlassian's `id.atlassian.com`, or `gitlab.com`)?
 
 ## 14. Changes to DESIGN.md

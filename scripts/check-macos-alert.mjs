@@ -5,7 +5,7 @@
 // dialog child's stdin (the cancel path) and when it times out. The alert is
 // drawn by UserNotificationCenter, so the check counts that process's
 // on-screen windows. It puts alerts on the user's screen, so it runs only when
-// given --on-desktop. See TESTING.md, "Real-UI acceptance".
+// given --on-desktop. See 2026-09-28 TESTING.md, "Real-UI acceptance".
 
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
