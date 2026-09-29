@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "M1.5a idle-only probe",
+  "version": "0.0.1",
+  "description": "Asks for the idle permission and nothing else, so the idle probe can read the install warnings Chrome gives for idle alone. Test-only; loaded by scripts/probes/idle.mjs.",
+  "incognito": "not_allowed",
+  "permissions": ["idle"]
+}
